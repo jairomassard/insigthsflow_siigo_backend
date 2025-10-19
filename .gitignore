@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+venv/
+siigo_virtual/
+.env.*
+instance/
+.DS_Store
+*.sqlite3
+*.log
