@@ -280,6 +280,7 @@ def create_app():
         }}
     )
 
+    print("🔍 Usando esta URI de base de datos:", app.config["SQLALCHEMY_DATABASE_URI"])
     db.init_app(app)
     jwt = JWTManager(app)  # ← guarda la instancia
 
