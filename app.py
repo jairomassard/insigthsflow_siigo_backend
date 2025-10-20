@@ -263,7 +263,7 @@ def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
 
     app.config.from_object(Config)
-    
+
     # app.py (o donde configuras Flask/JWT)
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "pon-una-clave-larga-y-estable")
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 60 * 60 * 24  # 24h opcional
@@ -6724,6 +6724,9 @@ def create_app():
 
 
     return app
+
+app = create_app()  # 👈 ESTA LÍNEA ES CLAVE PARA RAILWAY (Gunicorn la necesita)
+
 
 if __name__ == "__main__":
     app = create_app()
