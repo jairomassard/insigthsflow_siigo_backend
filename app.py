@@ -271,7 +271,7 @@ def create_app():
 
     # ✅ CORS en la instancia CORRECTA
     # CORS aplicado globalmente con soporte completo
-      CORS(
+    CORS(
         app,
         resources={r"/*": {
             "origins": "https://insigthsflow.up.railway.app",
