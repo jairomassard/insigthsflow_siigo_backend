@@ -271,16 +271,14 @@ def create_app():
 
     # ✅ CORS en la instancia CORRECTA
     # CORS aplicado globalmente con soporte completo
-        CORS(
-            app,
-            origins=[
-                "http://localhost:3000",
-                "http://127.0.0.1:3000",
-                "https://insigthsflow.up.railway.app"
-            ],
-            allow_headers=["Content-Type", "Authorization", "X-ID-CLIENTE"],
-            supports_credentials=True
-        )
+      CORS(
+        app,
+        resources={r"/*": {
+            "origins": "https://insigthsflow.up.railway.app",
+            "allow_headers": ["Content-Type", "Authorization", "X-ID-CLIENTE"],
+            "supports_credentials": True
+        }}
+    )
 
     print("🔍 Usando esta URI de base de datos:", app.config["SQLALCHEMY_DATABASE_URI"])
     db.init_app(app)
