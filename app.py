@@ -6730,6 +6730,5 @@ app = create_app()  # 👈 ESTA LÍNEA ES CLAVE PARA RAILWAY (Gunicorn la necesi
 
 
 if __name__ == "__main__":
-    app = create_app()
     app.run(debug=True)
 
