@@ -1,7 +1,9 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+if os.getenv("RAILWAY_ENVIRONMENT_ID") is None:
+    from dotenv import load_dotenv
+    load_dotenv()
 
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
