@@ -273,7 +273,12 @@ def create_app():
     CORS(
         app,
         resources={r"/*": {
-            "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "http://192.168.0.55:3000"],
+            "origins": [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://192.168.0.55:3000",
+                "https://insigthsflowsiigofrontend-production.up.railway.app"  # 👈 Railway frontend
+            ],
             "allow_headers": ["Content-Type", "Authorization", "X-ID-CLIENTE"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "supports_credentials": True,
