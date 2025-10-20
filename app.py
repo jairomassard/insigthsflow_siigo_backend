@@ -6477,7 +6477,8 @@ def create_app():
             "/siigo/sync-accounts-payable",
             "/siigo/cross-accounts-payable",
             "/siigo/sync-all",
-            "/config/siigo-sync-status",  # 👈 AGREGA ESTA LÍNEA
+            "/config/siigo-sync-status", 
+            "/ping",  # 👈 AGREGA ESTA LÍNEA PARA EL PING
         ]
         for ruta in rutas_exentas:
             if ruta in request.path:
