@@ -277,7 +277,7 @@ def create_app():
                 "http://localhost:3000",
                 "http://127.0.0.1:3000",
                 "http://192.168.0.55:3000",
-                "https://insigthsflowsiigofrontend-production.up.railway.app"  # 👈 Railway frontend
+                "https://web-production-7c5ba.up.railway.app"  # 👈 Railway frontend
             ],
             "allow_headers": ["Content-Type", "Authorization", "X-ID-CLIENTE"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
