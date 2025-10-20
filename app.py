@@ -6720,7 +6720,9 @@ def create_app():
             "detalle": detalle
         })
 
-
+    @app.route("/ping")
+    def ping():
+        return {"message": "pong"}, 200
 
 
 
