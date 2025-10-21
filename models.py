@@ -26,6 +26,8 @@ class Cliente(db.Model):
     logo_url = db.Column(db.String(300))
     limite_usuarios = db.Column(db.Integer)
     limite_sesiones = db.Column(db.Integer)
+    timezone = db.Column(db.String(50), default="America/Bogota")
+
 
     # 👇 usar el nombre real en BD
     created_at = db.Column(db.DateTime, server_default=func.now())
@@ -44,6 +46,7 @@ class Cliente(db.Model):
             "logo_url": self.logo_url,
             "limite_usuarios": self.limite_usuarios,
             "limite_sesiones": self.limite_sesiones,
+            "timezone": self.timezone,
             # opcional: "created_at": self.created_at.isoformat() if self.created_at else None
         }
 
