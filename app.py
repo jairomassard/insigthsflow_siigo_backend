@@ -4138,12 +4138,15 @@ def create_app():
             except:
                 return None
 
-        if desde and validar_fecha(desde):
-            condiciones.append("CAST(fecha AS DATE) >= :desde")
-            params["desde"] = desde
-        if hasta and validar_fecha(hasta):
-            condiciones.append("CAST(fecha AS DATE) <= :hasta")
-            params["hasta"] = hasta
+        fecha_desde_val = validar_fecha(desde)
+        fecha_hasta_val = validar_fecha(hasta)
+
+        if fecha_desde_val:
+            condiciones.append("fecha >= :desde")
+            params["desde"] = fecha_desde_val
+        if fecha_hasta_val:
+            condiciones.append("fecha <= :hasta")
+            params["hasta"] = fecha_hasta_val
         if centro_costos:
             condiciones.append("cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
@@ -4176,10 +4179,14 @@ def create_app():
 
         # ---------------- Costos de Nómina ----------------
         condiciones_nomina = ["idcliente = :idcliente"]
-        if desde and validar_fecha(desde):
-            condiciones_nomina.append("CAST(periodo AS DATE) >= :desde")
-        if hasta and validar_fecha(hasta):
-            condiciones_nomina.append("CAST(periodo AS DATE) <= :hasta")
+        params_nomina = {"idcliente": idcliente}
+
+        if fecha_desde_val:
+            condiciones_nomina.append("periodo >= :desde_nomina")
+            params_nomina["desde_nomina"] = fecha_desde_val
+        if fecha_hasta_val:
+            condiciones_nomina.append("periodo <= :hasta_nomina")
+            params_nomina["hasta_nomina"] = fecha_hasta_val
 
         where_nomina = " AND ".join(condiciones_nomina)
 
@@ -4191,8 +4198,7 @@ def create_app():
             WHERE {where_nomina}
             GROUP BY mes
         """)
-
-        nomina_rows = db.session.execute(sql_nomina, params).mappings().all()
+        nomina_rows = db.session.execute(sql_nomina, params_nomina).mappings().all()
 
         # Convertir a dict para fácil merge
         ingresos_dict = {str(r["mes"]): dict(r) for r in ingresos_rows}
@@ -4283,6 +4289,7 @@ def create_app():
             "top_clientes": top_clientes,
             "top_proveedores": top_proveedores
         })
+
 
 
 
