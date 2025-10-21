@@ -4139,10 +4139,10 @@ def create_app():
                 return None
 
         if desde and validar_fecha(desde):
-            condiciones.append("fecha >= :desde")
+            condiciones.append("CAST(fecha AS DATE) >= :desde")
             params["desde"] = desde
         if hasta and validar_fecha(hasta):
-            condiciones.append("fecha <= :hasta")
+            condiciones.append("CAST(fecha AS DATE) <= :hasta")
             params["hasta"] = hasta
         if centro_costos:
             condiciones.append("cost_center = :centro_costos")
@@ -4175,12 +4175,11 @@ def create_app():
         egresos_rows = db.session.execute(sql_egresos, params).mappings().all()
 
         # ---------------- Costos de Nómina ----------------
-        # (usamos periodo de la nómina para agrupar por mes)
         condiciones_nomina = ["idcliente = :idcliente"]
         if desde and validar_fecha(desde):
-            condiciones_nomina.append("periodo >= :desde")
+            condiciones_nomina.append("CAST(periodo AS DATE) >= :desde")
         if hasta and validar_fecha(hasta):
-            condiciones_nomina.append("periodo <= :hasta")
+            condiciones_nomina.append("CAST(periodo AS DATE) <= :hasta")
 
         where_nomina = " AND ".join(condiciones_nomina)
 
@@ -4214,7 +4213,7 @@ def create_app():
             nom = nomina_dict.get(mes, {"nomina": 0})
 
             ingresos = ing["ingresos"] or 0
-            egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)  # 👈 sumamos nómina a egresos
+            egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)
             nomina_mes = nom["nomina"] or 0
 
             utilidad = ingresos - egresos
@@ -4226,7 +4225,7 @@ def create_app():
                 "mes": mes,
                 "ingresos": ingresos,
                 "egresos": egresos,
-                "nomina": nomina_mes,  # 👈 nuevo campo para graficar costos de nómina mensual
+                "nomina": nomina_mes,
                 "utilidad": utilidad,
                 "margen": round(margen, 2),
                 "utilidad_acumulada": utilidad_acumulada
@@ -4245,7 +4244,7 @@ def create_app():
         kpis = {
             "ingresos": total_ingresos,
             "egresos": total_egresos,
-            "nomina": total_nomina,  # 👈 KPI global de nómina
+            "nomina": total_nomina,
             "utilidad": utilidad_total,
             "margen": round(margen_total, 2),
             "facturas_venta": facturas_venta,
@@ -4284,6 +4283,7 @@ def create_app():
             "top_clientes": top_clientes,
             "top_proveedores": top_proveedores
         })
+
 
 
 
