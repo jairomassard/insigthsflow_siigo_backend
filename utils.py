@@ -78,3 +78,20 @@ def local_to_utc(dt_local: datetime, tz_str: str) -> datetime:
         dt_local = tz.localize(dt_local)
     return dt_local.astimezone(utc)
 
+def siigo_date_to_utc(date_str: str, tz_str: str = "America/Bogota") -> datetime | None:
+    """
+    Convierte una fecha ISO 8601 (posiblemente sin zona horaria) a datetime en UTC.
+    """
+    if not date_str:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Si no tiene tzinfo, asumir zona local del cliente
+            tz = timezone(tz_str)
+            dt = tz.localize(dt)
+        return dt.astimezone(utc)
+    except Exception as e:
+        print(f"[WARN] siigo_date_to_utc: Error al parsear '{date_str}': {e}")
+        return None
