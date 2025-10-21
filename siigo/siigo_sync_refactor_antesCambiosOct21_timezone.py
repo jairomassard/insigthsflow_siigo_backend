@@ -14,7 +14,6 @@ from cryptography.fernet import Fernet, InvalidToken
 from decimal import Decimal
 
 from models import db, Cliente, SiigoCredencial, SiigoFactura, SiigoFacturaItem
-from utils import siigo_date_to_utc
 
 # -----------------------------
 # Config
@@ -283,7 +282,7 @@ def sync_facturas_desde_siigo(
             try:
                 inv_id   = _str(it.get("id"))
                 name     = _str(it.get("name"))     # p.ej. "FV-2-1689"
-                date     = siigo_date_to_utc(it.get("date"), cliente.timezone or "America/Bogota")
+                date     = _str(it.get("date"))
                 status   = _str(it.get("status"))
                 total    = _d(it.get("total"), DZERO)
                 balance  = _d(it.get("balance"), DZERO)
@@ -291,7 +290,7 @@ def sync_facturas_desde_siigo(
                 payments = it.get("payments") or []
                 vencimiento = None
                 if isinstance(payments, list) and payments and isinstance(payments[0], dict):
-                    vencimiento = siigo_date_to_utc(payments[0].get("due_date"), cliente.timezone or "America/Bogota")
+                    vencimiento = _str(payments[0].get("due_date"))
 
                 customer = it.get("customer") or {}
                 cname    = customer.get("name")
@@ -404,7 +403,7 @@ def sync_facturas_desde_siigo(
         f.siigo_uuid = _str(detalle.get("id") or f.siigo_uuid)
 
         if detalle.get("date"):
-            f.fecha = siigo_date_to_utc(detalle.get("date"), cliente.timezone or "America/Bogota")
+            f.fecha = detalle.get("date")
         f.estado = _str(detalle.get("status") or f.estado or "Emitida")
 
         customer_raw = detalle.get("customer") or {}
@@ -437,8 +436,11 @@ def sync_facturas_desde_siigo(
         items_detalle = _safe_items_list(detalle.get("items"))
         payments = detalle.get("payments") or []
         # Fecha de vencimiento
+        vencimiento = None
         if isinstance(payments, list) and payments and isinstance(payments[0], dict):
-            vencimiento = siigo_date_to_utc(payments[0].get("due_date"), cliente.timezone or "America/Bogota")
+            vencimiento = _str(payments[0].get("due_date"))
+
+        if vencimiento:
             f.vencimiento = vencimiento
 
 

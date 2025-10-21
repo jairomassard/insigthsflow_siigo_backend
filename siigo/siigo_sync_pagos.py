@@ -12,6 +12,7 @@ from .siigo_sync_refactor import (
     _request_with_retries, _headers_json, _headers_bearer,
     SiigoError
 )
+from utils import siigo_date_to_utc
 
 PARTNER_ID = os.getenv("SIIGO_PARTNER_ID", "ProjectManagerApp")
 PAGE_SIZE = int(os.getenv("SIIGO_PAGE_SIZE", "100"))
@@ -47,6 +48,8 @@ def sync_pagos_egresos_desde_siigo(
     cliente = Cliente.query.filter_by(idcliente=idcliente).first()
     if not cliente:
         raise RuntimeError("Cliente no encontrado")
+    
+    tz_str = cliente.timezone or "America/Bogota"
 
     cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
     if not cred or not cred.client_id or not cred.client_secret or not cred.base_url:
@@ -83,7 +86,7 @@ def sync_pagos_egresos_desde_siigo(
             print("📄 Procesando pago:", it.get("id"), "-", it.get("date"))
 
             pid = _str(it.get("id"))
-            fecha = _str(it.get("date"))
+            fecha = siigo_date_to_utc(it.get("date"), tz_str)
             total_pago = _d(it.get("payment", {}).get("value"))
 
             metodo = _str(it.get("payment", {}).get("name"))

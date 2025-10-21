@@ -1,15 +1,10 @@
 import requests
 from models import db, SiigoCompra, SiigoCompraItem, SiigoCredencial, SiigoProveedor
 from utils import _siigo_auth_json_for_client, _siigo_headers_bearer
-from utils import siigo_date_to_utc
-from models import Cliente
 
 # Función sync_compras_desde_siigo() que extrae compras desde /v1/purchases
 def sync_compras_desde_siigo(idcliente: int, deep: bool = False, batch_size: int = 50, only_missing: bool = True, since: str = None):
     cfg = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
-    cliente = Cliente.query.get(idcliente)
-    tz_str = cliente.timezone or "America/Bogota"
-
     if not cfg:
         return {"error": "Credenciales Siigo no configuradas"}
 
@@ -55,12 +50,12 @@ def sync_compras_desde_siigo(idcliente: int, deep: bool = False, batch_size: int
 
             print(f"➡️ Procesando compra: {idcompra}")
 
-            fecha = siigo_date_to_utc(c.get("date"), tz_str)
+            fecha = c.get("date")
             metadata = c.get("metadata", {})
-            creado = siigo_date_to_utc(metadata.get("created"), tz_str)
+            creado = metadata.get("created")
 
             payments = c.get("payments", [])
-            venc = siigo_date_to_utc(payments[0].get("due_date"), tz_str) if payments and isinstance(payments[0], dict) else None
+            venc = payments[0].get("due_date") if payments and isinstance(payments[0], dict) else None
 
             estado = c.get("status")
 

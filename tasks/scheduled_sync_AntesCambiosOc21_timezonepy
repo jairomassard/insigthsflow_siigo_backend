@@ -41,8 +41,7 @@ def ejecutar_sync(idcliente):
     return resultado, "\n".join(log_detalle)
 
 def main():
-    now = datetime.datetime.now(datetime.timezone.utc)
-
+    now = datetime.datetime.now()
     window_start = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).time()
     window_end = (now + datetime.timedelta(minutes=WINDOW_MINUTES)).time()
 

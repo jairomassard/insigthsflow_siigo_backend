@@ -711,10 +711,10 @@ class SiigoSyncConfig(db.Model):
     hora_ejecucion = db.Column(db.Time, nullable=False)
     frecuencia_dias = db.Column(db.Integer, default=1)
     activo = db.Column(db.Boolean, default=True)
-    ultimo_ejecutado = db.Column(db.DateTime)
+    ultimo_ejecutado = db.Column(db.DateTime(timezone=True))
     resultado_ultima_sync = db.Column(db.Text)
     detalle_ultima_sync = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, server_default=func.now())
+    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
 
     def as_dict(self):
         return {
@@ -736,11 +736,11 @@ class SiigoSyncLog(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
-    fecha_programada = db.Column(db.DateTime, nullable=False)
-    ejecutado_en = db.Column(db.DateTime)
+    fecha_programada = db.Column(db.DateTime(timezone=True), nullable=False)
+    ejecutado_en = db.Column(db.DateTime(timezone=True))
     resultado = db.Column(db.Text)
     detalle = db.Column(db.Text)
-    creado_en = db.Column(db.DateTime, server_default=func.now())
+    creado_en = db.Column(db.DateTime(timezone=True), server_default=func.now())
 
     def as_dict(self):
         return {
