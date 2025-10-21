@@ -2,8 +2,6 @@ import os
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from models import SiigoCredencial
-from pytz import timezone, utc
-from datetime import datetime
 
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
 fernet = Fernet(FERNET_KEY) if FERNET_KEY else None
@@ -56,25 +54,3 @@ def _siigo_auth_json_for_client(cfg: SiigoCredencial) -> dict:
             "detalle": str(e),
             "endpoint": auth_url
         }
-
-def utc_to_local(dt_utc: datetime, tz_str: str) -> datetime:
-    """
-    Convierte una fecha UTC a hora local usando la zona horaria del cliente.
-    """
-    if dt_utc is None:
-        return None
-    if dt_utc.tzinfo is None:
-        dt_utc = utc.localize(dt_utc)
-    return dt_utc.astimezone(timezone(tz_str))
-
-def local_to_utc(dt_local: datetime, tz_str: str) -> datetime:
-    """
-    Convierte una fecha local (según el cliente) a UTC.
-    """
-    if dt_local is None:
-        return None
-    tz = timezone(tz_str)
-    if dt_local.tzinfo is None:
-        dt_local = tz.localize(dt_local)
-    return dt_local.astimezone(utc)
-

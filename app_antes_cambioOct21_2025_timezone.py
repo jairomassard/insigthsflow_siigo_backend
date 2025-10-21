@@ -52,7 +52,6 @@ from decoradores_seguridad import (
     _perfil_tiene_permiso
 )
 
-from utils import local_to_utc
 
 
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
@@ -455,7 +454,6 @@ def create_app():
             logo_url=data.get("logo_url"),
             limite_usuarios=(int(data["limite_usuarios"]) if data.get("limite_usuarios") not in (None, "",) else None),
             limite_sesiones=(int(data["limite_sesiones"]) if data.get("limite_sesiones") not in (None, "",) else None),
-            timezone=data.get("timezone", "America/Bogota")  # 👈 nuevo campo con valor por defecto
         )
         db.session.add(cliente)
         db.session.commit()
@@ -472,7 +470,7 @@ def create_app():
 
         data = request.get_json() or {}
         for field in [
-            "nombre","nit","email","pais","ciudad","direccion","telefono1","logo_url", "timezone"
+            "nombre","nit","email","pais","ciudad","direccion","telefono1","logo_url"
         ]:
             if field in data:
                 setattr(cliente, field, data[field])
@@ -6628,7 +6626,8 @@ def create_app():
     # Endpoint para sincronizar todo (invoca internamente otros endpoints)  
     @app.route("/siigo/sync-all", methods=["POST"])
     def siigo_sync_all():
-        
+        from datetime import datetime
+
         idcliente = obtener_idcliente_desde_request()
         print("Sync-all iniciado, idcliente:", idcliente)
         if not idcliente:
@@ -6640,10 +6639,6 @@ def create_app():
 
         log_parts = []
         overall_status = "OK"
-
-        # 🟢 Obtener timezone del cliente
-        cliente = Cliente.query.get_or_404(idcliente)
-        tz_str = cliente.timezone or "America/Bogota"
 
         # 🔁 Ejecución real de sincronización
         sequence = [
@@ -6683,55 +6678,37 @@ def create_app():
                 break
 
         detalle = "\n".join(log_parts)
-       
-        # 🟢 Fecha y hora local → UTC
-        now_local = datetime.now()
-        now_utc = local_to_utc(now_local, tz_str)
+        now = datetime.now()
 
         # Actualizar o crear configuración
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
         if config:
             if es_manual:
-                config.hora_ejecucion = now_local.time()  # 🟢 local
-            config.ultimo_ejecutado = now_utc
+                config.hora_ejecucion = now.time()
+            config.ultimo_ejecutado = func.now()
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
         else:
-            hora = now_local.time() if es_manual else datetime.time(2, 0)
+            hora = now.time() if es_manual else datetime.time(2, 0)  # fallback seguro
             config = SiigoSyncConfig(
                 idcliente=idcliente,
                 hora_ejecucion=hora,
                 frecuencia_dias=1,
                 activo=True,
-                ultimo_ejecutado=now_utc,
+                ultimo_ejecutado=func.now(),
                 resultado_ultima_sync=overall_status,
                 detalle_ultima_sync=detalle[:10000],
             )
             db.session.add(config)
 
-            # 🕒 Log histórico
-            fecha_programada = datetime.combine(datetime.today(), config.hora_ejecucion)
-            logrec = SiigoSyncLog(
-                idcliente=idcliente,
-                fecha_programada=fecha_programada,
-                ejecutado_en=func.now(),
-                resultado=overall_status,
-                detalle=detalle[:10000],
-            )
-            db.session.add(logrec)
-
-        db.session.commit()
-
-        # 🟢 Guardar log en UTC
-        fecha_programada_local = datetime.combine(now_local.date(), config.hora_ejecucion)
-        fecha_programada_utc = local_to_utc(fecha_programada_local, tz_str)
-
+        # 🕒 Log histórico
+        fecha_programada = datetime.combine(datetime.today(), config.hora_ejecucion)
         logrec = SiigoSyncLog(
             idcliente=idcliente,
-            fecha_programada=fecha_programada_utc,
-            ejecutado_en=now_utc,
+            fecha_programada=fecha_programada,
+            ejecutado_en=func.now(),
             resultado=overall_status,
             detalle=detalle[:10000],
         )
