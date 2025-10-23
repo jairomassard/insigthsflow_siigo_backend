@@ -2904,7 +2904,6 @@ def create_app():
 
 
     @app.route("/siigo/sync-compras", methods=["POST"])
-    
     def siigo_sync_compras():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
@@ -2915,27 +2914,24 @@ def create_app():
         only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
         since = request.args.get("since")
 
-        try:
-            resultado = sync_compras_desde_siigo(
-                idcliente=idcliente,
-                deep=deep,
-                batch_size=batch if batch is not None else 50,
-                only_missing=only_missing,
-                since=since
-            )
+        def run_background():
+            try:
+                sync_compras_desde_siigo(
+                    idcliente=idcliente,
+                    deep=deep,
+                    batch_size=batch if batch is not None else 50,
+                    only_missing=only_missing,
+                    since=since
+                )
+                print(f"[siigo_sync_compras] terminado para cliente {idcliente}")
+            except Exception as e:
+                print(f"[siigo_sync_compras] ERROR: {e}")
 
-            # Validar que resultado sea dict
-            if not isinstance(resultado, dict):
-                return jsonify({"error": "Respuesta inesperada al sincronizar compras", "detalle": str(resultado)}), 500
+        # Ejecutar en segundo plano
+        thread = threading.Thread(target=run_background)
+        thread.start()
 
-            if "error" in resultado:
-                return jsonify(resultado), 500
-
-            mensaje = f"Compras: {resultado.get('nuevas', 0)} nuevas, {resultado.get('actualizadas', 0)} actualizadas, total {resultado.get('total', 0)}."
-
-            return jsonify({"mensaje": mensaje})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano"}), 202
 
 
 
