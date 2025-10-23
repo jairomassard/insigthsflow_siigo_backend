@@ -54,9 +54,6 @@ from decoradores_seguridad import (
 
 from utils import local_to_utc
 
-from threading import Thread
-import traceback
-
 
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
 fernet = Fernet(FERNET_KEY) if FERNET_KEY else None
@@ -1248,50 +1245,32 @@ def create_app():
         })
         
 
-
-
     @app.route("/siigo/sync-facturas", methods=["POST"])
+    
     def siigo_sync_facturas():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
-        # Capturamos parámetros (NO usar request dentro del hilo)
-        deep = request.args.get("deep") in ("1", "true", "yes")
+        deep = request.args.get("deep") in ("1","true","yes")
         batch = request.args.get("batch", default=None, type=int)
-        only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
-        since = request.args.get("since")  # opcional, 'YYYY-MM-DD'
+        only_missing = request.args.get("only_missing", default="1") in ("1","true","yes")
+        since = request.args.get("since")  # 'YYYY-MM-DD' opcional (filtro local)
 
-        # Armamos kwargs para pasarlos al hilo
-        kwargs = {
-            "idcliente": idcliente,
-            "deep": deep,
-            "only_missing": only_missing,
-            "since": since
-        }
-        if batch:
-            kwargs["batch_size"] = batch
+        try:
+            kwargs = {
+                "idcliente": idcliente,
+                "deep": deep,
+                "only_missing": only_missing,
+                "since": since
+            }
+            if batch:
+                kwargs["batch_size"] = batch
 
-        # Función que se ejecutará en background
-        def trabajo_lento(local_kwargs):
-            try:
-                # Aseguramos contexto de Flask (app, db, etc.)
-                with app.app_context():
-                    # Llamada real a la función que hace el trabajo pesado
-                    mensaje = sync_facturas_desde_siigo(**local_kwargs)
-                    # Opcional: imprimir/loggear resultado
-                    print(f"[siigo_sync_facturas] terminado: {mensaje}")
-            except Exception as e:
-                # Log completo para debug en producción
-                print("[siigo_sync_facturas] ERROR en background:")
-                traceback.print_exc()
-
-        # Lanzamos el hilo daemon para que no bloquee el proceso principal
-        t = Thread(target=trabajo_lento, args=(kwargs,), daemon=True)
-        t.start()
-
-        # Respondemos ya para evitar timeouts de Railway / proxies (202 Accepted)
-        return jsonify({"mensaje": "Sincronización iniciada en background. Revisar logs para progreso."}), 202
+            mensaje = sync_facturas_desde_siigo(**kwargs)
+            return jsonify({"mensaje": mensaje})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 
