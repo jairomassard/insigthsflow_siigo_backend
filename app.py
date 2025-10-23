@@ -2907,17 +2907,17 @@ def create_app():
 
     @app.route("/siigo/sync-compras", methods=["POST"])
     def siigo_sync_compras():
-        try:
-            idcliente = obtener_idcliente_desde_request()
-            if not idcliente:
-                return jsonify({"error": "Cliente no autorizado"}), 403
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
 
-            deep = request.args.get("deep") in ("1", "true", "yes")
-            batch = request.args.get("batch", default=None, type=int)
-            only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
-            since = request.args.get("since")
+        deep = request.args.get("deep") in ("1", "true", "yes")
+        batch = request.args.get("batch", default=None, type=int)
+        only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
+        since = request.args.get("since")
 
-            def run_background():
+        def run_background():
+            with app.app_context():
                 try:
                     print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
                     sync_compras_desde_siigo(
@@ -2931,18 +2931,11 @@ def create_app():
                 except Exception as e:
                     print(f"[sync-compras] ❌ Error en background: {e}")
 
-            # Ejecutar la sincronización en segundo plano
-            threading.Thread(target=run_background).start()
-
-            # Responder inmediatamente con éxito
-            return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano"}), 202
-
-        except Exception as e:
-            print(f"[sync-compras] ❌ Error inmediato: {e}")
-            return jsonify({"error": "Error inesperado al iniciar la sincronización", "detalle": str(e)}), 500
-
-
-
+        # Lanzar en background
+        threading.Thread(target=run_background).start()
+        
+        # Retornar inmediatamente para evitar timeout de 30s
+        return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano."}), 202
 
 
 
