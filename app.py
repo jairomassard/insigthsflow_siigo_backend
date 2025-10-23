@@ -54,6 +54,7 @@ from decoradores_seguridad import (
 
 from utils import local_to_utc
 
+import threading
 from threading import Thread
 import traceback
 
@@ -2903,35 +2904,42 @@ def create_app():
 
 
 
+
     @app.route("/siigo/sync-compras", methods=["POST"])
     def siigo_sync_compras():
-        idcliente = obtener_idcliente_desde_request()
-        if not idcliente:
-            return jsonify({"error": "Cliente no autorizado"}), 403
+        try:
+            idcliente = obtener_idcliente_desde_request()
+            if not idcliente:
+                return jsonify({"error": "Cliente no autorizado"}), 403
 
-        deep = request.args.get("deep") in ("1", "true", "yes")
-        batch = request.args.get("batch", default=None, type=int)
-        only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
-        since = request.args.get("since")
+            deep = request.args.get("deep") in ("1", "true", "yes")
+            batch = request.args.get("batch", default=None, type=int)
+            only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
+            since = request.args.get("since")
 
-        def run_background():
-            try:
-                sync_compras_desde_siigo(
-                    idcliente=idcliente,
-                    deep=deep,
-                    batch_size=batch if batch is not None else 50,
-                    only_missing=only_missing,
-                    since=since
-                )
-                print(f"[siigo_sync_compras] terminado para cliente {idcliente}")
-            except Exception as e:
-                print(f"[siigo_sync_compras] ERROR: {e}")
+            def run_background():
+                try:
+                    print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
+                    sync_compras_desde_siigo(
+                        idcliente=idcliente,
+                        deep=deep,
+                        batch_size=batch if batch is not None else 50,
+                        only_missing=only_missing,
+                        since=since
+                    )
+                    print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}")
+                except Exception as e:
+                    print(f"[sync-compras] ❌ Error en background: {e}")
 
-        # Ejecutar en segundo plano
-        thread = threading.Thread(target=run_background)
-        thread.start()
+            # Ejecutar la sincronización en segundo plano
+            threading.Thread(target=run_background).start()
 
-        return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano"}), 202
+            # Responder inmediatamente con éxito
+            return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano"}), 202
+
+        except Exception as e:
+            print(f"[sync-compras] ❌ Error inmediato: {e}")
+            return jsonify({"error": "Error inesperado al iniciar la sincronización", "detalle": str(e)}), 500
 
 
 
