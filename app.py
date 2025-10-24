@@ -4974,7 +4974,6 @@ def create_app():
         detalles_ajuste = {}
 
         for compra in ds_compras:
-            # Intentamos cruce flexible:
             total_pagado = db.session.query(func.sum(SiigoPagoProveedor.valor)).filter(
                 SiigoPagoProveedor.idcliente == idcliente,
                 or_(
@@ -4996,12 +4995,12 @@ def create_app():
                     compra.estado = "pendiente"
 
                 ds_ajustadas += 1
-                detalles_ajuste[compra.idcompra] = {
-                    "factura_proveedor": compra.factura_proveedor,
+                detalles_ajuste[str(compra.idcompra)] = {
+                    "factura_proveedor": str(compra.factura_proveedor or ""),
                     "total": float(compra.total or 0),
                     "pagado": float(total_pagado),
                     "saldo": float(nuevo_saldo),
-                    "estado": compra.estado,
+                    "estado": str(compra.estado or "")
                 }
 
         db.session.commit()
@@ -5014,8 +5013,6 @@ def create_app():
             ),
             "detalles_ds": detalles_ajuste
         })
-
-
 
 
 
