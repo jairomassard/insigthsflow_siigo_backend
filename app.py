@@ -3868,7 +3868,7 @@ def create_app():
                 SUM(CASE WHEN c.estado = 'pagado' THEN c.total ELSE 0 END) AS total_pagado,
                 SUM(CASE WHEN c.estado = 'pendiente' THEN c.saldo ELSE 0 END) AS total_saldo,
                 SUM(CASE WHEN c.estado = 'pagado' THEN 1 ELSE 0 END) AS facturas_pagadas,
-                SUM(CASE WHEN c.estado = 'pendiente' THEN 1 ELSE 0 END) AS facturas_pendientes
+                SUM(CASE WHEN c.estado = 'pendiente' THEN 1 ELSE 0 END) AS facturas_pendientes,
 
                 -- 👇 nuevos KPIs
                 SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN 1 ELSE 0 END) AS compras_x_factura,
