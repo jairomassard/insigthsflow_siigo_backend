@@ -3869,6 +3869,12 @@ def create_app():
                 SUM(CASE WHEN c.estado = 'pendiente' THEN c.saldo ELSE 0 END) AS total_saldo,
                 SUM(CASE WHEN c.estado = 'pagado' THEN 1 ELSE 0 END) AS facturas_pagadas,
                 SUM(CASE WHEN c.estado = 'pendiente' THEN 1 ELSE 0 END) AS facturas_pendientes
+
+                -- 👇 nuevos KPIs
+                SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN 1 ELSE 0 END) AS compras_x_factura,
+                SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN c.total ELSE 0 END) AS valor_compras_x_factura,
+                SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN 1 ELSE 0 END) AS compras_x_cta_cobro,
+                SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN c.total ELSE 0 END) AS valor_compras_x_cta_cobro
             FROM siigo_compras c
             WHERE {where_sql}
         """

@@ -16,8 +16,11 @@ from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
 import base64, json, requests
-from flask import request, jsonify
+
 from flask_jwt_extended import jwt_required, get_jwt
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+
+
 from siigo_api import auth as siigo_auth, SiigoError
 from siigo.siigo_sync_refactor import sync_facturas_desde_siigo
 from datetime import datetime
@@ -34,6 +37,10 @@ import zipfile
 
 import requests
 
+
+from sqlalchemy.sql import text
+import math
+
 import unicodedata
 from sqlalchemy.dialects.postgresql import insert
 
@@ -45,6 +52,11 @@ from decoradores_seguridad import (
     _perfil_tiene_permiso
 )
 
+from utils import local_to_utc
+
+import threading
+from threading import Thread
+import traceback
 
 
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
@@ -219,45 +231,61 @@ def interpretar_indicador(k: str, v: float | None) -> str:
 
 
 
+
 def obtener_idcliente_desde_request():
     """
-    Permite obtener el ID del cliente desde JWT o desde el header 'X-ID-CLIENTE'.
+    Obtiene el ID del cliente necesario para todas las sincronizaciones.
+    Primero intenta el header 'X-ID-CLIENTE'. Si no existe, intenta extraerlo del JWT.
     """
-    try:
-        claims = get_jwt()
-        idc = claims.get("idcliente")
-        print("obtener_idcliente_desde_request: desde JWT →", idc)
-        return idc
-    except Exception:
-        x_id = request.headers.get("X-ID-CLIENTE")
+
+    # 1. Intentar header primero
+    x_id = request.headers.get("X-ID-CLIENTE")
+    if x_id:
         print("obtener_idcliente_desde_request: desde header →", x_id)
-        if x_id:
-            try:
-                return int(x_id)
-            except ValueError:
-                return None
-        return None
+        try:
+            return int(x_id)
+        except ValueError:
+            return None
+
+    # 2. Si no hay header, intentar JWT opcional
+    try:
+        verify_jwt_in_request(optional=True)  # 👈 aquí el truco
+        identity = get_jwt_identity()
+        if identity and isinstance(identity, dict):
+            idc = identity.get("idcliente")
+            print("obtener_idcliente_desde_request: desde JWT →", idc)
+            if idc is not None:
+                return int(idc)
+    except Exception as e:
+        print("obtener_idcliente_desde_request: error al leer JWT:", e)
+
+    print("obtener_idcliente_desde_request: no se encontró idcliente")
+    return None
+
 
 
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder="static", static_url_path="")
+
     app.config.from_object(Config)
+
     # app.py (o donde configuras Flask/JWT)
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "pon-una-clave-larga-y-estable")
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 60 * 60 * 24  # 24h opcional
 
 
     # ✅ CORS en la instancia CORRECTA
+    # CORS aplicado globalmente con soporte completo
     CORS(
         app,
         resources={r"/*": {
-            "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "http://192.168.0.55:3000"],
+            "origins": "https://insigthsflow.up.railway.app",
             "allow_headers": ["Content-Type", "Authorization", "X-ID-CLIENTE"],
-            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "supports_credentials": True,
+            "supports_credentials": True
         }}
     )
 
+    print("🔍 Usando esta URI de base de datos:", app.config["SQLALCHEMY_DATABASE_URI"])
     db.init_app(app)
     jwt = JWTManager(app)  # ← guarda la instancia
 
@@ -431,6 +459,7 @@ def create_app():
             logo_url=data.get("logo_url"),
             limite_usuarios=(int(data["limite_usuarios"]) if data.get("limite_usuarios") not in (None, "",) else None),
             limite_sesiones=(int(data["limite_sesiones"]) if data.get("limite_sesiones") not in (None, "",) else None),
+            timezone=data.get("timezone", "America/Bogota")  # 👈 nuevo campo con valor por defecto
         )
         db.session.add(cliente)
         db.session.commit()
@@ -447,7 +476,7 @@ def create_app():
 
         data = request.get_json() or {}
         for field in [
-            "nombre","nit","email","pais","ciudad","direccion","telefono1","logo_url"
+            "nombre","nit","email","pais","ciudad","direccion","telefono1","logo_url", "timezone"
         ]:
             if field in data:
                 setattr(cliente, field, data[field])
@@ -1220,32 +1249,50 @@ def create_app():
         })
         
 
+
+
     @app.route("/siigo/sync-facturas", methods=["POST"])
-    
     def siigo_sync_facturas():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
-        deep = request.args.get("deep") in ("1","true","yes")
+        # Capturamos parámetros (NO usar request dentro del hilo)
+        deep = request.args.get("deep") in ("1", "true", "yes")
         batch = request.args.get("batch", default=None, type=int)
-        only_missing = request.args.get("only_missing", default="1") in ("1","true","yes")
-        since = request.args.get("since")  # 'YYYY-MM-DD' opcional (filtro local)
+        only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
+        since = request.args.get("since")  # opcional, 'YYYY-MM-DD'
 
-        try:
-            kwargs = {
-                "idcliente": idcliente,
-                "deep": deep,
-                "only_missing": only_missing,
-                "since": since
-            }
-            if batch:
-                kwargs["batch_size"] = batch
+        # Armamos kwargs para pasarlos al hilo
+        kwargs = {
+            "idcliente": idcliente,
+            "deep": deep,
+            "only_missing": only_missing,
+            "since": since
+        }
+        if batch:
+            kwargs["batch_size"] = batch
 
-            mensaje = sync_facturas_desde_siigo(**kwargs)
-            return jsonify({"mensaje": mensaje})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        # Función que se ejecutará en background
+        def trabajo_lento(local_kwargs):
+            try:
+                # Aseguramos contexto de Flask (app, db, etc.)
+                with app.app_context():
+                    # Llamada real a la función que hace el trabajo pesado
+                    mensaje = sync_facturas_desde_siigo(**local_kwargs)
+                    # Opcional: imprimir/loggear resultado
+                    print(f"[siigo_sync_facturas] terminado: {mensaje}")
+            except Exception as e:
+                # Log completo para debug en producción
+                print("[siigo_sync_facturas] ERROR en background:")
+                traceback.print_exc()
+
+        # Lanzamos el hilo daemon para que no bloquee el proceso principal
+        t = Thread(target=trabajo_lento, args=(kwargs,), daemon=True)
+        t.start()
+
+        # Respondemos ya para evitar timeouts de Railway / proxies (202 Accepted)
+        return jsonify({"mensaje": "Sincronización iniciada en background. Revisar logs para progreso."}), 202
 
 
 
@@ -2587,7 +2634,8 @@ def create_app():
                         'idfactura', idfactura,
                         'cliente_nombre', cliente_nombre,
                         'saldo', saldo,
-                        'public_url', public_url
+                        'public_url', public_url,
+                        'dias_vencidos', (CURRENT_DATE - vencimiento)
                     )
                 ) AS facturas
             FROM facturas_enriquecidas
@@ -2856,8 +2904,8 @@ def create_app():
 
 
 
+
     @app.route("/siigo/sync-compras", methods=["POST"])
-    
     def siigo_sync_compras():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
@@ -2868,30 +2916,26 @@ def create_app():
         only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
         since = request.args.get("since")
 
-        try:
-            resultado = sync_compras_desde_siigo(
-                idcliente=idcliente,
-                deep=deep,
-                batch_size=batch if batch is not None else 50,
-                only_missing=only_missing,
-                since=since
-            )
+        def run_background():
+            with app.app_context():
+                try:
+                    print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
+                    sync_compras_desde_siigo(
+                        idcliente=idcliente,
+                        deep=deep,
+                        batch_size=batch if batch is not None else 50,
+                        only_missing=only_missing,
+                        since=since
+                    )
+                    print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}")
+                except Exception as e:
+                    print(f"[sync-compras] ❌ Error en background: {e}")
 
-            # Validar que resultado sea dict
-            if not isinstance(resultado, dict):
-                return jsonify({"error": "Respuesta inesperada al sincronizar compras", "detalle": str(resultado)}), 500
-
-            if "error" in resultado:
-                return jsonify(resultado), 500
-
-            mensaje = f"Compras: {resultado.get('nuevas', 0)} nuevas, {resultado.get('actualizadas', 0)} actualizadas, total {resultado.get('total', 0)}."
-
-            return jsonify({"mensaje": mensaje})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-
-
+        # Lanzar en background
+        threading.Thread(target=run_background).start()
+        
+        # Retornar inmediatamente para evitar timeout de 30s
+        return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano."}), 202
 
 
 
@@ -4112,12 +4156,15 @@ def create_app():
             except:
                 return None
 
-        if desde and validar_fecha(desde):
+        fecha_desde_val = validar_fecha(desde)
+        fecha_hasta_val = validar_fecha(hasta)
+
+        if fecha_desde_val:
             condiciones.append("fecha >= :desde")
-            params["desde"] = desde
-        if hasta and validar_fecha(hasta):
+            params["desde"] = fecha_desde_val
+        if fecha_hasta_val:
             condiciones.append("fecha <= :hasta")
-            params["hasta"] = hasta
+            params["hasta"] = fecha_hasta_val
         if centro_costos:
             condiciones.append("cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
@@ -4149,12 +4196,15 @@ def create_app():
         egresos_rows = db.session.execute(sql_egresos, params).mappings().all()
 
         # ---------------- Costos de Nómina ----------------
-        # (usamos periodo de la nómina para agrupar por mes)
         condiciones_nomina = ["idcliente = :idcliente"]
-        if desde and validar_fecha(desde):
-            condiciones_nomina.append("periodo >= :desde")
-        if hasta and validar_fecha(hasta):
-            condiciones_nomina.append("periodo <= :hasta")
+        params_nomina = {"idcliente": idcliente}
+
+        if fecha_desde_val:
+            condiciones_nomina.append("periodo >= :desde_nomina")
+            params_nomina["desde_nomina"] = fecha_desde_val
+        if fecha_hasta_val:
+            condiciones_nomina.append("periodo <= :hasta_nomina")
+            params_nomina["hasta_nomina"] = fecha_hasta_val
 
         where_nomina = " AND ".join(condiciones_nomina)
 
@@ -4166,8 +4216,7 @@ def create_app():
             WHERE {where_nomina}
             GROUP BY mes
         """)
-
-        nomina_rows = db.session.execute(sql_nomina, params).mappings().all()
+        nomina_rows = db.session.execute(sql_nomina, params_nomina).mappings().all()
 
         # Convertir a dict para fácil merge
         ingresos_dict = {str(r["mes"]): dict(r) for r in ingresos_rows}
@@ -4188,7 +4237,7 @@ def create_app():
             nom = nomina_dict.get(mes, {"nomina": 0})
 
             ingresos = ing["ingresos"] or 0
-            egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)  # 👈 sumamos nómina a egresos
+            egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)
             nomina_mes = nom["nomina"] or 0
 
             utilidad = ingresos - egresos
@@ -4200,7 +4249,7 @@ def create_app():
                 "mes": mes,
                 "ingresos": ingresos,
                 "egresos": egresos,
-                "nomina": nomina_mes,  # 👈 nuevo campo para graficar costos de nómina mensual
+                "nomina": nomina_mes,
                 "utilidad": utilidad,
                 "margen": round(margen, 2),
                 "utilidad_acumulada": utilidad_acumulada
@@ -4219,7 +4268,7 @@ def create_app():
         kpis = {
             "ingresos": total_ingresos,
             "egresos": total_egresos,
-            "nomina": total_nomina,  # 👈 KPI global de nómina
+            "nomina": total_nomina,
             "utilidad": utilidad_total,
             "margen": round(margen_total, 2),
             "facturas_venta": facturas_venta,
@@ -4258,6 +4307,8 @@ def create_app():
             "top_clientes": top_clientes,
             "top_proveedores": top_proveedores
         })
+
+
 
 
 
@@ -4923,7 +4974,6 @@ def create_app():
         detalles_ajuste = {}
 
         for compra in ds_compras:
-            # Intentamos cruce flexible:
             total_pagado = db.session.query(func.sum(SiigoPagoProveedor.valor)).filter(
                 SiigoPagoProveedor.idcliente == idcliente,
                 or_(
@@ -4945,12 +4995,12 @@ def create_app():
                     compra.estado = "pendiente"
 
                 ds_ajustadas += 1
-                detalles_ajuste[compra.idcompra] = {
-                    "factura_proveedor": compra.factura_proveedor,
+                detalles_ajuste[str(compra.idcompra)] = {
+                    "factura_proveedor": str(compra.factura_proveedor or ""),
                     "total": float(compra.total or 0),
                     "pagado": float(total_pagado),
                     "saldo": float(nuevo_saldo),
-                    "estado": compra.estado,
+                    "estado": str(compra.estado or "")
                 }
 
         db.session.commit()
@@ -4963,8 +5013,6 @@ def create_app():
             ),
             "detalles_ds": detalles_ajuste
         })
-
-
 
 
 
@@ -6209,6 +6257,224 @@ def create_app():
         })
 
 
+    # Reporte Criuce de IVAs
+    @app.route("/reportes/cruce_iva", methods=["GET"])
+    @jwt_required()
+    def get_cruce_iva():
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        desde_str = request.args.get("desde")
+        hasta_str = request.args.get("hasta")
+        modo = request.args.get("modo", "mensual").lower()
+        incluir_detalle = request.args.get("detalle", "0") == "1"
+
+        modos_validos = {
+            "mensual": 1,
+            "bimensual": 2,
+            "trimestral": 3,
+            "cuatrimestral": 4
+        }
+        agrupacion_meses = modos_validos.get(modo, 1)
+
+        try:
+            desde = datetime.strptime(desde_str, "%Y-%m-%d") if desde_str else None
+            hasta = datetime.strptime(hasta_str, "%Y-%m-%d") if hasta_str else None
+        except:
+            return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+
+        params = {"idcliente": idcliente}
+        wh_ventas = ["f.idcliente = :idcliente"]
+        wh_compras = ["c.idcliente = :idcliente"]
+        filtro_nc_fecha = []
+
+        if desde:
+            wh_ventas.append("f.fecha >= :desde")
+            wh_compras.append("c.fecha >= :desde")
+            filtro_nc_fecha.append("nc.fecha >= :desde")
+            params["desde"] = desde
+        if hasta:
+            wh_ventas.append("f.fecha <= :hasta")
+            wh_compras.append("c.fecha <= :hasta")
+            filtro_nc_fecha.append("nc.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        sql_main = text(f"""
+            WITH notas_credito_ajuste AS (
+                SELECT
+                    EXTRACT(YEAR FROM nc.fecha) AS anio,
+                    EXTRACT(MONTH FROM nc.fecha) AS mes,
+                    SUM(
+                        CASE 
+                            WHEN f.total IS NOT NULL AND nc.total >= 0.9 * f.total THEN f.impuestos_total
+                            ELSE (f.impuestos_total * (nc.total / f.total))
+                        END
+                    ) AS iva_nc
+                FROM siigo_notas_credito nc
+                LEFT JOIN facturas_enriquecidas f 
+                    ON nc.factura_afectada_id = f.idfactura
+                WHERE nc.idcliente = :idcliente
+                {f" AND {' AND '.join(filtro_nc_fecha)}" if filtro_nc_fecha else ""}
+                GROUP BY anio, mes
+            ),
+            ventas AS (
+                SELECT
+                    EXTRACT(YEAR FROM f.fecha) AS anio,
+                    EXTRACT(MONTH FROM f.fecha) AS mes,
+                    SUM(f.impuestos_total) - COALESCE(nc.iva_nc, 0) AS iva_ventas
+                FROM facturas_enriquecidas f
+                LEFT JOIN notas_credito_ajuste nc
+                    ON EXTRACT(YEAR FROM f.fecha) = nc.anio AND EXTRACT(MONTH FROM f.fecha) = nc.mes
+                WHERE {" AND ".join(wh_ventas)}
+                GROUP BY EXTRACT(YEAR FROM f.fecha), EXTRACT(MONTH FROM f.fecha), nc.iva_nc
+            ),
+            compras AS (
+                SELECT
+                    EXTRACT(YEAR FROM c.fecha) AS anio,
+                    EXTRACT(MONTH FROM c.fecha) AS mes,
+                    SUM(ci.impuestos) AS iva_compras
+                FROM siigo_compras_items ci
+                JOIN siigo_compras c ON ci.compra_id = c.id
+                WHERE {" AND ".join(wh_compras)}
+                GROUP BY anio, mes
+            ),
+            combinadas AS (
+                SELECT COALESCE(v.anio, c.anio) AS anio,
+                    COALESCE(v.mes, c.mes) AS mes,
+                    COALESCE(v.iva_ventas, 0) AS iva_ventas,
+                    COALESCE(c.iva_compras, 0) AS iva_compras,
+                    COALESCE(v.iva_ventas, 0) - COALESCE(c.iva_compras, 0) AS saldo_iva
+                FROM ventas v
+                FULL OUTER JOIN compras c
+                ON v.anio = c.anio AND v.mes = c.mes
+            )
+            SELECT anio,
+                mes,
+                TO_CHAR(MAKE_DATE(anio::int, mes::int, 1), 'YYYY-MM') AS periodo,
+                TO_CHAR(MAKE_DATE(anio::int, mes::int, 1) + INTERVAL '1 month', 'YYYY-MM') AS mes_presentacion,
+                SUM(iva_ventas) AS iva_ventas,
+                SUM(iva_compras) AS iva_compras,
+                SUM(saldo_iva) AS saldo_iva
+            FROM combinadas
+            GROUP BY anio, mes
+            ORDER BY anio, mes
+        """)
+
+        try:
+            result = db.session.execute(sql_main, params).mappings().all()
+            rows = [dict(r) for r in result]
+
+            kpis = {
+                "iva_ventas": sum(r["iva_ventas"] for r in rows),
+                "iva_compras": sum(r["iva_compras"] for r in rows),
+                "saldo_iva": sum(r["saldo_iva"] for r in rows),
+            }
+
+            series = [
+                {
+                    "label": r["periodo"],
+                    "mes_presentacion": r["mes_presentacion"],
+                    "iva_ventas": r["iva_ventas"],
+                    "iva_compras": r["iva_compras"],
+                    "saldo_iva": r["saldo_iva"],
+                }
+                for r in rows
+            ]
+
+            def agrupar(rows, step):
+                grupos = []
+                for i in range(0, len(rows), step):
+                    grupo = rows[i:i+step]
+                    if not grupo:
+                        continue
+                    iva_ventas = sum(r["iva_ventas"] or 0 for r in grupo)
+                    iva_compras = sum(r["iva_compras"] or 0 for r in grupo)
+                    saldo_iva = sum(r["saldo_iva"] or 0 for r in grupo)
+
+                    grupos.append({
+                        "label": " + ".join(r["periodo"] for r in grupo),
+                        "mes_presentacion": grupo[-1]["mes_presentacion"],
+                        "iva_ventas": iva_ventas,
+                        "iva_compras": iva_compras,
+                        "saldo_iva": saldo_iva,
+                    })
+
+                # 👉 Aplicar lógica de arrastre
+                saldo_acumulado = 0
+                for g in grupos:
+                    g["arrastre_anterior"] = saldo_acumulado
+                    neto = g["saldo_iva"] + saldo_acumulado
+                    g["iva_neto_a_pagar"] = max(neto, 0)
+                    saldo_acumulado = neto if neto < 0 else 0
+
+                return grupos
+
+            series_agrupadas = {
+                "bimensual": agrupar(rows, 2),
+                "trimestral": agrupar(rows, 3),
+                "cuatrimestral": agrupar(rows, 4),
+            }
+
+            response = {
+                "rows": rows,
+                "series": series,
+                "series_agrupadas": series_agrupadas,
+                "kpis": kpis,
+                "modo": modo,
+                "count": len(rows),
+            }
+
+            if incluir_detalle:
+                detalle_ventas = db.session.execute(text(f"""
+                    SELECT TO_CHAR(DATE_TRUNC('month', fecha), 'YYYY-MM') AS periodo,
+                        idfactura, fecha, cliente_nombre,
+                        impuestos_total, total, public_url
+                    FROM facturas_enriquecidas f
+                    WHERE {" AND ".join(wh_ventas)}
+                    ORDER BY fecha
+                """), params).mappings().all()
+
+                detalle_compras = db.session.execute(text(f"""
+                    SELECT TO_CHAR(DATE_TRUNC('month', c.fecha), 'YYYY-MM') AS periodo,
+                        c.idcompra, c.fecha, c.proveedor_nombre,
+                        SUM(ci.impuestos) AS impuestos_total,
+                        c.total, c.factura_proveedor
+                    FROM siigo_compras_items ci
+                    JOIN siigo_compras c ON ci.compra_id = c.id
+                    WHERE {" AND ".join(wh_compras)}
+                    GROUP BY c.idcompra, c.fecha, c.proveedor_nombre, c.total, c.factura_proveedor
+                    ORDER BY c.fecha
+                """), params).mappings().all()
+
+                def agrupar_facturas(filas):
+                    agrupado = {}
+                    for f in filas:
+                        p = f["periodo"]
+                        agrupado.setdefault(p, []).append(dict(f))
+                    return agrupado
+
+                response["facturas_ventas"] = agrupar_facturas(detalle_ventas)
+                response["facturas_compras"] = agrupar_facturas(detalle_compras)
+
+            return jsonify(response)
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
+
+
+
+
+
     # --- Registrar rutas de permisos ---
     from permisos_routes import register_permisos_routes
     register_permisos_routes(app)
@@ -6235,7 +6501,8 @@ def create_app():
             "/siigo/sync-accounts-payable",
             "/siigo/cross-accounts-payable",
             "/siigo/sync-all",
-            "/config/siigo-sync-status",  # 👈 AGREGA ESTA LÍNEA
+            "/config/siigo-sync-status", 
+            "/ping",  # 👈 AGREGA ESTA LÍNEA PARA EL PING
         ]
         for ruta in rutas_exentas:
             if ruta in request.path:
@@ -6293,6 +6560,8 @@ def create_app():
                 codigo = "ver_reporte_nomina"
             elif "cxc" in request.path or "cartera" in request.path:
                 codigo = "ver_reporte_cxc"
+            elif "cruce_iva" in request.path:
+                codigo = "ver_reporte_cruceivas"
             else:
                 # Si no se reconoce un reporte específico, usa permiso general
                 codigo = "ver_reportes"
@@ -6381,8 +6650,7 @@ def create_app():
     # Endpoint para sincronizar todo (invoca internamente otros endpoints)  
     @app.route("/siigo/sync-all", methods=["POST"])
     def siigo_sync_all():
-        from datetime import datetime
-
+        
         idcliente = obtener_idcliente_desde_request()
         print("Sync-all iniciado, idcliente:", idcliente)
         if not idcliente:
@@ -6394,6 +6662,10 @@ def create_app():
 
         log_parts = []
         overall_status = "OK"
+
+        # 🟢 Obtener timezone del cliente
+        cliente = Cliente.query.get_or_404(idcliente)
+        tz_str = cliente.timezone or "America/Bogota"
 
         # 🔁 Ejecución real de sincronización
         sequence = [
@@ -6433,37 +6705,55 @@ def create_app():
                 break
 
         detalle = "\n".join(log_parts)
-        now = datetime.now()
+       
+        # 🟢 Fecha y hora local → UTC
+        now_local = datetime.now()
+        now_utc = local_to_utc(now_local, tz_str)
 
         # Actualizar o crear configuración
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
         if config:
             if es_manual:
-                config.hora_ejecucion = now.time()
-            config.ultimo_ejecutado = func.now()
+                config.hora_ejecucion = now_local.time()  # 🟢 local
+            config.ultimo_ejecutado = now_utc
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
         else:
-            hora = now.time() if es_manual else datetime.time(2, 0)  # fallback seguro
+            hora = now_local.time() if es_manual else datetime.time(2, 0)
             config = SiigoSyncConfig(
                 idcliente=idcliente,
                 hora_ejecucion=hora,
                 frecuencia_dias=1,
                 activo=True,
-                ultimo_ejecutado=func.now(),
+                ultimo_ejecutado=now_utc,
                 resultado_ultima_sync=overall_status,
-                detalle=detalle[:10000],
+                detalle_ultima_sync=detalle[:10000],
             )
             db.session.add(config)
 
-        # 🕒 Log histórico
-        fecha_programada = datetime.combine(datetime.today(), config.hora_ejecucion)
+            # 🕒 Log histórico
+            fecha_programada = datetime.combine(datetime.today(), config.hora_ejecucion)
+            logrec = SiigoSyncLog(
+                idcliente=idcliente,
+                fecha_programada=fecha_programada,
+                ejecutado_en=func.now(),
+                resultado=overall_status,
+                detalle=detalle[:10000],
+            )
+            db.session.add(logrec)
+
+        db.session.commit()
+
+        # 🟢 Guardar log en UTC
+        fecha_programada_local = datetime.combine(now_local.date(), config.hora_ejecucion)
+        fecha_programada_utc = local_to_utc(fecha_programada_local, tz_str)
+
         logrec = SiigoSyncLog(
             idcliente=idcliente,
-            fecha_programada=fecha_programada,
-            ejecutado_en=func.now(),
+            fecha_programada=fecha_programada_utc,
+            ejecutado_en=now_utc,
             resultado=overall_status,
             detalle=detalle[:10000],
         )
@@ -6476,13 +6766,17 @@ def create_app():
             "detalle": detalle
         })
 
-
+    @app.route("/ping")
+    def ping():
+        return {"message": "pong"}, 200
 
 
 
     return app
 
+app = create_app()  # 👈 ESTA LÍNEA ES CLAVE PARA RAILWAY (Gunicorn la necesita)
+
+
 if __name__ == "__main__":
-    app = create_app()
     app.run(debug=True)
 
