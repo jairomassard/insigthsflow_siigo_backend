@@ -1257,42 +1257,42 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        # Capturamos parámetros (NO usar request dentro del hilo)
         deep = request.args.get("deep") in ("1", "true", "yes")
         batch = request.args.get("batch", default=None, type=int)
         only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
-        since = request.args.get("since")
-        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"  # 👈 marca que viene desde /sync-all
+        since = request.args.get("since")  # opcional, 'YYYY-MM-DD'
 
+        # Armamos kwargs para pasarlos al hilo
         kwargs = {
             "idcliente": idcliente,
             "deep": deep,
             "only_missing": only_missing,
-            "since": since,
+            "since": since
         }
         if batch:
             kwargs["batch_size"] = batch
 
-        try:
-            if modo_sync_all:
-                # 🔹 Ejecución sin background (sincrónica)
-                mensaje = sync_facturas_desde_siigo(**kwargs)
-                return jsonify({"mensaje": mensaje}), 200
-            else:
-                # 🔹 Ejecución background para UI manual
-                def trabajo_lento(local_kwargs):
-                    with app.app_context():
-                        try:
-                            mensaje = sync_facturas_desde_siigo(**local_kwargs)
-                            print(f"[siigo_sync_facturas] ✅ Terminado: {mensaje}")
-                        except Exception:
-                            traceback.print_exc()
+        # Función que se ejecutará en background
+        def trabajo_lento(local_kwargs):
+            try:
+                # Aseguramos contexto de Flask (app, db, etc.)
+                with app.app_context():
+                    # Llamada real a la función que hace el trabajo pesado
+                    mensaje = sync_facturas_desde_siigo(**local_kwargs)
+                    # Opcional: imprimir/loggear resultado
+                    print(f"[siigo_sync_facturas] terminado: {mensaje}")
+            except Exception as e:
+                # Log completo para debug en producción
+                print("[siigo_sync_facturas] ERROR en background:")
+                traceback.print_exc()
 
-                t = Thread(target=trabajo_lento, args=(kwargs,), daemon=True)
-                t.start()
-                return jsonify({"mensaje": "Sincronización iniciada en background. Revisar logs para progreso."}), 202
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        # Lanzamos el hilo daemon para que no bloquee el proceso principal
+        t = Thread(target=trabajo_lento, args=(kwargs,), daemon=True)
+        t.start()
 
+        # Respondemos ya para evitar timeouts de Railway / proxies (202 Accepted)
+        return jsonify({"mensaje": "Sincronización iniciada en background. Revisar logs para progreso."}), 202
 
 
 
@@ -2915,41 +2915,27 @@ def create_app():
         batch = request.args.get("batch", default=None, type=int)
         only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
         since = request.args.get("since")
-        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
 
-        try:
-            if modo_sync_all:
-                # 🔹 Ejecutar directamente (sin hilo)
-                resultado = sync_compras_desde_siigo(
-                    idcliente=idcliente,
-                    deep=deep,
-                    batch_size=batch if batch else 50,
-                    only_missing=only_missing,
-                    since=since,
-                )
-                return jsonify({"mensaje": f"Compras sincronizadas: {resultado}"}), 200
+        def run_background():
+            with app.app_context():
+                try:
+                    print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
+                    sync_compras_desde_siigo(
+                        idcliente=idcliente,
+                        deep=deep,
+                        batch_size=batch if batch is not None else 50,
+                        only_missing=only_missing,
+                        since=since
+                    )
+                    print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}")
+                except Exception as e:
+                    print(f"[sync-compras] ❌ Error en background: {e}")
 
-            # 🔹 Modo UI manual: background thread
-            def run_background():
-                with app.app_context():
-                    try:
-                        print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
-                        sync_compras_desde_siigo(
-                            idcliente=idcliente,
-                            deep=deep,
-                            batch_size=batch if batch else 50,
-                            only_missing=only_missing,
-                            since=since,
-                        )
-                        print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}")
-                    except Exception as e:
-                        print(f"[sync-compras] ❌ Error en background: {e}")
-
-            threading.Thread(target=run_background, daemon=True).start()
-            return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano."}), 202
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+        # Lanzar en background
+        threading.Thread(target=run_background).start()
+        
+        # Retornar inmediatamente para evitar timeout de 30s
+        return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano."}), 202
 
 
 
@@ -6708,11 +6694,8 @@ def create_app():
                     qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
                     url += qs
 
-                headers = {
-                    "X-ID-CLIENTE": str(idcliente),
-                    "X-SYNC-ALL": "1"   # 👈 nuevo header para ejecutar de forma sincrónica
-                }
-                print("Llamando endpoint:", url, "con headers:", headers)
+                headers = {"X-ID-CLIENTE": str(idcliente)}
+                print("Llamando endpoint:", url, "con header:", headers)
                 resp = requests.post(url, headers=headers, timeout=600)
                 status = resp.status_code
                 body = resp.text
