@@ -36,6 +36,7 @@ import pandas as pd
 import zipfile
 
 import requests
+import time
 
 
 from sqlalchemy.sql import text
@@ -6701,8 +6702,11 @@ def create_app():
             ("/siigo/cross-accounts-payable", {}),
         ]
 
+        print("=== INICIO SECUENCIA SYNC-ALL ===")
+
         for ep, params in sequence:
             try:
+                print(f"➡️ Iniciando {ep} ...")
                 url = request.host_url.rstrip("/") + ep
                 if params:
                     qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
@@ -6713,7 +6717,11 @@ def create_app():
                     "X-SYNC-ALL": "1"   # 👈 nuevo header para ejecutar de forma sincrónica
                 }
                 print("Llamando endpoint:", url, "con headers:", headers)
+                inicio = time.time()
                 resp = requests.post(url, headers=headers, timeout=600)
+
+                dur = round(time.time() - inicio, 1)
+                print(f"✅ {ep} terminado en {dur}s con status {resp.status_code}")
                 status = resp.status_code
                 body = resp.text
 
