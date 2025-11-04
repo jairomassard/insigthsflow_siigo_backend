@@ -6668,10 +6668,9 @@ def create_app():
 
 
     # Enpoint para llevar a cabo la ejecucion del boton de sincronizacion de todo en siigo
-    # Endpoint para sincronizar todo (invoca internamente otros endpoints)  
+    # Endpoint para sincronizar todo (invoca internamente otros endpoints)
     @app.route("/siigo/sync-all", methods=["POST"])
     def siigo_sync_all():
-        
         idcliente = obtener_idcliente_desde_request()
         print("Sync-all iniciado, idcliente:", idcliente)
         if not idcliente:
@@ -6688,7 +6687,7 @@ def create_app():
         cliente = Cliente.query.get_or_404(idcliente)
         tz_str = cliente.timezone or "America/Bogota"
 
-        # 🔁 Ejecución real de sincronización
+        # 🔁 Secuencia de endpoints Siigo
         sequence = [
             ("/siigo/sync-catalogos", {}),
             ("/siigo/sync-customers", {}),
@@ -6704,49 +6703,51 @@ def create_app():
 
         print("=== INICIO SECUENCIA SYNC-ALL ===")
 
-        for ep, params in sequence:
-            try:
-                print(f"➡️ Iniciando {ep} ...")
-                url = request.host_url.rstrip("/") + ep
-                if params:
-                    qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
-                    url += qs
+        # 🧠 Ejecuta cada endpoint localmente (sin salir del proceso)
+        with app.test_client() as client:
+            for ep, params in sequence:
+                try:
+                    print(f"➡️ Iniciando {ep} ...")
+                    inicio = time.time()
 
-                headers = {
-                    "X-ID-CLIENTE": str(idcliente),
-                    "X-SYNC-ALL": "1"   # 👈 nuevo header para ejecutar de forma sincrónica
-                }
-                print("Llamando endpoint:", url, "con headers:", headers)
-                inicio = time.time()
-                resp = requests.post(url, headers=headers, timeout=600)
+                    # Llamada interna dentro del proceso Flask
+                    resp = client.post(
+                        ep,
+                        headers={
+                            "X-ID-CLIENTE": str(idcliente),
+                            "X-SYNC-ALL": "1"
+                        },
+                        query_string=params
+                    )
 
-                dur = round(time.time() - inicio, 1)
-                print(f"✅ {ep} terminado en {dur}s con status {resp.status_code}")
-                status = resp.status_code
-                body = resp.text
+                    dur = round(time.time() - inicio, 1)
+                    print(f"✅ {ep} terminado en {dur}s con status {resp.status_code}")
 
-                log_parts.append(f"{ep} {params} → {status}: {body}")
-                if status >= 400:
+                    status = resp.status_code
+                    body = resp.get_data(as_text=True)
+                    log_parts.append(f"{ep} {params} → {status}: {body}")
+
+                    if status >= 400:
+                        overall_status = "ERROR"
+                        break
+
+                except Exception as e:
                     overall_status = "ERROR"
+                    log_parts.append(f"{ep} excepción: {str(e)}")
                     break
 
-            except Exception as e:
-                overall_status = "ERROR"
-                log_parts.append(f"{ep} excepción: {str(e)}")
-                break
-
+        # 🟢 Consolidar logs
         detalle = "\n".join(log_parts)
-       
-        # 🟢 Fecha y hora local → UTC
+
+        # 🕒 Fecha local → UTC
         now_local = datetime.now()
         now_utc = local_to_utc(now_local, tz_str)
 
-        # Actualizar o crear configuración
+        # 🧩 Actualizar configuración o crearla
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
-
         if config:
             if es_manual:
-                config.hora_ejecucion = now_local.time()  # 🟢 local
+                config.hora_ejecucion = now_local.time()
             config.ultimo_ejecutado = now_utc
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
@@ -6764,20 +6765,7 @@ def create_app():
             )
             db.session.add(config)
 
-            # 🕒 Log histórico
-            fecha_programada = datetime.combine(datetime.today(), config.hora_ejecucion)
-            logrec = SiigoSyncLog(
-                idcliente=idcliente,
-                fecha_programada=fecha_programada,
-                ejecutado_en=func.now(),
-                resultado=overall_status,
-                detalle=detalle[:10000],
-            )
-            db.session.add(logrec)
-
-        db.session.commit()
-
-        # 🟢 Guardar log en UTC
+        # 🧾 Registrar log histórico
         fecha_programada_local = datetime.combine(now_local.date(), config.hora_ejecucion)
         fecha_programada_utc = local_to_utc(fecha_programada_local, tz_str)
 
@@ -6789,13 +6777,13 @@ def create_app():
             detalle=detalle[:10000],
         )
         db.session.add(logrec)
-
         db.session.commit()
 
         return jsonify({
             "status": overall_status,
             "detalle": detalle
         })
+
 
     @app.route("/ping")
     def ping():
