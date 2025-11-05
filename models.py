@@ -752,3 +752,31 @@ class SiigoSyncLog(db.Model):
             "detalle": self.detalle,
             "creado_en": self.creado_en.isoformat()
         }
+
+
+
+class SiigoSyncMetric(db.Model):
+    __tablename__ = "siigo_sync_metrics"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+    endpoint = db.Column(db.Text, nullable=False)
+    duracion_segundos = db.Column(db.Numeric(8, 2))
+    status_code = db.Column(db.Integer)
+    resultado = db.Column(db.Text)
+    ejecutado_en = db.Column(db.DateTime(timezone=True), server_default=func.now())
+    detalle_resumen = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "idcliente": self.idcliente,
+            "endpoint": self.endpoint,
+            "duracion_segundos": float(self.duracion_segundos or 0),
+            "status_code": self.status_code,
+            "resultado": self.resultado,
+            "ejecutado_en": self.ejecutado_en.isoformat() if self.ejecutado_en else None,
+            "detalle_resumen": (self.detalle_resumen[:300] + "...") if self.detalle_resumen and len(self.detalle_resumen) > 300 else self.detalle_resumen,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }

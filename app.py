@@ -11,7 +11,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import date, datetime, timezone, timedelta
  
 from config import Config
-from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog
+from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric
 from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
@@ -6727,6 +6727,22 @@ def create_app():
                     body = resp.get_data(as_text=True)
                     log_parts.append(f"{ep} {params} → {status}: {body}")
 
+                    # 🧩 Guardar métrica de ejecución individual
+                    try:
+                        resumen = body[:300] if body else None
+                        metric = SiigoSyncMetric(
+                            idcliente=idcliente,
+                            endpoint=ep,
+                            duracion_segundos=dur,
+                            status_code=status,
+                            resultado="OK" if status < 400 else "ERROR",
+                            detalle_resumen=resumen
+                        )
+                        db.session.add(metric)
+                        db.session.commit()
+                    except Exception as e:
+                        print(f"⚠️ Error guardando métrica: {e}")
+
                     if status >= 400:
                         overall_status = "ERROR"
                         break
@@ -6765,7 +6781,7 @@ def create_app():
             )
             db.session.add(config)
 
-        # 🧾 Registrar log histórico
+        # 🧾 Registrar log histórico general
         fecha_programada_local = datetime.combine(now_local.date(), config.hora_ejecucion)
         fecha_programada_utc = local_to_utc(fecha_programada_local, tz_str)
 
@@ -6783,6 +6799,7 @@ def create_app():
             "status": overall_status,
             "detalle": detalle
         })
+
 
 
     @app.route("/ping")
