@@ -53,7 +53,8 @@ from decoradores_seguridad import (
     _perfil_tiene_permiso
 )
 
-from utils import local_to_utc
+from utils import local_to_utc, utc_to_local
+
 
 import threading
 from threading import Thread
@@ -6638,7 +6639,7 @@ def create_app():
 
 
     
-    @app.route("/config/siigo-sync-status", methods=["GET", "OPTIONS"])
+    @app.route("/config/siigo-sync-status", methods=["GET", "OPTIONS"]) 
     @jwt_required()
     @cross_origin()  # opcional si ya tienes CORS global
     def config_siigo_sync_status():
@@ -6652,18 +6653,33 @@ def create_app():
                 "pendientes": 0,
                 "ultimo_ejec": None,
                 "resultado": None,
-                "detalle": ""
+                "detalle": "",
+                "hora_ejecucion": None,
+                "frecuencia_dias": 1,
+                "activo": False,
             })
+
+        # 🔹 Obtener timezone del cliente (o Bogotá por defecto)
+        cliente = Cliente.query.get(idcliente)
+        tz_str = (cliente.timezone if cliente and cliente.timezone else "America/Bogota")
+
+        # 🔹 Convertir de UTC (BD) → hora local del cliente
+        if config.ultimo_ejecutado:
+            dt_local = utc_to_local(config.ultimo_ejecutado, tz_str)
+            ultimo_ejec = dt_local.isoformat()
+        else:
+            ultimo_ejec = None
 
         return jsonify({
             "pendientes": 0,
-            "ultimo_ejec": config.ultimo_ejecutado.isoformat() if config.ultimo_ejecutado else None,
+            "ultimo_ejec": ultimo_ejec,  # ← ya viene en hora local
             "resultado": config.resultado_ultima_sync,
             "detalle": config.detalle_ultima_sync or "",
             "hora_ejecucion": config.hora_ejecucion.strftime("%H:%M") if config.hora_ejecucion else None,
             "frecuencia_dias": config.frecuencia_dias,
             "activo": config.activo,
         })
+
 
 
 
