@@ -6816,11 +6816,19 @@ def create_app():
        # 🟢 Crear notificación para administradores del cliente
         try:
             titulo = "Sincronización automática completada"
+            # Detectar el último endpoint fallido, si hubo error
+            ep_fallido = None
+            for line in reversed(log_parts):
+                if "→" in line and "ERROR" in line or "excepción" in line:
+                    ep_fallido = line.split(" ")[0]
+                    break
+
+
             if overall_status == "OK":
                 mensaje = f"✅ La sincronización automática de Siigo finalizó correctamente el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str})."
                 nivel = "success"
             else:
-                mensaje = f"❌ La sincronización automática de Siigo falló el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). Revisa los reportes de integración para más detalles."
+                mensaje = f"❌ La sincronización automática de Siigo falló en {ep_fallido or 'uno de los módulos'} el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). Revisa los reportes de integración para más detalles."
                 nivel = "error"
 
             notif = SystemNotification(
