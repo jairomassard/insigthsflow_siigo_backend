@@ -5,8 +5,6 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Boolean, Numeric, TIMESTAMP
 
-
-
 db = SQLAlchemy()
 
 class Cliente(db.Model):
@@ -780,3 +778,21 @@ class SiigoSyncMetric(db.Model):
             "detalle_resumen": (self.detalle_resumen[:300] + "...") if self.detalle_resumen and len(self.detalle_resumen) > 300 else self.detalle_resumen,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
+
+
+
+
+class SystemNotification(db.Model):
+    __tablename__ = "system_notifications"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, nullable=False)
+    tipo = db.Column(db.String(50), default="INFO")  # Ej: 'SYNC_RESULT'
+    titulo = db.Column(db.String(200))
+    mensaje = db.Column(db.Text)
+    nivel = db.Column(db.String(20), default="info")  # 'info', 'success', 'warning', 'error'
+    leido = db.Column(db.Boolean, default=False)
+    creado_en = db.Column(db.DateTime(timezone=True), default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<SystemNotification id={self.id} cliente={self.idcliente} tipo={self.tipo}>"

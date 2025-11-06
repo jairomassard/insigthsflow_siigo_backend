@@ -11,7 +11,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import date, datetime, timezone, timedelta
  
 from config import Config
-from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric
+from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification
 from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
@@ -6813,12 +6813,166 @@ def create_app():
         db.session.add(logrec)
         db.session.commit()
 
+       # 🟢 Crear notificación para administradores del cliente
+        try:
+            titulo = "Sincronización automática completada"
+            if overall_status == "OK":
+                mensaje = f"✅ La sincronización automática de Siigo finalizó correctamente el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str})."
+                nivel = "success"
+            else:
+                mensaje = f"❌ La sincronización automática de Siigo falló el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). Revisa los reportes de integración para más detalles."
+                nivel = "error"
+
+            notif = SystemNotification(
+                idcliente=idcliente,
+                tipo="SYNC_RESULT",
+                titulo=titulo,
+                mensaje=mensaje,
+                nivel=nivel,
+                leido=False
+            )
+            db.session.add(notif)
+            db.session.commit()
+            print(f"📢 Notificación creada para cliente {idcliente}: {nivel}")
+        except Exception as e:
+            print(f"⚠️ Error creando notificación: {e}")
+
         print("✅ Registro en BD completado. Verifica hora con offset correcto en logs/DB.\n")
 
         return jsonify({
             "status": overall_status,
             "detalle": detalle
         })
+
+
+
+    # --- CRON: Verificador automático de sincronización Siigo (cada 4 horas) ---
+    @app.route("/cron/siigo-verifier", methods=["GET"])
+    def cron_siigo_verifier():
+        """
+        Verifica en siigo_sync_config qué clientes deben ejecutar sync-all
+        en las próximas 4 horas (según su zona horaria y frecuencia).
+        Ejecuta si están dentro del rango.
+        """
+        from datetime import datetime, timedelta
+        import pytz
+
+        print("⏰ CRON Siigo-verifier iniciado...")
+
+        ahora_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+        rango_horas = 4  # 🔹 Cada 4 horas
+        print(f"🕓 Hora actual UTC: {ahora_utc.isoformat()}")
+
+        # Buscar configuraciones activas
+        configs = SiigoSyncConfig.query.filter_by(activo=True).all()
+        if not configs:
+            print("⚠️ No hay configuraciones activas en siigo_sync_config.")
+            return jsonify({"mensaje": "Sin configuraciones activas"})
+
+        ejecutados = []
+        skip_por_frecuencia = []
+        fuera_de_rango = []
+
+        for cfg in configs:
+            cliente = Cliente.query.get(cfg.idcliente)
+            if not cliente:
+                continue
+
+            tz_str = cliente.timezone or "America/Bogota"
+            tz_obj = pytz.timezone(tz_str)
+            ahora_local = ahora_utc.astimezone(tz_obj)
+
+            hora_prog = cfg.hora_ejecucion
+            fecha_prog_local = datetime.combine(ahora_local.date(), hora_prog)
+            fecha_prog_local = tz_obj.localize(fecha_prog_local)
+
+            # Ajuste si ya pasó la hora programada hoy → usar la de mañana
+            if fecha_prog_local < ahora_local:
+                fecha_prog_local += timedelta(days=1)
+
+            # Verificar frecuencia
+            if cfg.ultimo_ejecutado:
+                dias_desde_ultima = (ahora_utc - cfg.ultimo_ejecutado).days
+                if dias_desde_ultima < cfg.frecuencia_dias:
+                    skip_por_frecuencia.append(cliente.idcliente)
+                    continue
+
+            # Si está dentro de las próximas 4 horas, ejecutar
+            diff_horas = (fecha_prog_local - ahora_local).total_seconds() / 3600
+            if 0 <= diff_horas <= rango_horas:
+                print(f"🚀 Ejecutando sync-all para cliente {cliente.idcliente} ({tz_str})")
+                try:
+                    with app.test_client() as client:
+                        resp = client.post(
+                            "/siigo/sync-all",
+                            headers={"X-ID-CLIENTE": str(cliente.idcliente)},
+                            json={"origen": "cron"}
+                        )
+                        print(f"✅ Cliente {cliente.idcliente} → {resp.status_code}")
+                        ejecutados.append(cliente.idcliente)
+                except Exception as e:
+                    print(f"❌ Error en cliente {cliente.idcliente}: {e}")
+            else:
+                fuera_de_rango.append(cliente.idcliente)
+
+        print(f"🟢 Ejecutados: {ejecutados}")
+        print(f"⏸ Omitidos por frecuencia: {skip_por_frecuencia}")
+        print(f"⏰ Fuera de rango horario: {fuera_de_rango}")
+
+        return jsonify({
+            "hora_utc": ahora_utc.isoformat(),
+            "ejecutados": ejecutados,
+            "omitidos_por_frecuencia": skip_por_frecuencia,
+            "fuera_de_rango": fuera_de_rango,
+            "total_activos": len(configs)
+        })
+
+
+
+    @app.route("/api/notificaciones", methods=["GET"])
+    @jwt_required()
+    def get_notificaciones():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        perfilid = claims.get("perfilid")
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        # Solo administradores del cliente o superadmin (perfilid == 0)
+        if perfilid not in [0, 1]:
+            return jsonify([])
+
+        notifs = (
+            SystemNotification.query
+            .filter_by(idcliente=idcliente, leido=False)
+            .order_by(SystemNotification.creado_en.desc())
+            .limit(5)
+            .all()
+        )
+
+        return jsonify([
+            {
+                "id": n.id,
+                "titulo": n.titulo,
+                "mensaje": n.mensaje,
+                "nivel": n.nivel,
+                "fecha": n.creado_en.isoformat()
+            }
+            for n in notifs
+        ])
+
+
+
+    @app.route("/api/notificaciones/marcar-leida/<int:notif_id>", methods=["POST"])
+    @jwt_required()
+    def marcar_notificacion_leida(notif_id):
+        idcliente = get_jwt().get("idcliente")
+        notif = SystemNotification.query.filter_by(id=notif_id, idcliente=idcliente).first()
+        if notif:
+            notif.leido = True
+            db.session.commit()
+        return jsonify({"ok": True})
 
 
 
