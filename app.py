@@ -6678,6 +6678,7 @@ def create_app():
             "hora_ejecucion": config.hora_ejecucion.strftime("%H:%M") if config.hora_ejecucion else None,
             "frecuencia_dias": config.frecuencia_dias,
             "activo": config.activo,
+            "timezone": tz_str  # 👈 nuevo campo
         })
 
 
