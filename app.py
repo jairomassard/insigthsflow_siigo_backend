@@ -6689,7 +6689,7 @@ def create_app():
     @app.route("/siigo/sync-all", methods=["POST"])
     def siigo_sync_all():
         idcliente = obtener_idcliente_desde_request()
-        print("Sync-all iniciado, idcliente:", idcliente)
+        print(f"🔹 Sync-all iniciado para cliente {idcliente}")
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
@@ -6700,11 +6700,12 @@ def create_app():
         log_parts = []
         overall_status = "OK"
 
-        # 🟢 Obtener timezone del cliente
+        # 🕒 Obtener zona horaria del cliente
         cliente = Cliente.query.get_or_404(idcliente)
         tz_str = cliente.timezone or "America/Bogota"
+        print(f"🌎 Zona horaria detectada para cliente {idcliente}: {tz_str}")
 
-        # 🔁 Secuencia de endpoints Siigo
+        # 🔁 Secuencia de endpoints Siigo a ejecutar
         sequence = [
             ("/siigo/sync-catalogos", {}),
             ("/siigo/sync-customers", {}),
@@ -6718,16 +6719,15 @@ def create_app():
             ("/siigo/cross-accounts-payable", {}),
         ]
 
-        print("=== INICIO SECUENCIA SYNC-ALL ===")
+        print("🚀 === INICIO SECUENCIA SYNC-ALL ===")
 
-        # 🧠 Ejecuta cada endpoint localmente (sin salir del proceso)
+        # 🧠 Ejecuta cada endpoint localmente (sin salir del proceso Flask)
         with app.test_client() as client:
             for ep, params in sequence:
                 try:
-                    print(f"➡️ Iniciando {ep} ...")
+                    print(f"➡️  Ejecutando {ep} ...")
                     inicio = time.time()
 
-                    # Llamada interna dentro del proceso Flask
                     resp = client.post(
                         ep,
                         headers={
@@ -6738,13 +6738,13 @@ def create_app():
                     )
 
                     dur = round(time.time() - inicio, 1)
-                    print(f"✅ {ep} terminado en {dur}s con status {resp.status_code}")
+                    print(f"✅ {ep} completado en {dur}s → {resp.status_code}")
 
                     status = resp.status_code
                     body = resp.get_data(as_text=True)
                     log_parts.append(f"{ep} {params} → {status}: {body}")
 
-                    # 🧩 Guardar métrica de ejecución individual
+                    # 📊 Guardar métrica individual del endpoint
                     try:
                         resumen = body[:300] if body else None
                         metric = SiigoSyncMetric(
@@ -6758,7 +6758,7 @@ def create_app():
                         db.session.add(metric)
                         db.session.commit()
                     except Exception as e:
-                        print(f"⚠️ Error guardando métrica: {e}")
+                        print(f"⚠️  Error guardando métrica: {e}")
 
                     if status >= 400:
                         overall_status = "ERROR"
@@ -6769,19 +6769,21 @@ def create_app():
                     log_parts.append(f"{ep} excepción: {str(e)}")
                     break
 
-        # 🟢 Consolidar logs
+        # 🟢 Consolidar logs finales
         detalle = "\n".join(log_parts)
 
-        # 🕒 Fecha local → UTC
-        now_local = datetime.now()
-        now_utc = local_to_utc(now_local, tz_str)
+        # 🕒 Fecha/hora local del cliente
+        now_local = datetime.now(timezone(tz_str))
+        print(f"🕒 Fecha/hora local: {now_local.isoformat()}")
+        print(f"🕐 Offset local detectado: {now_local.utcoffset()}")
+        print(f"📦 Guardando hora local con zona horaria incluida para cliente {idcliente}")
 
         # 🧩 Actualizar configuración o crearla
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
         if config:
             if es_manual:
                 config.hora_ejecucion = now_local.time()
-            config.ultimo_ejecutado = now_utc
+            config.ultimo_ejecutado = now_local  # ✅ Guardamos hora local con tzinfo
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
@@ -6792,25 +6794,24 @@ def create_app():
                 hora_ejecucion=hora,
                 frecuencia_dias=1,
                 activo=True,
-                ultimo_ejecutado=now_utc,
+                ultimo_ejecutado=now_local,
                 resultado_ultima_sync=overall_status,
                 detalle_ultima_sync=detalle[:10000],
             )
             db.session.add(config)
 
-        # 🧾 Registrar log histórico general
-        fecha_programada_local = datetime.combine(now_local.date(), config.hora_ejecucion)
-        fecha_programada_utc = local_to_utc(fecha_programada_local, tz_str)
-
+        # 🧾 Registrar log histórico (ya en hora local del cliente)
         logrec = SiigoSyncLog(
             idcliente=idcliente,
-            fecha_programada=fecha_programada_utc,
-            ejecutado_en=now_utc,
+            fecha_programada=now_local,
+            ejecutado_en=now_local,
             resultado=overall_status,
             detalle=detalle[:10000],
         )
         db.session.add(logrec)
         db.session.commit()
+
+        print("✅ Registro en BD completado. Verifica hora con offset correcto en logs/DB.\n")
 
         return jsonify({
             "status": overall_status,
@@ -6819,6 +6820,7 @@ def create_app():
 
 
 
+    # Para verificar la conexion del BAckend
     @app.route("/ping")
     def ping():
         return {"message": "pong"}, 200
