@@ -6,23 +6,17 @@ from app import app, db
 from models import Cliente, SiigoSyncConfig
 
 # === CONFIGURACIÓN DEL CRON ===
-# Ejecuta cada 4 horas (definido en Railway)
-# Este script recorre todos los clientes activos y dispara su sincronización si corresponde.
+# Ejecuta cada 4 horas (configuras esto en Railway)
+# Este script se encarga de decidir qué clientes sincronizar.
 
 def ejecutar_sync_pendientes():
     with app.app_context():
-        print("\n" + "=" * 60)
-        print("🕓 INICIO DE VERIFICACIÓN AUTOMÁTICA DE SINCRONIZACIONES")
-        print("=" * 60)
-
+        print("🕓 Iniciando verificación de sincronizaciones automáticas...")
         now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+
+        # Traer todos los clientes activos con configuración
         configs = SiigoSyncConfig.query.all()
-
-        print(f"🔍 Se encontraron {len(configs)} configuraciones registradas.\n")
-
-        total_ok = 0
-        total_error = 0
-        total_pendientes = 0
+        print(f"🔍 Se encontraron {len(configs)} configuraciones registradas.")
 
         for cfg in configs:
             cliente = Cliente.query.get(cfg.idcliente)
@@ -35,6 +29,7 @@ def ejecutar_sync_pendientes():
 
             # Calcular próxima ejecución esperada
             ultima_ejec = cfg.ultimo_ejecutado.astimezone(tz) if cfg.ultimo_ejecutado else None
+            proxima_ejec = None
             if ultima_ejec:
                 proxima_ejec = ultima_ejec + timedelta(days=cfg.frecuencia_dias)
                 proxima_ejec = proxima_ejec.replace(
@@ -43,18 +38,16 @@ def ejecutar_sync_pendientes():
                     second=cfg.hora_ejecucion.second
                 )
             else:
+                # Si nunca ha ejecutado, usar la hora programada del día actual
                 proxima_ejec = now_local.replace(
                     hour=cfg.hora_ejecucion.hour,
                     minute=cfg.hora_ejecucion.minute,
                     second=cfg.hora_ejecucion.second
                 )
 
-            print(f"👤 Cliente {cliente.id} – {cliente.nombre}")
-            print(f"   🕐 Hora local: {now_local.strftime('%Y-%m-%d %H:%M:%S')} ({tz_str})")
-            print(f"   📅 Próxima ejecución esperada: {proxima_ejec.strftime('%Y-%m-%d %H:%M:%S')}")
-
+            # Verificar si ya toca ejecutar
             if now_local >= proxima_ejec:
-                print(f"   ⏰ Ejecutando sincronización automática...")
+                print(f"⏰ Ejecutando sincronización para cliente {cliente.id} ({cliente.nombre})")
                 try:
                     with app.test_client() as client:
                         resp = client.post(
@@ -62,30 +55,14 @@ def ejecutar_sync_pendientes():
                             headers={"X-ID-CLIENTE": str(cliente.id)},
                             json={"origen": "cron"}
                         )
-                        if resp.status_code < 400:
-                            print(f"   ✅ Sincronización completada con éxito (HTTP {resp.status_code})")
-                            total_ok += 1
-                        else:
-                            print(f"   ❌ Error HTTP {resp.status_code} durante la sincronización")
-                            total_error += 1
+                        print(f"✅ Resultado cliente {cliente.id}: {resp.status_code}")
                 except Exception as e:
-                    print(f"   💥 Excepción: {e}")
-                    total_error += 1
+                    print(f"❌ Error ejecutando sync para cliente {cliente.id}: {e}")
             else:
                 faltan = (proxima_ejec - now_local).total_seconds() / 3600
-                print(f"   💤 No ejecuta aún (faltan {faltan:.1f} horas)")
-                total_pendientes += 1
+                print(f"🕒 Cliente {cliente.id} aún no debe ejecutar (faltan {faltan:.1f}h)")
 
-            print("-" * 60)
-
-        # === Resumen final ===
-        print("\n📊 RESUMEN DEL CRON")
-        print("=" * 60)
-        print(f"✅ Éxitos     : {total_ok}")
-        print(f"❌ Errores    : {total_error}")
-        print(f"⏳ Pendientes : {total_pendientes}")
-        print("=" * 60)
-        print("🏁 Verificación de sincronizaciones finalizada.\n")
+        print("🏁 Verificación de sincronizaciones finalizada.")
 
 if __name__ == "__main__":
     ejecutar_sync_pendientes()
