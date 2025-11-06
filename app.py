@@ -6772,8 +6772,10 @@ def create_app():
         # 🟢 Consolidar logs finales
         detalle = "\n".join(log_parts)
 
-        # 🕒 Fecha/hora local del cliente
-        now_local = datetime.now(timezone(tz_str))
+        # ✅ Usar pytz solo localmente (sin afectar otras partes del programa)
+        import pytz
+        tz_obj = pytz.timezone(tz_str)
+        now_local = datetime.now(tz_obj)
         print(f"🕒 Fecha/hora local: {now_local.isoformat()}")
         print(f"🕐 Offset local detectado: {now_local.utcoffset()}")
         print(f"📦 Guardando hora local con zona horaria incluida para cliente {idcliente}")
@@ -6817,6 +6819,7 @@ def create_app():
             "status": overall_status,
             "detalle": detalle
         })
+
 
 
 
