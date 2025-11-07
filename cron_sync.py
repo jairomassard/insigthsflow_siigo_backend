@@ -49,7 +49,7 @@ def ejecutar_sync_pendientes():
                     second=cfg.hora_ejecucion.second
                 )
 
-            print(f"👤 Cliente {cliente.id} – {cliente.nombre}")
+            print(f"👤 Cliente {cliente.idcliente} – {cliente.nombre}")
             print(f"   🕐 Hora local: {now_local.strftime('%Y-%m-%d %H:%M:%S')} ({tz_str})")
             print(f"   📅 Próxima ejecución esperada: {proxima_ejec.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -59,7 +59,7 @@ def ejecutar_sync_pendientes():
                     with app.test_client() as client:
                         resp = client.post(
                             "/siigo/sync-all",
-                            headers={"X-ID-CLIENTE": str(cliente.id)},
+                            headers={"X-ID-CLIENTE": str(cliente.idcliente)},
                             json={"origen": "cron"}
                         )
                         if resp.status_code < 400:
