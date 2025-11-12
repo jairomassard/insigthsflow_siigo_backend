@@ -4198,7 +4198,6 @@ def create_app():
             SELECT
                 date_trunc('month', fecha) AS mes,
                 SUM(COALESCE(total,0)) AS ingresos,
-                SUM(COALESCE(subtotal,0)) AS ingresos_netos,
                 COUNT(*) AS facturas_venta
             FROM facturas_enriquecidas
             WHERE {where_sql}
@@ -4260,7 +4259,6 @@ def create_app():
             nom = nomina_dict.get(mes, {"nomina": 0})
 
             ingresos = ing["ingresos"] or 0
-            ingresos_netos = ing.get("ingresos_netos", 0) or 0
             egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)
             nomina_mes = nom["nomina"] or 0
 
@@ -4276,12 +4274,10 @@ def create_app():
                 "nomina": nomina_mes,
                 "utilidad": utilidad,
                 "margen": round(margen, 2),
-                "utilidad_acumulada": utilidad_acumulada,
-                "ingresos_netos": ingresos_netos,
+                "utilidad_acumulada": utilidad_acumulada
             })
 
             total_ingresos += ingresos
-            total_ingresos_netos = total_ingresos_netos + ingresos_netos if 'total_ingresos_netos' in locals() else ingresos_netos
             total_egresos += egresos
             total_nomina += nomina_mes
             facturas_venta += ing["facturas_venta"]
@@ -4293,7 +4289,6 @@ def create_app():
 
         kpis = {
             "ingresos": total_ingresos,
-            "ingresos_netos": total_ingresos_netos,
             "egresos": total_egresos,
             "nomina": total_nomina,
             "utilidad": utilidad_total,
