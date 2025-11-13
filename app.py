@@ -4185,7 +4185,7 @@ def create_app():
             condiciones.append("fecha >= :desde")
             params["desde"] = fecha_desde_val
         if fecha_hasta_val:
-            condiciones.append("fecha <= :hasta")
+            condiciones.append("fecha < (:hasta::date + INTERVAL '1 day')")
             params["hasta"] = fecha_hasta_val
         if centro_costos:
             condiciones.append("cost_center = :centro_costos")
@@ -4371,7 +4371,8 @@ def create_app():
             condiciones.append("fecha >= :desde")
             params["desde"] = desde
         if hasta and validar_fecha(hasta):
-            condiciones.append("fecha <= :hasta")
+            # incluir TODO el día final (hasta las 23:59:59)
+            condiciones.append("fecha < (:hasta::date + INTERVAL '1 day')")
             params["hasta"] = hasta
         if cliente:
             condiciones.append("cliente_nombre = :cliente")
