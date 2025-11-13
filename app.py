@@ -4355,7 +4355,8 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
-        cost_center = request.args.get("cost_center")
+        centro_costos = request.args.get("centro_costos")
+
 
         condiciones = ["idcliente = :idcliente"]
         params = {"idcliente": idcliente}
@@ -4375,9 +4376,11 @@ def create_app():
         if cliente:
             condiciones.append("cliente_nombre = :cliente")
             params["cliente"] = cliente
-        if cost_center:
-            condiciones.append("cost_center = :cost_center")
-            params["cost_center"] = cost_center
+        if centro_costos:
+            condiciones.append("(cost_center = :centro_costos OR cost_center IS NULL)")
+            params["centro_costos"] = centro_costos
+
+
 
         where_sql = " AND ".join(condiciones)
 
