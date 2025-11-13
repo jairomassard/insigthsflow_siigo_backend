@@ -4185,7 +4185,7 @@ def create_app():
             condiciones.append("fecha >= :desde")
             params["desde"] = fecha_desde_val
         if fecha_hasta_val:
-            condiciones.append("fecha < (:hasta::date + INTERVAL '1 day')")
+            condiciones.append("fecha <= :hasta")
             params["hasta"] = fecha_hasta_val
         if centro_costos:
             condiciones.append("cost_center = :centro_costos")
