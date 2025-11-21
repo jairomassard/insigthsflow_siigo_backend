@@ -4356,7 +4356,7 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
-        centro_costos = request.args.get("centro_costos")
+        centro_costos = request.args.get("centro_costos", type=int)  # 👈 opcional pero mejor
 
 
         condiciones = ["idcliente = :idcliente"]
@@ -4379,9 +4379,10 @@ def create_app():
             condiciones.append("cliente_nombre = :cliente")
             params["cliente"] = cliente
         if centro_costos:
-            condiciones.append("(cost_center = :centro_costos OR cost_center IS NULL)")
+            # condiciones.append("(cost_center = :centro_costos OR cost_center IS NULL)")
+            # 👇 QUITA el OR cost_center IS NULL
+            condiciones.append("cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
-
 
 
         where_sql = " AND ".join(condiciones)
