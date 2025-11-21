@@ -4167,9 +4167,7 @@ def create_app():
         # -------- Filtros --------
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        # centro_costos = request.args.get("centro_costos")
-        cost_center = request.args.get("cost_center")
-
+        centro_costos = request.args.get("centro_costos", type=int)
 
         params = {"idcliente": idcliente}
         condiciones = ["idcliente = :idcliente"]
@@ -4189,13 +4187,10 @@ def create_app():
         if fecha_hasta_val:
             condiciones.append("fecha <= :hasta")
             params["hasta"] = fecha_hasta_val
-        #if centro_costos:
-        #    condiciones.append("cost_center = :centro_costos")
-        #    params["centro_costos"] = centro_costos
-        if cost_center:
-            wh.append("f.cost_center = :cc")
-            params["cc"] = cost_center
-
+        if centro_costos:
+            # misma columna en facturas_enriquecidas y siigo_compras
+            condiciones.append("cost_center = :centro_costos")
+            params["centro_costos"] = centro_costos
 
         where_sql = " AND ".join(condiciones)
 
