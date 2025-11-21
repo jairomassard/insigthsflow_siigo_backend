@@ -2126,7 +2126,7 @@ def create_app():
         hasta       = request.args.get("hasta")
         cliente     = request.args.get("cliente")
         cost_center = request.args.get("cost_center", type=int)
-        limit       = request.args.get("limit", type=int) or 20
+        limit       = request.args.get("limit", type=int)
         offset      = request.args.get("offset", type=int) or 0
         filtro_estado = request.args.get("estado")  # 👈 'sano' | 'alerta' | 'vencido' | 'pagado'
 
@@ -2163,7 +2163,7 @@ def create_app():
                 FROM facturas_enriquecidas f
                 WHERE {where_clause}
                 ORDER BY f.fecha DESC
-                LIMIT :limit OFFSET :offset
+                LIMIT COALESCE(:limit, 999999)
             """)
             rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
             enriched = enriquecer_facturas(rows)
@@ -4167,7 +4167,9 @@ def create_app():
         # -------- Filtros --------
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        centro_costos = request.args.get("centro_costos")
+        # centro_costos = request.args.get("centro_costos")
+        cost_center = request.args.get("cost_center")
+
 
         params = {"idcliente": idcliente}
         condiciones = ["idcliente = :idcliente"]
@@ -4187,9 +4189,13 @@ def create_app():
         if fecha_hasta_val:
             condiciones.append("fecha <= :hasta")
             params["hasta"] = fecha_hasta_val
-        if centro_costos:
-            condiciones.append("cost_center = :centro_costos")
-            params["centro_costos"] = centro_costos
+        #if centro_costos:
+        #    condiciones.append("cost_center = :centro_costos")
+        #    params["centro_costos"] = centro_costos
+        if cost_center:
+            wh.append("f.cost_center = :cc")
+            params["cc"] = cost_center
+
 
         where_sql = " AND ".join(condiciones)
 
