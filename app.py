@@ -1957,7 +1957,7 @@ def create_app():
 
         sql = text(f"""
             SELECT
-                f.id,
+                f.factura_id AS id,
                 f.idfactura,
                 f.fecha,
                 f.vencimiento,
