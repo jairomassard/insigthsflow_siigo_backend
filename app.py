@@ -1989,7 +1989,7 @@ def create_app():
     # Modal para ver facturas por cliente en pagina Finaciero/ventas
     @app.route("/reportes/facturas_por_cliente", methods=["GET"])
     @jwt_required()
-    def facturas_por_cliente():
+    def facturas_por_cliente_financieroventas():
         from sqlalchemy.sql import text
 
         claims = get_jwt()
