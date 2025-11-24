@@ -2084,7 +2084,11 @@ def create_app():
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
-        wh = ["f.idcliente = :idcliente", "f.estado_pago = :estado"]
+        wh = [
+            "f.idcliente = :idcliente",
+            "TRIM(LOWER(f.estado_pago)) = TRIM(LOWER(:estado))"
+        ]
+
         params = {"idcliente": idcliente, "estado": estado}
 
         if desde:
