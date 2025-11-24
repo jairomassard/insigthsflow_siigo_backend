@@ -1985,6 +1985,151 @@ def create_app():
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify({"rows": rows})
 
+    
+    # Modal para ver facturas por cliente en pagina Finaciero/ventas
+    @app.route("/reportes/facturas_por_cliente", methods=["GET"])
+    @jwt_required()
+    def facturas_por_cliente():
+        from sqlalchemy.sql import text
+
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        cliente_nombre = request.args.get("cliente")
+        if not cliente_nombre:
+            return jsonify({"rows": []})
+
+        desde       = request.args.get("desde")
+        hasta       = request.args.get("hasta")
+        seller_id   = request.args.get("seller_id", type=int)
+        cost_center = request.args.get("cost_center", type=int)
+
+        wh = ["f.idcliente = :idcliente", "f.cliente_nombre = :cliente"]
+        params = {"idcliente": idcliente, "cliente": cliente_nombre}
+
+        if desde:
+            wh.append("f.fecha >= :desde")
+            params["desde"] = desde
+
+        if hasta:
+            wh.append("f.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        if seller_id:
+            wh.append("f.seller_id = :seller_id")
+            params["seller_id"] = seller_id
+
+        if cost_center:
+            wh.append("f.cost_center = :cost_center")
+            params["cost_center"] = cost_center
+
+        sql = text(f"""
+            SELECT
+                f.idfactura,
+                f.fecha,
+                f.vencimiento,
+                f.cliente_nombre,
+                f.subtotal,
+                f.impuestos_total AS impuestos,
+                f.total,
+                f.pagos_total AS pagado,
+                f.saldo,
+                COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                v.nombre AS vendedor_nombre,
+                f.public_url
+            FROM facturas_enriquecidas f
+            LEFT JOIN siigo_centros_costo cc ON cc.id = f.cost_center
+            LEFT JOIN siigo_vendedores v ON v.id = f.seller_id
+            WHERE { " AND ".join(wh) }
+            ORDER BY f.fecha DESC
+        """)
+
+        rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
+        return jsonify({"rows": rows})
+
+
+
+    # Modal facturas pagadas y pendientes en pagina financiero/ventas
+    @app.route("/reportes/facturas_por_estado", methods=["GET"])
+    @jwt_required()
+    def facturas_por_estado():
+        from sqlalchemy.sql import text
+
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        estado = request.args.get("estado")
+        if not estado:
+            return jsonify({"rows": []})
+
+        desde       = request.args.get("desde")
+        hasta       = request.args.get("hasta")
+        seller_id   = request.args.get("seller_id", type=int)
+        cost_center = request.args.get("cost_center", type=int)
+        cliente     = request.args.get("cliente")
+
+        wh = ["f.idcliente = :idcliente", "f.estado_pago = :estado"]
+        params = {"idcliente": idcliente, "estado": estado}
+
+        if desde:
+            wh.append("f.fecha >= :desde")
+            params["desde"] = desde
+
+        if hasta:
+            wh.append("f.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        if seller_id:
+            wh.append("f.seller_id = :seller_id")
+            params["seller_id"] = seller_id
+
+        if cost_center:
+            wh.append("f.cost_center = :cost_center")
+            params["cost_center"] = cost_center
+
+        if cliente:
+            wh.append("f.cliente_nombre = :cliente")
+            params["cliente"] = cliente
+
+        sql = text(f"""
+            SELECT
+                f.idfactura,
+                f.fecha,
+                f.vencimiento,
+                f.cliente_nombre,
+                f.subtotal,
+                f.impuestos_total AS impuestos,
+                f.total,
+                f.pagos_total AS pagado,
+                f.saldo,
+                COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                v.nombre AS vendedor_nombre,
+                f.public_url
+            FROM facturas_enriquecidas f
+            LEFT JOIN siigo_centros_costo cc ON cc.id = f.cost_center
+            LEFT JOIN siigo_vendedores v ON v.id = f.seller_id
+            WHERE { " AND ".join(wh) }
+            ORDER BY f.fecha DESC
+        """)
+
+        rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
+        return jsonify({"rows": rows})
 
 
 
