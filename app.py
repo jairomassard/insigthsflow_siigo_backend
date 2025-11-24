@@ -2074,7 +2074,7 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        estado = request.args.get("estado")
+        estado = request.args.get("estado")  # "Pagado" o "Pendiente"
         if not estado:
             return jsonify({"rows": []})
 
@@ -2084,12 +2084,19 @@ def create_app():
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
+        # --- MUY IMPORTANTE ---
+        # Normalizamos el filtro de estado según saldo, no según texto
+        if estado.lower() == "pagado":
+            estado_filter = "f.saldo = 0"
+        else:
+            estado_filter = "f.saldo > 0"
+
         wh = [
             "f.idcliente = :idcliente",
-            "TRIM(LOWER(f.estado_pago)) = TRIM(LOWER(:estado))"
+            estado_filter
         ]
 
-        params = {"idcliente": idcliente, "estado": estado}
+        params = {"idcliente": idcliente}
 
         if desde:
             wh.append("f.fecha >= :desde")
@@ -2134,6 +2141,7 @@ def create_app():
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify({"rows": rows})
+
 
 
 
