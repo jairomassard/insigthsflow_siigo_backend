@@ -2059,7 +2059,7 @@ def create_app():
 
     # Modal facturas pagadas y pendientes en pagina financiero/ventas
     # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
-    # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
+    # Modal facturas por estado (Pagado / Pendiente)
     @app.route("/reportes/facturas_por_estado", methods=["GET"])
     @jwt_required()
     def facturas_por_estado():
@@ -2080,13 +2080,13 @@ def create_app():
         if not estado:
             return jsonify({"rows": []})
 
+        # Filtros compartidos
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
         seller_id   = request.args.get("seller_id", type=int)
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
-        # ---- MISMO WHERE QUE EL REPORTE PRINCIPAL ----
         wh = ["f.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
@@ -2112,64 +2112,58 @@ def create_app():
 
         where_clause = " AND ".join(wh)
 
-        # ---- MISMO CTE QUE USA EL DASHBOARD ----
+        # El CTE SÍ trae subtotal e impuestos_total directamente desde siigo_facturas
         cte = f"""
-            WITH comp AS (
+            WITH base AS (
                 SELECT
-                    f.*,
-                    COALESCE((
-                        SELECT SUM((elem->>'value')::numeric)
-                        FROM jsonb_array_elements(f.retenciones) elem
-                        WHERE jsonb_typeof(f.retenciones) = 'array'
-                        AND LOWER(elem->>'type') LIKE '%autorretencion%'
-                    ), 0) AS autorretencion,
-
-                    COALESCE((
-                        SELECT SUM((elem->>'value')::numeric)
-                        FROM jsonb_array_elements(f.retenciones) elem
-                        WHERE jsonb_typeof(f.retenciones) = 'array'
-                        AND (elem->>'type') IS NOT NULL
-                        AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
-                    ), 0) AS retenciones_sin_auto,
-
-                    COALESCE(f.total, 0) AS total_b,
-                    COALESCE(f.saldo, 0) AS saldo_b
+                    f.idfactura,
+                    f.fecha,
+                    f.vencimiento,
+                    f.cliente_nombre,
+                    f.subtotal,
+                    f.impuestos_total,
+                    f.total,
+                    f.pagos_total,
+                    f.saldo,
+                    f.saldo_calculado,
+                    f.public_url,
+                    f.cost_center,
+                    f.seller_id
                 FROM siigo_facturas f
                 WHERE {where_clause}
             ),
 
-            ajuste AS (
+            calc AS (
                 SELECT
                     *,
-                    (total_b - saldo_b) AS pagado,
-                    saldo_b AS pendiente
-                FROM comp
+                    (total - saldo) AS pagado,
+                    saldo AS pendiente
+                FROM base
             )
         """
 
-        # ---- FILTRO DE ESTADO EXACTO ----
+        # Filtro real según estado
         filtro_estado = "pendiente = 0" if estado.lower() == "pagado" else "pendiente > 0"
 
         sql = text(cte + f"""
             SELECT
-                idfactura,
-                fecha,
-                vencimiento,
-                cliente_nombre,
-                subtotal,
-                impuestos_total,
-                total,
-                pagado,
-                pendiente,
-                public_url,
-                cost_center,
+                c.idfactura,
+                c.fecha,
+                c.vencimiento,
+                c.cliente_nombre,
+                c.subtotal,
+                c.impuestos_total,
+                c.total,
+                c.pagado,
+                c.pendiente,
+                c.public_url,
                 COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                 v.nombre AS vendedor_nombre
-            FROM ajuste a
-            LEFT JOIN siigo_centros_costo cc ON cc.id = a.cost_center
-            LEFT JOIN siigo_vendedores v ON v.id = a.seller_id
+            FROM calc c
+            LEFT JOIN siigo_centros_costo cc ON cc.id = c.cost_center
+            LEFT JOIN siigo_vendedores v ON v.id = c.seller_id
             WHERE {filtro_estado}
-            ORDER BY fecha DESC
+            ORDER BY c.fecha DESC
         """)
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
