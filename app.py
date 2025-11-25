@@ -2058,8 +2058,7 @@ def create_app():
 
 
     # Modal facturas pagadas y pendientes en pagina financiero/ventas
-    # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
-    # Modal facturas por estado (Pagado / Pendiente)
+    # Modal facturas por estado (Pagado / Pendiente) en página financiero/ventas
     @app.route("/reportes/facturas_por_estado", methods=["GET"])
     @jwt_required()
     def facturas_por_estado():
@@ -2069,6 +2068,7 @@ def create_app():
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
 
+        # Superadmin puede forzar ?idcliente=
         q_idcliente = request.args.get("idcliente", type=int)
         if perfilid == 0 and q_idcliente:
             idcliente = q_idcliente
@@ -2076,11 +2076,11 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        estado = request.args.get("estado")  # Pagado / Pendiente
+        estado = request.args.get("estado")  # "Pagado" o "Pendiente"
         if not estado:
             return jsonify({"rows": []})
 
-        # Filtros compartidos
+        # ---- Filtros compartidos (igual que en facturas_enriquecidas) ----
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
         seller_id   = request.args.get("seller_id", type=int)
@@ -2112,7 +2112,7 @@ def create_app():
 
         where_clause = " AND ".join(wh)
 
-        # El CTE SÍ trae subtotal e impuestos_total directamente desde siigo_facturas
+        # ---- CTE basado en FACTURAS_ENRIQUECIDAS (MISMA BASE QUE EL REPORTE) ----
         cte = f"""
             WITH base AS (
                 SELECT
@@ -2120,30 +2120,37 @@ def create_app():
                     f.fecha,
                     f.vencimiento,
                     f.cliente_nombre,
-                    f.subtotal,
-                    f.impuestos_total,
-                    f.total,
-                    f.pagos_total,
-                    f.saldo,
-                    f.saldo_calculado,
+                    COALESCE(f.subtotal, 0)          AS subtotal,
+                    COALESCE(f.impuestos_total, 0)   AS impuestos,
+                    COALESCE(f.total, 0)             AS total,
+                    COALESCE(f.saldo, 0)             AS saldo,
+                    COALESCE(f.total, 0) - COALESCE(f.saldo, 0) AS pagado,
                     f.public_url,
                     f.cost_center,
                     f.seller_id
-                FROM siigo_facturas f
+                FROM facturas_enriquecidas f
                 WHERE {where_clause}
             ),
-
             calc AS (
                 SELECT
                     *,
-                    (total - saldo) AS pagado,
                     saldo AS pendiente
                 FROM base
             )
         """
 
-        # Filtro real según estado
-        filtro_estado = "pendiente = 0" if estado.lower() == "pagado" else "pendiente > 0"
+        # ---- Filtro por estado de pago real (coherente con el pie) ----
+        # El pie hace:
+        #  - Pagado   = SUM(total - saldo)
+        #  - Pendiente = SUM(saldo)
+        #
+        # Para el modal:
+        #  - "Pagado"   => facturas donde pagado > 0
+        #  - "Pendiente" => facturas donde pendiente > 0
+        if estado.lower() == "pagado":
+            filtro_estado = "pagado > 0"
+        else:
+            filtro_estado = "pendiente > 0"
 
         sql = text(cte + f"""
             SELECT
@@ -2152,7 +2159,7 @@ def create_app():
                 c.vencimiento,
                 c.cliente_nombre,
                 c.subtotal,
-                c.impuestos_total,
+                c.impuestos,      -- alias correcto para que el frontend use f.impuestos
                 c.total,
                 c.pagado,
                 c.pendiente,
@@ -2161,7 +2168,7 @@ def create_app():
                 v.nombre AS vendedor_nombre
             FROM calc c
             LEFT JOIN siigo_centros_costo cc ON cc.id = c.cost_center
-            LEFT JOIN siigo_vendedores v ON v.id = c.seller_id
+            LEFT JOIN siigo_vendedores   v  ON v.id = c.seller_id
             WHERE {filtro_estado}
             ORDER BY c.fecha DESC
         """)
