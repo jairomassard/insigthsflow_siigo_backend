@@ -2084,9 +2084,9 @@ def create_app():
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
-        # ===========================
-        # FILTRO REAL QUE DEBE USAR
-        # ===========================
+        # ===== MATCH EXACTO CON EL PIE CHART =====
+        # "Pagado" = todas con saldo = 0
+        # "Pendiente" = todas con saldo > 0
         if estado.lower() == "pagado":
             filtro_estado = "f.saldo = 0"
         else:
@@ -2128,7 +2128,7 @@ def create_app():
                 f.subtotal,
                 f.impuestos_total AS impuestos,
                 f.total,
-                f.pagos_total AS pagado,
+                f.pagos_total,
                 f.saldo,
                 COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                 v.nombre AS vendedor_nombre,
@@ -2142,6 +2142,7 @@ def create_app():
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify({"rows": rows})
+
 
 
 
