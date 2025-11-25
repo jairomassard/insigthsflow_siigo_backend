@@ -2058,6 +2058,7 @@ def create_app():
 
 
     # Modal facturas pagadas y pendientes en pagina financiero/ventas
+    # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
     @app.route("/reportes/facturas_por_estado", methods=["GET"])
     @jwt_required()
     def facturas_por_estado():
@@ -2084,19 +2085,8 @@ def create_app():
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
-        # ===== MATCH EXACTO CON EL PIE CHART =====
-        # "Pagado" = todas con saldo = 0
-        # "Pendiente" = todas con saldo > 0
-        if estado.lower() == "pagado":
-            filtro_estado = "f.saldo = 0"
-        else:
-            filtro_estado = "f.saldo > 0"
-
-        wh = [
-            "f.idcliente = :idcliente",
-            filtro_estado
-        ]
-
+        # --- MISMO WHERE DEL ENDPOINT PRINCIPAL ---
+        wh = ["f.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
         if desde:
@@ -2119,30 +2109,67 @@ def create_app():
             wh.append("f.cliente_nombre = :cliente")
             params["cliente"] = cliente
 
-        sql = text(f"""
+        where_clause = " AND ".join(wh)
+
+        # --- REUTILIZAMOS EXACTAMENTE EL MISMO CTE DEL REPORTE PRINCIPAL ---
+        cte_common = f"""
+            WITH comp AS (
+                SELECT
+                    f.*,
+                    COALESCE((
+                        SELECT SUM((elem->>'value')::numeric)
+                        FROM jsonb_array_elements(f.retenciones) elem
+                        WHERE jsonb_typeof(f.retenciones) = 'array'
+                        AND LOWER(elem->>'type') LIKE '%autorretencion%'
+                    ), 0) AS autorretencion,
+                    COALESCE((
+                        SELECT SUM((elem->>'value')::numeric)
+                        FROM jsonb_array_elements(f.retenciones) elem
+                        WHERE jsonb_typeof(f.retenciones) = 'array'
+                        AND (elem->>'type') IS NOT NULL
+                        AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
+                    ), 0) AS retenciones_sin_auto,
+                    COALESCE(f.total, 0) AS total_b,
+                    COALESCE(f.saldo, 0) AS saldo_b
+                FROM facturas_enriquecidas f
+                WHERE {where_clause}
+            ),
+            ajuste AS (
+                SELECT
+                    *,
+                    (total_b - saldo_b) AS pagado,
+                    saldo_b AS pendiente
+                FROM comp
+            )
+        """
+
+        # --- FILTRAR SEGÚN ESTADO REAL ---
+        filtro_estado = "pendiente = 0" if estado.lower() == "pagado" else "pendiente > 0"
+
+        sql = text(cte_common + f"""
             SELECT
-                f.idfactura,
-                f.fecha,
-                f.vencimiento,
-                f.cliente_nombre,
-                f.subtotal,
-                f.impuestos_total AS impuestos,
-                f.total,
-                f.pagos_total,
-                f.saldo,
+                idfactura,
+                fecha,
+                vencimiento,
+                cliente_nombre,
+                subtotal,
+                impuestos_total,
+                total,
+                pagado,
+                pendiente,
+                public_url,
+                cost_center,
                 COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                v.nombre AS vendedor_nombre,
-                f.public_url
-            FROM facturas_enriquecidas f
-            LEFT JOIN siigo_centros_costo cc ON cc.id = f.cost_center
-            LEFT JOIN siigo_vendedores v ON v.id = f.seller_id
-            WHERE { " AND ".join(wh) }
-            ORDER BY f.fecha DESC
+                v.nombre AS vendedor_nombre
+            FROM ajuste a
+            LEFT JOIN siigo_centros_costo cc ON cc.id = a.cost_center
+            LEFT JOIN siigo_vendedores v ON v.id = a.seller_id
+            WHERE {filtro_estado}
+            ORDER BY fecha DESC
         """)
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify({"rows": rows})
-
 
 
 
