@@ -2059,6 +2059,7 @@ def create_app():
 
     # Modal facturas pagadas y pendientes en pagina financiero/ventas
     # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
+    # Modal facturas pagadas y pendientes (misma lógica del reporte principal)
     @app.route("/reportes/facturas_por_estado", methods=["GET"])
     @jwt_required()
     def facturas_por_estado():
@@ -2085,7 +2086,7 @@ def create_app():
         cost_center = request.args.get("cost_center", type=int)
         cliente     = request.args.get("cliente")
 
-        # --- MISMO WHERE DEL ENDPOINT PRINCIPAL ---
+        # ---- MISMO WHERE QUE EL REPORTE PRINCIPAL ----
         wh = ["f.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
@@ -2111,8 +2112,8 @@ def create_app():
 
         where_clause = " AND ".join(wh)
 
-        # --- REUTILIZAMOS EXACTAMENTE EL MISMO CTE DEL REPORTE PRINCIPAL ---
-        cte_common = f"""
+        # ---- MISMO CTE QUE USA EL DASHBOARD ----
+        cte = f"""
             WITH comp AS (
                 SELECT
                     f.*,
@@ -2122,6 +2123,7 @@ def create_app():
                         WHERE jsonb_typeof(f.retenciones) = 'array'
                         AND LOWER(elem->>'type') LIKE '%autorretencion%'
                     ), 0) AS autorretencion,
+
                     COALESCE((
                         SELECT SUM((elem->>'value')::numeric)
                         FROM jsonb_array_elements(f.retenciones) elem
@@ -2129,11 +2131,13 @@ def create_app():
                         AND (elem->>'type') IS NOT NULL
                         AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
                     ), 0) AS retenciones_sin_auto,
+
                     COALESCE(f.total, 0) AS total_b,
                     COALESCE(f.saldo, 0) AS saldo_b
-                FROM facturas_enriquecidas f
+                FROM siigo_facturas f
                 WHERE {where_clause}
             ),
+
             ajuste AS (
                 SELECT
                     *,
@@ -2143,10 +2147,10 @@ def create_app():
             )
         """
 
-        # --- FILTRAR SEGÚN ESTADO REAL ---
+        # ---- FILTRO DE ESTADO EXACTO ----
         filtro_estado = "pendiente = 0" if estado.lower() == "pagado" else "pendiente > 0"
 
-        sql = text(cte_common + f"""
+        sql = text(cte + f"""
             SELECT
                 idfactura,
                 fecha,
@@ -2170,6 +2174,7 @@ def create_app():
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify({"rows": rows})
+
 
 
 
