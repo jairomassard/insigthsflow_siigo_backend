@@ -5667,6 +5667,7 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos")
+        cliente = request.args.get("cliente")
 
         filtros = ["f.idcliente = :idcliente", "f.estado_pago = 'pagada'"]
         params = {"idcliente": idcliente}
@@ -5680,8 +5681,6 @@ def create_app():
         if centro_costos:
             filtros.append("f.cost_center = :centro_costos")  # 👈 nombre correcto
             params["centro_costos"] = centro_costos
-
-        cliente = request.args.get("cliente")
 
         if cliente:
             filtros.append("f.cliente_nombre = :cliente")
