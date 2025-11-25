@@ -5681,6 +5681,13 @@ def create_app():
             filtros.append("f.cost_center = :centro_costos")  # 👈 nombre correcto
             params["centro_costos"] = centro_costos
 
+        cliente = request.args.get("cliente")
+
+        if cliente:
+            filtros.append("f.cliente_nombre = :cliente")
+            params["cliente"] = cliente
+
+
         filtro_sql = " AND ".join(filtros)
 
         # KPIs
