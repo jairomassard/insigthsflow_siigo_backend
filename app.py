@@ -2163,6 +2163,7 @@ def create_app():
                 c.total,
                 c.pagado,
                 c.pendiente,
+                c.saldo,  -- <-- NECESARIO PARA EL FRONTEND
                 c.public_url,
                 COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                 v.nombre AS vendedor_nombre
