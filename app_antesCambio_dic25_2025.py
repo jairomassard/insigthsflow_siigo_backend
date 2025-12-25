@@ -4802,18 +4802,9 @@ def create_app():
 
         file = request.files["archivo"]
 
-        def _norm_text(v) -> str:
-            return str(v or "").replace("\xa0", " ").replace("\ufeff", "").strip()
-
-        def _norm_lower(v) -> str:
-            return _norm_text(v).lower()
-
-        def _norm_upper(v) -> str:
-            return _norm_text(v).upper()
-
         try:
             df = pd.read_excel(file, header=7)
-            df.columns = df.columns.str.strip().str.replace("\xa0", " ")
+            df.columns = df.columns.str.strip().str.replace('\xa0', ' ')
         except Exception as e:
             return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
@@ -4822,102 +4813,23 @@ def create_app():
         if faltantes:
             return jsonify({"error": f"Faltan columnas requeridas: {', '.join(faltantes)}"}), 400
 
-        # ---------------------------
-        # BLINDAJE (validación previa)
-        # ---------------------------
-        # 1) Detectar columna de tipo de transacción (si existe)
-        possible_tipo_cols = [
-            "Tipo de Transacción",
-            "Tipo de transacción",
-            "Tipo transacción",
-            "Tipo de Transaccion",
-            "Tipo transaccion",
-        ]
-        tipo_col = next((c for c in possible_tipo_cols if c in df.columns), None)
-
-        # 2) Tomar solo filas "secuencia" para analizar qué viene en el archivo
-        #    (limitamos a un subconjunto para eficiencia)
-        sample = df.head(5000).copy()
-        sample["__tipo_reg__"] = sample.get("Tipo de registro", "").apply(_norm_lower)
-        sample = sample[sample["__tipo_reg__"] == "secuencia"]
-
-        if sample.empty:
-            return jsonify({"error": "El archivo no contiene filas 'secuencia'. Revisa que sea el reporte correcto."}), 400
-
-        # prefijo según Número comprobante
-        sample["__num__"] = sample["Número comprobante"].apply(lambda x: _norm_upper(str(x).split(".")[0]))
-        sample["__pref__"] = sample["__num__"].apply(lambda s: s.split("-")[0] if s else "")
-
-        total_seq = len(sample)
-        cnt_ds = int((sample["__pref__"] == "DS").sum())
-        cnt_fc = int((sample["__pref__"] == "FC").sum())
-        cnt_fv = int((sample["__pref__"] == "FV").sum())
-        cnt_otro = total_seq - (cnt_ds + cnt_fc + cnt_fv)
-
-        # Si detecta FC o FV en el archivo → BLOQUEAR (no omitir)
-        if cnt_fc > 0 or cnt_fv > 0:
-            return jsonify({
-                "error": (
-                    "Archivo inválido: el reporte contiene transacciones distintas a Documento Soporte (FC/FV). "
-                    "En Siigo debes exportar desde: Reportes > Compras y Gastos > Movimientos de documentos Compras > "
-                    "Movimiento Factura de compra, seleccionando Tipo de Transacción = Documento Soporte."
-                ),
-                "diagnostico": {
-                    "filas_secuencia_analizadas": total_seq,
-                    "DS": cnt_ds,
-                    "FC": cnt_fc,
-                    "FV": cnt_fv,
-                    "OTRO": cnt_otro
-                }
-            }), 400
-
-        # Si existe tipo_col, validar que sea Documento Soporte (permitimos variaciones)
-        if tipo_col:
-            sample["__tipo_tx__"] = sample[tipo_col].apply(_norm_lower)
-            # si alguna fila no contiene "documento soporte", se bloquea
-            invalid_tx = sample[~sample["__tipo_tx__"].str.contains("documento soporte", na=False)]
-            if not invalid_tx.empty:
-                return jsonify({
-                    "error": (
-                        f"Archivo inválido: la columna '{tipo_col}' contiene valores diferentes a 'Documento Soporte'. "
-                        "Reexporta el reporte seleccionando Tipo de Transacción = Documento Soporte."
-                    ),
-                    "diagnostico": {
-                        "columna_tipo_transaccion": tipo_col,
-                        "filas_secuencia_analizadas": total_seq,
-                        "ejemplos_invalidos": invalid_tx[tipo_col].head(10).tolist()
-                    }
-                }), 400
-
-        # ---------------------------
-        # Importación normal (solo DS)
-        # ---------------------------
         centros_costo = {
-            c.nombre.strip().upper(): c.id
-            for c in SiigoCentroCosto.query.filter_by(idcliente=idcliente).all()
+            c.nombre.strip().upper(): c.id for c in SiigoCentroCosto.query.filter_by(idcliente=idcliente).all()
         }
 
         registros_creados = 0
         compras = {}
         compras_omitidas = []
 
-        # métricas
-        omitidas_por_no_secuencia = 0
-        omitidas_por_no_ds = 0
-
         for _, row in df.iterrows():
-            tipo_registro = _norm_lower(row.get("Tipo de registro", ""))
+            tipo_registro_raw = row.get("Tipo de registro", "")
+            tipo_registro = str(tipo_registro_raw).replace('\xa0', ' ').replace('\ufeff', '').strip().lower()
+
             if tipo_registro != "secuencia":
-                omitidas_por_no_secuencia += 1
                 continue
 
-            num_comprobante = _norm_upper(str(row.get("Número comprobante", "")).split(".")[0])
-            if not num_comprobante.startswith("DS-"):
-                # “doble seguridad”: aquí ya no debería pasar por el blindaje previo
-                omitidas_por_no_ds += 1
-                continue
-
-            consecutivo = _norm_text(row.get("Consecutivo", "")).split(".")[0]
+            num_comprobante = str(row.get("Número comprobante", "")).split(".")[0]
+            consecutivo = str(row.get("Consecutivo", "")).split(".")[0]
             idcompra = f"{num_comprobante}-{consecutivo}"
 
             if idcompra not in compras:
@@ -4926,34 +4838,29 @@ def create_app():
                     compras_omitidas.append(idcompra)
                     continue
 
-                centro_costo_nombre = _norm_upper(row.get("Centro costo", ""))
+                centro_costo_nombre = str(row.get("Centro costo", "")).strip().upper()
                 cost_center = centros_costo.get(centro_costo_nombre)
 
-                fecha_elab = pd.to_datetime(row["Fecha elaboración"], dayfirst=True, errors="coerce")
-                if pd.isna(fecha_elab):
-                    # si fecha viene inválida, mejor omitir o lanzar error según tu preferencia
-                    continue
+                fecha_elab = pd.to_datetime(row["Fecha elaboración"], dayfirst=True)
 
-                factura_proveedor = _norm_upper(row.get("Factura proveedor", ""))
+                factura_proveedor = str(row.get("Factura proveedor", "")).strip().upper()
+
                 if factura_proveedor.lower() in ("nan", "nat", ""):
                     factura_proveedor = None
-
-                venc = pd.to_datetime(row.get("Fecha vencimiento"), errors="coerce", dayfirst=True)
-                venc_date = None if pd.isna(venc) else venc.date()
 
                 compra = SiigoCompra(
                     idcliente=idcliente,
                     idcompra=idcompra,
                     fecha=fecha_elab.date(),
-                    vencimiento=venc_date,
-                    proveedor_nombre=_norm_text(row.get("Nombre tercero", "")),
-                    proveedor_identificacion=_norm_text(row.get("Identificación", "")).split(".")[0],
+                    vencimiento=pd.to_datetime(row.get("Fecha vencimiento"), errors="coerce", dayfirst=True).date() if row.get("Fecha vencimiento") else None,
+                    proveedor_nombre=str(row.get("Nombre tercero", "")).strip(),
+                    proveedor_identificacion=str(row.get("Identificación", "")).strip().split('.')[0],
                     estado=None,
                     total=float(row.get("Total", 0) or 0),
                     saldo=0,
                     cost_center=cost_center,
                     creado=fecha_elab + pd.Timedelta(minutes=15),
-                    factura_proveedor=factura_proveedor
+                    factura_proveedor=factura_proveedor  # <- NUEVO
                 )
 
                 db.session.add(compra)
@@ -4966,12 +4873,12 @@ def create_app():
 
             item = SiigoCompraItem(
                 compra_id=compra_id,
-                idcliente=idcliente,
-                descripcion=_norm_text(row.get("Nombre", "")),
+                idcliente=idcliente,  # ✅ importante
+                descripcion=str(row.get("Nombre", "")).strip(),
                 cantidad=float(row.get("Cantidad", 0) or 0),
                 precio=float(row.get("Total", 0) or 0),
                 impuestos=impuestos,
-                codigo="" if pd.isna(row.get("Código", "")) else _norm_text(row.get("Código", ""))
+                codigo="" if pd.isna(row.get("Código", "")) else str(row.get("Código", "")).strip()
             )
             db.session.add(item)
 
@@ -4979,21 +4886,8 @@ def create_app():
 
         return jsonify({
             "mensaje": f"Importación completada. Compras creadas: {registros_creados}",
-            "omitidas": compras_omitidas,
-            "debug": {
-                "omitidas_por_no_secuencia": omitidas_por_no_secuencia,
-                "omitidas_por_no_ds": omitidas_por_no_ds,
-                "blindaje_prev": {
-                    "filas_secuencia_analizadas": total_seq,
-                    "DS": cnt_ds,
-                    "FC": cnt_fc,
-                    "FV": cnt_fv,
-                    "OTRO": cnt_otro,
-                    "tipo_col": tipo_col
-                }
-            }
+            "omitidas": compras_omitidas
         })
-
 
 
 
