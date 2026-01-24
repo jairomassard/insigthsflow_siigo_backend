@@ -4098,7 +4098,6 @@ def create_app():
 
 
     # --- ENDPOINT: Reporte Financiero Compras y Gastos ---
-    # --- ENDPOINT: Reporte Financiero Compras y Gastos ---
     # --- ENDPOINT 1: Reporte Financiero Compras y Gastos (KPIs + Evolución Mensual) ---
     @app.route("/reportes/financiero/compras-gastos", methods=["GET"])
     @jwt_required()
@@ -4139,13 +4138,13 @@ def create_app():
 
         where_sql = " AND ".join(condiciones)
 
-        # --- Evolución mensual (contable) ---
+        # --- Evolución mensual ---
         query_evolucion = f"""
             SELECT
                 date_trunc('month', c.fecha) AS mes,
-                SUM(COALESCE(c.total,0)) AS total_compras,
-                SUM(COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS total_pagadas,
-                SUM(COALESCE(c.saldo,0)) AS total_pendientes
+                SUM(c.total) AS total_compras,
+                SUM(CASE WHEN c.estado = 'pagado' THEN c.total ELSE 0 END) AS total_pagadas,
+                SUM(CASE WHEN c.estado = 'pendiente' THEN c.saldo ELSE 0 END) AS total_pendientes
             FROM siigo_compras c
             WHERE {where_sql}
             GROUP BY mes
@@ -4153,36 +4152,28 @@ def create_app():
         """
         rows_evol = db.session.execute(text(query_evolucion), params).mappings().all()
 
-        # --- KPIs generales (contables + parciales) ---
+        # --- KPIs generales ---
         query_kpis = f"""
             SELECT
                 COUNT(*) AS total_facturas,
-                SUM(COALESCE(c.total,0)) AS total_compras,
+                SUM(c.total) AS total_compras,
+                SUM(CASE WHEN c.estado = 'pagado' THEN c.total ELSE 0 END) AS total_pagado,
+                SUM(CASE WHEN c.estado = 'pendiente' THEN c.saldo ELSE 0 END) AS total_saldo,
+                SUM(CASE WHEN c.estado = 'pagado' THEN 1 ELSE 0 END) AS facturas_pagadas,
+                SUM(CASE WHEN c.estado = 'pendiente' THEN 1 ELSE 0 END) AS facturas_pendientes,
 
-                -- Contable (incluye parciales)
-                SUM(COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS total_pagado,
-                SUM(COALESCE(c.saldo,0)) AS total_saldo,
-
-                -- Conteos contables por saldo
-                SUM(CASE WHEN COALESCE(c.saldo,0) = 0 THEN 1 ELSE 0 END) AS facturas_pagadas,
-                SUM(CASE WHEN COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0) THEN 1 ELSE 0 END) AS facturas_pendientes,
-                SUM(CASE WHEN COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0) THEN 1 ELSE 0 END) AS facturas_parciales,
-
-                -- Valor parcial (saldo de parciales)
-                SUM(CASE WHEN COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0) THEN COALESCE(c.saldo,0) ELSE 0 END) AS saldo_parcial,
-
-                -- KPIs por tipo documento (siguen por total, no por estado)
+                -- 👇 nuevos KPIs
                 SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN 1 ELSE 0 END) AS compras_x_factura,
-                SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN COALESCE(c.total,0) ELSE 0 END) AS valor_compras_x_factura,
+                SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN c.total ELSE 0 END) AS valor_compras_x_factura,
                 SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN 1 ELSE 0 END) AS compras_x_cta_cobro,
-                SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN COALESCE(c.total,0) ELSE 0 END) AS valor_compras_x_cta_cobro
+                SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN c.total ELSE 0 END) AS valor_compras_x_cta_cobro
             FROM siigo_compras c
             WHERE {where_sql}
         """
         row_kpis = db.session.execute(text(query_kpis), params).mappings().first()
 
         return jsonify({
-            "kpis": dict(row_kpis or {}),
+            "kpis": dict(row_kpis),
             "evolucion": [dict(r) for r in rows_evol]
         })
 
@@ -4275,7 +4266,6 @@ def create_app():
 
 
     # --- ENDPOINT 4: Detalle de facturas por mes ---
-    # --- ENDPOINT 4: Detalle de facturas por mes ---
     @app.route("/reportes/financiero/compras-gastos/detalle", methods=["GET"])
     @jwt_required()
     def detalle_facturas_mes():
@@ -4285,8 +4275,8 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        mes = request.args.get("mes")  # YYYY-MM
-        estado = request.args.get("estado")  # "total" | "pagado" | "pendiente" | "parcial"
+        mes = request.args.get("mes")
+        estado = request.args.get("estado")  # "total" | "pagado" | "pendiente"
         centro_costos = request.args.get("centro_costos")
 
         if not mes:
@@ -4295,14 +4285,9 @@ def create_app():
         condiciones = ["c.idcliente = :idcliente", "TO_CHAR(c.fecha, 'YYYY-MM') = :mes"]
         params = {"idcliente": idcliente, "mes": mes}
 
-        # Filtro contable por saldo
-        if estado == "pagado":
-            condiciones.append("COALESCE(c.saldo,0) = 0")
-        elif estado == "pendiente":
-            condiciones.append("COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0)")
-        elif estado == "parcial":
-            condiciones.append("COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0)")
-        # estado == "total" o None => sin filtro adicional
+        if estado in ("pagado", "pendiente"):
+            condiciones.append("c.estado = :estado")
+            params["estado"] = estado
 
         if centro_costos:
             condiciones.append("c.cost_center = :centro_costos")
@@ -4311,21 +4296,14 @@ def create_app():
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
-            SELECT
+            SELECT 
                 c.proveedor_nombre,
                 c.idcompra AS factura,
                 c.fecha,
                 c.vencimiento,
-                c.estado AS estado_raw,  -- informativo (lo que venga de Siigo)
-                COALESCE(c.total,0) AS total,
-                COALESCE(c.saldo,0) AS saldo,
-                (COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS pagado_calc,
-                CASE
-                    WHEN COALESCE(c.saldo,0) = 0 THEN 'pagado'
-                    WHEN COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0) THEN 'pendiente'
-                    WHEN COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0) THEN 'parcial'
-                    ELSE 'pendiente'
-                END AS estado_calc,
+                c.estado,  -- 👈 devuelve 'pagado' o 'pendiente'
+                c.total,
+                c.saldo,
                 sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
             LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
