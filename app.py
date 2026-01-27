@@ -4280,6 +4280,7 @@ def create_app():
     @jwt_required()
     def detalle_facturas_mes():
         from sqlalchemy.sql import text
+
         claims = get_jwt()
         idcliente = claims.get("idcliente")
         if not idcliente:
@@ -4292,17 +4293,20 @@ def create_app():
         if not mes:
             return jsonify({"error": "Mes requerido"}), 400
 
-        condiciones = ["c.idcliente = :idcliente", "TO_CHAR(c.fecha, 'YYYY-MM') = :mes"]
+        condiciones = [
+            "c.idcliente = :idcliente",
+            "TO_CHAR(c.fecha, 'YYYY-MM') = :mes"
+        ]
         params = {"idcliente": idcliente, "mes": mes}
 
-        # Filtro contable por saldo
+        # Filtro contable por saldo (VERDAD)
         if estado == "pagado":
             condiciones.append("COALESCE(c.saldo,0) = 0")
         elif estado == "pendiente":
             condiciones.append("COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0)")
         elif estado == "parcial":
             condiciones.append("COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0)")
-        # estado == "total" o None => sin filtro adicional
+        # "total" o None => sin filtro adicional
 
         if centro_costos:
             condiciones.append("c.cost_center = :centro_costos")
@@ -4312,28 +4316,39 @@ def create_app():
 
         sql = text(f"""
             SELECT
+                c.id,
                 c.proveedor_nombre,
                 c.idcompra AS factura,
+                c.factura_proveedor,
                 c.fecha,
                 c.vencimiento,
-                c.estado AS estado_raw,  -- informativo (lo que venga de Siigo)
+                COALESCE(c.estado, '') AS estado_raw,  -- informativo
                 COALESCE(c.total,0) AS total,
                 COALESCE(c.saldo,0) AS saldo,
                 (COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS pagado_calc,
+
                 CASE
                     WHEN COALESCE(c.saldo,0) = 0 THEN 'pagado'
                     WHEN COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0) THEN 'pendiente'
                     WHEN COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0) THEN 'parcial'
                     ELSE 'pendiente'
                 END AS estado_calc,
+
+                CASE
+                    WHEN COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) > COALESCE(c.total,0) THEN true
+                    ELSE false
+                END AS anomalia_saldo_mayor_total,
+
                 sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
             LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
             WHERE {where_sql}
             ORDER BY c.fecha DESC
         """)
+
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify(rows)
+
 
 
     # --- ENDPOINT 5: Detalle de facturas por proveedor ---
