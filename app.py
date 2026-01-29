@@ -4383,20 +4383,40 @@ def create_app():
 
         sql = text(f"""
             SELECT 
-                c.idcompra,
-                c.proveedor_nombre,
-                c.factura_proveedor,
-                c.fecha,
-                c.vencimiento,
-                c.total,
-                c.saldo,
-                c.estado, -- 👈 devuelve 'pagado' o 'pendiente'
-                sc.nombre AS centro_costo_nombre
+                c.idcompra                    AS id,
+                c.proveedor_nombre            AS proveedor_nombre,
+                c.factura_proveedor           AS factura,
+                c.fecha                       AS fecha,
+                c.vencimiento                 AS vencimiento,
+
+                COALESCE(c.total, 0)          AS total,
+                COALESCE(c.saldo, 0)          AS saldo,
+
+                -- Raw de Siigo (informativo)
+                c.estado                      AS estado_raw,
+
+                -- Cálculo contable
+                (COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS pagado_calc,
+
+                CASE
+                    WHEN COALESCE(c.saldo,0) <= 0 THEN 'pagado'
+                    WHEN COALESCE(c.saldo,0) >= COALESCE(c.total,0) THEN 'pendiente'
+                    ELSE 'parcial'
+                END AS estado_calc,
+
+                CASE
+                    WHEN COALESCE(c.saldo,0) > COALESCE(c.total,0) THEN true
+                    ELSE false
+                END AS anomalia_saldo_mayor_total,
+
+                sc.nombre                     AS centro_costo_nombre
+
             FROM siigo_compras c
             LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
             WHERE {where_sql}
             ORDER BY c.fecha DESC
         """)
+
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify(rows)
 
