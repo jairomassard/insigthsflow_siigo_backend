@@ -607,7 +607,8 @@ class SiigoNomina(db.Model):
     sueldo = db.Column(db.Numeric(18, 2))
     aux_transporte = db.Column(db.Numeric(18, 2))
     auxilio_extralegal = db.Column(db.Numeric(18, 2))
-    prima = db.Column(db.Numeric(18, 2))
+    prima = db.Column(db.Numeric(18, 2), default=0)
+    intereses_cesantias = db.Column(db.Numeric(18, 2), default=0)
     total_ingresos = db.Column(db.Numeric(18, 2))
     fondo_salud = db.Column(db.Numeric(18, 2))
     fondo_pension = db.Column(db.Numeric(18, 2))
@@ -617,7 +618,6 @@ class SiigoNomina(db.Model):
     total_deducciones = db.Column(db.Numeric(18, 2))
     neto_pagar = db.Column(db.Numeric(18, 2))
     creado = db.Column(db.DateTime, default=db.func.now())
-
 
 
 class SiigoProducto(db.Model):
