@@ -111,6 +111,7 @@ HEADER_MAP = {
         "aux conectividad",
         "transporte",
         "aux transporte",
+        "Aux. de transporte/Aux. de conectividad digital",
     ],
 
     "auxilio_extralegal": [
