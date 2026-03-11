@@ -5920,7 +5920,7 @@ def create_app():
                 params["mes"] = int(mes)
 
             # Filtro por rango de fechas
-            # Si llegan desde y hasta, se aplican adicionalmente
+            # Si hay rango de fechas, tiene prioridad sobre año/mes
             if desde and hasta:
                 try:
                     desde_dt = datetime.strptime(desde, "%Y-%m-%d").date()
@@ -5930,6 +5930,14 @@ def create_app():
                     params["hasta"] = hasta_dt
                 except ValueError:
                     return jsonify({"error": "Formato de fecha inválido. Use YYYY-MM-DD"}), 400
+            else:
+                if anio and anio.strip() and anio != "0":
+                    condiciones.append("EXTRACT(YEAR FROM periodo) = :anio")
+                    params["anio"] = int(anio)
+
+                if mes and mes.strip() and mes != "0":
+                    condiciones.append("EXTRACT(MONTH FROM periodo) = :mes")
+                    params["mes"] = int(mes)
 
             # Filtro por empleado
             if empleado and empleado.strip():
