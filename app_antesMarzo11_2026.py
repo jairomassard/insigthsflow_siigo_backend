@@ -60,153 +60,6 @@ import threading
 from threading import Thread
 import traceback
 
-import re
-import unicodedata
-from decimal import Decimal, InvalidOperation
-
-HEADER_MAP = {
-    "nombre": [
-        "nombre",
-        "empleado",
-        "trabajador",
-        "nombre empleado",
-        "nombre trabajador",
-    ],
-
-    "identificacion": [
-        "identificación",
-        "identificacion",
-        "documento",
-        "cedula",
-        "cédula",
-        "numero documento",
-        "número documento",
-    ],
-
-    "no_contrato": [
-        "no contrato",
-        "número de contrato",
-        "numero de contrato",
-        "contrato",
-        "id contrato",
-    ],
-
-    "sueldo": [
-        "sueldo",
-        "salario",
-        "salario básico",
-        "salario basico",
-        "basico",
-        "básico",
-    ],
-
-    "aux_transporte": [
-        "auxilio transporte/conectividad",
-        "auxilio transporte",
-        "auxilio de transporte",
-        "auxilio de transporte/conectividad",
-        "aux. de transporte/aux. de conectividad digital",
-        "auxilio conectividad",
-        "auxilio de conectividad",
-        "aux conectividad",
-        "transporte",
-        "aux transporte",
-    ],
-
-    "auxilio_extralegal": [
-        "auxilio extralegal",
-        "aux extralegal",
-        "bonificacion extralegal",
-        "bonificación extralegal",
-    ],
-
-    "prima": [
-        "prima",
-        "prima servicios",
-        "prima de servicios",
-        "prima semestral",
-        "prima mitad de año",
-        "prima fin de año",
-    ],
-
-    "total_ingresos": [
-        "total ingresos",
-        "total ingresos devengados",
-        "total devengado",
-        "total devengados",
-        "ingresos totales",
-        "devengados",
-    ],
-
-    "fondo_salud": [
-        "fondo de salud",
-        "salud",
-        "eps",
-        "aporte salud",
-    ],
-
-    "fondo_pension": [
-        "fondo de pensión",
-        "fondo de pension",
-        "pensión",
-        "pension",
-        "afp",
-        "aporte pension",
-        "aporte pensión",
-    ],
-
-    "fondo_solidaridad": [
-        "fondo de solidaridad pensional",
-        "solidaridad pensional",
-        "fondo solidaridad",
-    ],
-
-    "retefuente": [
-        "retefuente",
-        "retencion en la fuente",
-        "retención en la fuente",
-    ],
-
-    "prestamos": [
-        "prestamos",
-        "préstamos",
-        "prestamo",
-        "préstamo",
-        "descuento prestamos",
-        "descuento préstamo",
-    ],
-
-    "total_deducciones": [
-        "total deducciones",
-        "total deducciones empleado",
-        "total descuentos",
-        "deducciones totales",
-    ],
-
-    "neto_pagar": [
-        "neto a pagar",
-        "neto pagar",
-        "valor neto",
-        "neto",
-    ],
-}
-
-REQUIRED_DB_FIELDS = [
-    "nombre",
-    "identificacion",
-    "no_contrato",
-    "sueldo",
-    "aux_transporte",
-    "auxilio_extralegal",
-    "total_ingresos",
-    "fondo_salud",
-    "fondo_pension",
-    "fondo_solidaridad",
-    "retefuente",
-    "total_deducciones",
-    "neto_pagar",
-]
-
 
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
 fernet = Fernet(FERNET_KEY) if FERNET_KEY else None
@@ -411,82 +264,6 @@ def obtener_idcliente_desde_request():
     print("obtener_idcliente_desde_request: no se encontró idcliente")
     return None
 
-# funciones para cargue campos de nomina
-def normalizar_texto(texto):
-    if texto is None:
-        return ""
-    texto = str(texto).strip().lower()
-    texto = texto.replace("\xa0", " ")
-    texto = unicodedata.normalize("NFD", texto)
-    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
-    texto = re.sub(r"\s+", " ", texto)
-    return texto.strip()
-
-
-def normalizar_numero(valor):
-    """
-    Convierte valores de Excel a Decimal seguro.
-    Soporta:
-    - None
-    - NaN
-    - enteros / floats
-    - strings como '1.234.567,89' o '1234567.89'
-    """
-    if valor is None:
-        return Decimal("0")
-
-    try:
-        if hasattr(valor, "__class__") and str(valor).lower() == "nan":
-            return Decimal("0")
-    except Exception:
-        pass
-
-    if isinstance(valor, (int, float, Decimal)):
-        try:
-            return Decimal(str(valor))
-        except Exception:
-            return Decimal("0")
-
-    texto = str(valor).strip()
-    if not texto:
-        return Decimal("0")
-
-    texto = texto.replace("$", "").replace(" ", "")
-
-    # Caso formato latino: 1.234.567,89
-    if "," in texto and "." in texto:
-        texto = texto.replace(".", "").replace(",", ".")
-    # Caso 1234,56
-    elif "," in texto:
-        texto = texto.replace(",", ".")
-
-    try:
-        return Decimal(texto)
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
-
-
-def resolver_columnas(headers_originales):
-    """
-    Retorna un dict:
-    {
-        "nombre": "Nombre",
-        "identificacion": "Identificación",
-        ...
-    }
-    mapeando el campo DB al nombre real de la columna del Excel.
-    """
-    headers_norm = {normalizar_texto(h): h for h in headers_originales if h is not None}
-    columnas_resueltas = {}
-
-    for campo_db, aliases in HEADER_MAP.items():
-        for alias in aliases:
-            alias_norm = normalizar_texto(alias)
-            if alias_norm in headers_norm:
-                columnas_resueltas[campo_db] = headers_norm[alias_norm]
-                break
-
-    return columnas_resueltas
 
 
 def create_app():
@@ -5721,13 +5498,13 @@ def create_app():
 
         claims = get_jwt()
         idcliente = claims.get("idcliente")
-
         if not idcliente:
             return jsonify({"error": "Token sin cliente asociado"}), 400
 
         if "archivo" not in request.files:
             return jsonify({"error": "Archivo no proporcionado"}), 400
 
+        # --- Leer parámetros de periodo ---
         mes = request.form.get("mes")
         anio = request.form.get("anio")
 
@@ -5735,23 +5512,26 @@ def create_app():
             return jsonify({"error": "Debe indicar mes y año de la nómina"}), 400
 
         try:
-            periodo = date(int(anio), int(mes), 1)
+            periodo = date(int(anio), int(mes), 1)  # 👈 Generamos periodo YYYY-MM-01
         except Exception:
             return jsonify({"error": "Mes o año inválido"}), 400
 
         file = request.files["archivo"]
 
         try:
+            # ✅ Usamos calamine para evitar el bug de celdas combinadas
             df_raw = pd.read_excel(file, header=None, engine="calamine")
 
-            # La fila 6 (índice 5) contiene encabezados según tu archivo actual
+            # La fila 6 (índice 5 en 0-based) son los headers
             headers = df_raw.iloc[5].tolist()
-            headers = [str(h).strip().replace("\xa0", " ") if h is not None else "" for h in headers]
+            headers = [str(h).strip().replace("\xa0", " ") for h in headers]
 
-            # Datos desde fila 7
+            # Desde fila 7 en adelante
             df = df_raw.iloc[6:].copy()
             df.columns = headers
             df = df.dropna(how="all")
+
+            # 🔹 Reemplazar NaN por None para que no falle JSON ni DB
             df = df.where(pd.notnull(df), None)
 
             print("✅ Encabezados detectados:", headers)
@@ -5762,70 +5542,48 @@ def create_app():
             traceback.print_exc()
             return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
-        # Resolver columnas por equivalencias
-        columnas_resueltas = resolver_columnas(headers)
-
-        faltantes = [campo for campo in REQUIRED_DB_FIELDS if campo not in columnas_resueltas]
-        if faltantes:
-            return jsonify({
-                "error": "El archivo no contiene todas las columnas mínimas requeridas.",
-                "faltantes": faltantes,
-                "columnas_detectadas": headers
-            }), 400
-
         registros_creados = 0
         errores = []
 
+        for idx, row in df.iterrows():
+            try:
+                registro = SiigoNomina(
+                    idcliente=idcliente,
+                    periodo=periodo,
+                    nombre=str(row.get("Nombre", "")),
+                    identificacion=str(row.get("Identificación", "")),
+                    no_contrato=str(row.get("No contrato", "")),
+                    sueldo=row.get("Sueldo") or 0,
+                    aux_transporte=row.get("Aux. de transporte/Aux. de conectividad digital") or 0,
+                    prov_vacaciones=row.get("Provision Mensual Vacaciones") or 0,
+                    prov_prima=row.get("Provision Mensual Prima") or 0,
+                    prov_intereses_cesantias=row.get("Provision Mensual Intereses a las Cesantias") or 0,
+                    prov_cesantias=row.get("Provision Mensual Cesantias") or 0,
+                    auxilio_extralegal=row.get("Auxilio extralegal") or 0,
+                    total_ingresos=row.get("Total Ingresos") or 0,
+                    fondo_salud=row.get("Fondo de salud") or 0,
+                    fondo_pension=row.get("Fondo de pensión") or 0,
+                    fondo_solidaridad=row.get("Fondo de solidaridad pensional") or 0,
+                    retefuente=row.get("Retefuente") or 0,
+                    prestamos=row.get("Prestamos") or 0,
+                    total_deducciones=row.get("Total deducciones") or 0,
+                    neto_pagar=row.get("Neto a Pagar") or 0,
+                )
+                db.session.add(registro)
+                registros_creados += 1
+            except Exception as e:
+                errores.append(f"Fila {idx+7}: {e}")  # +7 porque los datos empiezan en la fila 7
+
         try:
-            # Borrado previo del periodo para evitar duplicados
-            eliminados = SiigoNomina.query.filter_by(
-                idcliente=idcliente,
-                periodo=periodo
-            ).delete(synchronize_session=False)
-
-            print(f"🗑️ Registros previos eliminados para cliente={idcliente}, periodo={periodo}: {eliminados}")
-
-            for idx, row in df.iterrows():
-                try:
-                    registro = SiigoNomina(
-                        idcliente=idcliente,
-                        periodo=periodo,
-                        nombre=str(row.get(columnas_resueltas["nombre"], "") or "").strip(),
-                        identificacion=str(row.get(columnas_resueltas["identificacion"], "") or "").strip(),
-                        no_contrato=str(row.get(columnas_resueltas["no_contrato"], "") or "").strip(),
-                        sueldo=normalizar_numero(row.get(columnas_resueltas["sueldo"])),
-                        aux_transporte=normalizar_numero(row.get(columnas_resueltas["aux_transporte"])),
-                        auxilio_extralegal=normalizar_numero(row.get(columnas_resueltas["auxilio_extralegal"])),
-                        prima=normalizar_numero(row.get(columnas_resueltas["prima"])) if "prima" in columnas_resueltas else Decimal("0"),
-                        total_ingresos=normalizar_numero(row.get(columnas_resueltas["total_ingresos"])),
-                        fondo_salud=normalizar_numero(row.get(columnas_resueltas["fondo_salud"])),
-                        fondo_pension=normalizar_numero(row.get(columnas_resueltas["fondo_pension"])),
-                        fondo_solidaridad=normalizar_numero(row.get(columnas_resueltas["fondo_solidaridad"])),
-                        retefuente=normalizar_numero(row.get(columnas_resueltas["retefuente"])),
-                        prestamos=normalizar_numero(row.get(columnas_resueltas["prestamos"])) if "prestamos" in columnas_resueltas else Decimal("0"),
-                        total_deducciones=normalizar_numero(row.get(columnas_resueltas["total_deducciones"])),
-                        neto_pagar=normalizar_numero(row.get(columnas_resueltas["neto_pagar"])),
-                    )
-                    db.session.add(registro)
-                    registros_creados += 1
-
-                except Exception as e:
-                    errores.append(f"Fila {idx + 7}: {str(e)}")
-
             db.session.commit()
-
         except Exception as e:
             db.session.rollback()
-            import traceback
-            traceback.print_exc()
             return jsonify({"error": f"Error al guardar en BD: {str(e)}"}), 500
 
         return jsonify({
-            "mensaje": f"Nómina {periodo.strftime('%B %Y')} importada correctamente.",
+            "mensaje": f"Nómina {periodo.strftime('%B %Y')} importada.",
             "registros_creados": registros_creados,
-            "registros_reemplazados_previos": eliminados,
-            "errores": errores[:10],
-            "columnas_mapeadas": columnas_resueltas
+            "errores": errores[:5]  # mostramos hasta 5 errores como preview
         })
 
 
