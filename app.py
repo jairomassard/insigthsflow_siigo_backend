@@ -5909,18 +5909,7 @@ def create_app():
         params = {"idcliente": idcliente}
 
         try:
-            # Filtro por año
-            if anio and anio.strip() and anio != "0":
-                condiciones.append("EXTRACT(YEAR FROM periodo) = :anio")
-                params["anio"] = int(anio)
-
-            # Filtro por mes
-            if mes and mes.strip() and mes != "0":
-                condiciones.append("EXTRACT(MONTH FROM periodo) = :mes")
-                params["mes"] = int(mes)
-
-            # Filtro por rango de fechas
-            # Si hay rango de fechas, tiene prioridad sobre año/mes
+            # Si hay rango de fechas, tiene prioridad total sobre año/mes
             if desde and hasta:
                 try:
                     desde_dt = datetime.strptime(desde, "%Y-%m-%d").date()
@@ -5998,12 +5987,9 @@ def create_app():
         """)
         empleados = [dict(r) for r in db.session.execute(sql_por_empleado, params).mappings().all()]
 
-        # --- Top empleados por costo ---
         top_empleados = empleados[:10]
 
-        # --- Evolución mensual general ---
-        # Importante: no debe verse afectada por filtro de empleado si quieres ver tendencia general.
-        # Pero como tú pediste que refleje la nómina cargada según filtros, sí lo dejamos atado a filtros.
+        # --- Evolución mensual ---
         sql_evolucion = text(f"""
             SELECT
                 TO_CHAR(periodo, 'YYYY-MM') AS periodo,
@@ -6026,7 +6012,6 @@ def create_app():
             "top_empleados": top_empleados,
             "evolucion_mensual": evolucion_mensual
         })
-
 
 
     ############ ENDPOINTS PRODUCTOS ############
