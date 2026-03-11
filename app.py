@@ -5874,7 +5874,7 @@ def create_app():
 
 
     # --- ENDPOINT: Reporte Dashboard de Nómina ---
-    # --- ENDPOINT: Reporte Dashboard de Nómina (extendido con rango de fechas) ---
+    # --- ENDPOINT: Reporte Dashboard de Nómina (actualizado) ---
     @app.route("/reportes/nomina/dashboard", methods=["GET"])
     @jwt_required()
     def reporte_nomina_dashboard():
@@ -5896,18 +5896,19 @@ def create_app():
         condiciones = ["idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
-        # --- Filtros inteligentes ---
         try:
-            # Filtro por año y/o mes (mantiene compatibilidad con versión anterior)
+            # Filtro por año
             if anio and anio.strip() and anio != "0":
                 condiciones.append("EXTRACT(YEAR FROM periodo) = :anio")
                 params["anio"] = int(anio)
 
+            # Filtro por mes
             if mes and mes.strip() and mes != "0":
                 condiciones.append("EXTRACT(MONTH FROM periodo) = :mes")
                 params["mes"] = int(mes)
 
-            # --- Filtro por rango de fechas (tiene prioridad sobre año/mes si ambos están presentes)
+            # Filtro por rango de fechas
+            # Si llegan desde y hasta, se aplican adicionalmente
             if desde and hasta:
                 try:
                     desde_dt = datetime.strptime(desde, "%Y-%m-%d").date()
@@ -5918,10 +5919,10 @@ def create_app():
                 except ValueError:
                     return jsonify({"error": "Formato de fecha inválido. Use YYYY-MM-DD"}), 400
 
-            # --- Filtro opcional por empleado ---
+            # Filtro por empleado
             if empleado and empleado.strip():
                 condiciones.append("identificacion = :empleado")
-                params["empleado"] = empleado
+                params["empleado"] = empleado.strip()
 
         except Exception as e:
             print(f"[ERROR filtros nómina] {e}")
@@ -5933,21 +5934,18 @@ def create_app():
         sql_global = text(f"""
             SELECT
                 COUNT(DISTINCT identificacion) AS empleados,
-                SUM(sueldo) AS total_sueldos,
-                SUM(aux_transporte) AS total_auxilios,
-                SUM(prov_vacaciones) AS total_vacaciones,
-                SUM(prov_prima) AS total_primas,
-                SUM(prov_intereses_cesantias) AS total_intereses_cesantias,
-                SUM(prov_cesantias) AS total_cesantias,
-                SUM(auxilio_extralegal) AS total_extralegal,
-                SUM(total_ingresos) AS total_ingresos,
-                SUM(fondo_salud) AS total_salud,
-                SUM(fondo_pension) AS total_pension,
-                SUM(fondo_solidaridad) AS total_solidaridad,
-                SUM(retefuente) AS total_retefuente,
-                SUM(prestamos) AS total_prestamos,
-                SUM(total_deducciones) AS total_deducciones,
-                SUM(neto_pagar) AS total_neto_pagar
+                COALESCE(SUM(sueldo), 0) AS total_sueldos,
+                COALESCE(SUM(aux_transporte), 0) AS total_auxilios,
+                COALESCE(SUM(auxilio_extralegal), 0) AS total_extralegal,
+                COALESCE(SUM(prima), 0) AS total_prima,
+                COALESCE(SUM(total_ingresos), 0) AS total_ingresos,
+                COALESCE(SUM(fondo_salud), 0) AS total_salud,
+                COALESCE(SUM(fondo_pension), 0) AS total_pension,
+                COALESCE(SUM(fondo_solidaridad), 0) AS total_solidaridad,
+                COALESCE(SUM(retefuente), 0) AS total_retefuente,
+                COALESCE(SUM(prestamos), 0) AS total_prestamos,
+                COALESCE(SUM(total_deducciones), 0) AS total_deducciones,
+                COALESCE(SUM(neto_pagar), 0) AS total_neto_pagar
             FROM siigo_nomina
             WHERE {where_sql}
         """)
@@ -5958,37 +5956,54 @@ def create_app():
             SELECT
                 nombre,
                 identificacion,
-                SUM(sueldo) AS sueldo,
-                SUM(aux_transporte) AS aux_transporte,
-                SUM(prov_vacaciones) AS prov_vacaciones,
-                SUM(prov_prima) AS prov_prima,
-                SUM(prov_intereses_cesantias) AS prov_intereses_cesantias,
-                SUM(prov_cesantias) AS prov_cesantias,
-                SUM(auxilio_extralegal) AS auxilio_extralegal,
-                SUM(total_ingresos) AS total_ingresos,
-                SUM(fondo_salud) AS fondo_salud,
-                SUM(fondo_pension) AS fondo_pension,
-                SUM(fondo_solidaridad) AS fondo_solidaridad,
-                SUM(retefuente) AS retefuente,
-                SUM(prestamos) AS prestamos,
-                SUM(total_deducciones) AS total_deducciones,
-                SUM(neto_pagar) AS neto_pagar
+                MAX(no_contrato) AS no_contrato,
+                COALESCE(SUM(sueldo), 0) AS sueldo,
+                COALESCE(SUM(aux_transporte), 0) AS aux_transporte,
+                COALESCE(SUM(auxilio_extralegal), 0) AS auxilio_extralegal,
+                COALESCE(SUM(prima), 0) AS prima,
+                COALESCE(SUM(total_ingresos), 0) AS total_ingresos,
+                COALESCE(SUM(fondo_salud), 0) AS fondo_salud,
+                COALESCE(SUM(fondo_pension), 0) AS fondo_pension,
+                COALESCE(SUM(fondo_solidaridad), 0) AS fondo_solidaridad,
+                COALESCE(SUM(retefuente), 0) AS retefuente,
+                COALESCE(SUM(prestamos), 0) AS prestamos,
+                COALESCE(SUM(total_deducciones), 0) AS total_deducciones,
+                COALESCE(SUM(neto_pagar), 0) AS neto_pagar
             FROM siigo_nomina
             WHERE {where_sql}
             GROUP BY nombre, identificacion
-            ORDER BY SUM(neto_pagar) DESC
+            ORDER BY COALESCE(SUM(neto_pagar), 0) DESC
         """)
         empleados = [dict(r) for r in db.session.execute(sql_por_empleado, params).mappings().all()]
 
         # --- Top empleados por costo ---
-        top_empleados = sorted(empleados, key=lambda x: x["neto_pagar"] or 0, reverse=True)[:10]
+        top_empleados = empleados[:10]
+
+        # --- Evolución mensual general ---
+        # Importante: no debe verse afectada por filtro de empleado si quieres ver tendencia general.
+        # Pero como tú pediste que refleje la nómina cargada según filtros, sí lo dejamos atado a filtros.
+        sql_evolucion = text(f"""
+            SELECT
+                TO_CHAR(periodo, 'YYYY-MM') AS periodo,
+                COUNT(DISTINCT identificacion) AS empleados,
+                COALESCE(SUM(total_ingresos), 0) AS total_ingresos,
+                COALESCE(SUM(total_deducciones), 0) AS total_deducciones,
+                COALESCE(SUM(neto_pagar), 0) AS total_neto_pagar
+            FROM siigo_nomina
+            WHERE {where_sql}
+            GROUP BY periodo
+            ORDER BY periodo
+        """)
+        evolucion_mensual = [
+            dict(r) for r in db.session.execute(sql_evolucion, params).mappings().all()
+        ]
 
         return jsonify({
             "globales": dict(globales) if globales else {},
             "empleados": empleados,
-            "top_empleados": top_empleados
+            "top_empleados": top_empleados,
+            "evolucion_mensual": evolucion_mensual
         })
-
 
 
 
