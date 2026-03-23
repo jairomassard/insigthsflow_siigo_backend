@@ -499,70 +499,6 @@ def resolver_columnas(headers_originales):
 
     return columnas_resueltas
 
-# --- LÓGICA EXCLUSIVA PARA PROCESAMIENTO DE AUXILIAR CONTABLE SIIGO (LIBRO AUXILIAR) ---
-
-def normalizar_valor_auxiliar(valor):
-    """Convierte celdas de Excel a Decimal de forma ultra segura."""
-    if valor is None or str(valor).lower() == 'nan':
-        return Decimal("0.00")
-    try:
-        if isinstance(valor, (int, float, Decimal)):
-            return Decimal(str(valor))
-        texto = str(valor).replace("$", "").replace(" ", "").replace(".", "").replace(",", ".")
-        return Decimal(texto)
-    except:
-        return Decimal("0.00")
-
-def procesar_excel_auxiliar_v2(file_storage, idcliente):
-    """Parser específico para el reporte Movimiento Auxiliar por Cuenta Contable de Siigo."""
-    # Saltamos 4 filas (encabezado Siigo)
-    df = pd.read_excel(file_storage, skiprows=4)
-    
-    # Mapeo por índice para evitar problemas si Siigo cambia nombres de columnas
-    # Siigo suele exportar: [Fecha, Cuenta, Comprobante, Identificación, Nombre, Detalle, Débitos, Créditos, Base]
-    registros = []
-    
-    for _, row in df.iterrows():
-        # Validamos que la fila tenga fecha y cuenta (evita totales de Siigo)
-        if pd.isna(row.iloc[0]) or pd.isna(row.iloc[1]):
-            continue
-            
-        try:
-            f_contable = pd.to_datetime(row.iloc[0])
-            cuenta_raw = str(row.iloc[1])
-            comp_raw = str(row.iloc[2])
-            
-            # Split de cuenta "240805 IVA..."
-            partes_cta = cuenta_raw.split(' ')
-            codigo_cta = partes_cta[0]
-            nombre_cta = " ".join(partes_cta[1:])
-            
-            # Split de comprobante "FC-1-10"
-            tipo_comp = comp_raw.split('-')[0] if '-' in comp_raw else comp_raw
-            num_comp = comp_raw.split('-')[-1] if '-' in comp_raw else ""
-
-            registros.append({
-                "idcliente": idcliente,
-                "fecha_contable": f_contable.date(),
-                "comprobante_tipo": tipo_comp,
-                "comprobante_numero": num_comp,
-                "cuenta_codigo": codigo_cta,
-                "cuenta_nombre": nombre_cta,
-                "tercero_nit": str(row.iloc[3]),
-                "tercero_nombre": str(row.iloc[4]),
-                "detalle": str(row.iloc[5]),
-                "debito": normalizar_valor_auxiliar(row.iloc[6]),
-                "credito": normalizar_valor_auxiliar(row.iloc[7]),
-                "base_gravable": normalizar_valor_auxiliar(row.iloc[8]),
-                "periodo_anio": f_contable.year,
-                "periodo_mes": f_contable.month,
-                "archivo_origen": file_storage.filename
-            })
-        except:
-            continue
-            
-    return registros
-
 
 def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
@@ -7062,95 +6998,218 @@ def create_app():
             "conclusiones": conclusiones
         })
 
-    # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
-    @app.route("/reportes/cargar_auxiliar", methods=["POST"])
+
+    # Reporte Criuce de IVAs  antes de uso de Reporte de Auxiliar contable
+    @app.route("/reportes/cruce_iva", methods=["GET"])
     @jwt_required()
-    def endpoint_cargar_auxiliar():
-        idcliente = get_jwt().get("idcliente")
-        if 'file' not in request.files:
-            return jsonify({"error": "No hay archivo"}), 400
-        
-        file = request.files['file']
-        try:
-            from models import AuxiliarContable
-            datos = procesar_excel_auxiliar_v2(file, idcliente)
-            
-            if not datos:
-                return jsonify({"error": "No se encontraron datos válidos"}), 400
+    def get_cruce_iva():
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
 
-            # Determinamos rango para borrado atómico
-            f_inicio = min(d['fecha_contable'] for d in datos)
-            f_fin = max(d['fecha_contable'] for d in datos)
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
 
-            AuxiliarContable.query.filter(
-                AuxiliarContable.idcliente == idcliente,
-                AuxiliarContable.fecha_contable >= f_inicio,
-                AuxiliarContable.fecha_contable <= f_fin
-            ).delete()
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
 
-            db.session.bulk_insert_mappings(AuxiliarContable, datos)
-            db.session.commit()
+        desde_str = request.args.get("desde")
+        hasta_str = request.args.get("hasta")
+        modo = request.args.get("modo", "mensual").lower()
+        incluir_detalle = request.args.get("detalle", "0") == "1"
 
-            return jsonify({
-                "detalles": {
-                    "registros_procesados": len(datos),
-                    "rango_desde": f_inicio.isoformat(),
-                    "rango_hasta": f_fin.isoformat()
-                }
-            }), 200
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/reportes/cruce_iva_v2", methods=["GET"])
-    @jwt_required()
-    def get_cruce_iva_v2():
-        idcliente = get_jwt().get("idcliente")
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        
-        # Query optimizado sobre la nueva tabla de Auxiliar
-        sql = text("""
-            SELECT 
-                periodo_anio, periodo_mes,
-                SUM(CASE WHEN cuenta_codigo LIKE '240805%' THEN (credito - debito) ELSE 0 END) AS vtas,
-                SUM(CASE WHEN cuenta_codigo LIKE '240810%' THEN (debito - credito) ELSE 0 END) AS comps,
-                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
-            FROM auxiliar_contable
-            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
-        """)
-        
-        res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        
-        series = []
-        for r in res:
-            iva_v = float(r['vtas'])
-            iva_c = float(r['comps'])
-            rete = float(r['rete'])
-            series.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-                "iva_ventas": iva_v,
-                "iva_compras": iva_c,
-                "reteiva_favor": rete,
-                "saldo_iva": iva_v - iva_c - rete,
-                "mes_presentacion": (datetime(r['periodo_anio'], r['periodo_mes'], 1) + timedelta(days=32)).strftime("%Y-%m")
-            })
-
-        # Agregación por modos (bimensual, etc) - Reutilizamos tu lógica de frontend o backend aquí
-        # Por brevedad, devolvemos las series y los KPIs totales
-        kpis = {
-            "iva_ventas": sum(s['iva_ventas'] for s in series),
-            "iva_compras": sum(s['iva_compras'] for s in series),
-            "reteiva_favor": sum(s['reteiva_favor'] for s in series),
-            "saldo_iva": sum(s['saldo_iva'] for s in series)
+        modos_validos = {
+            "mensual": 1,
+            "bimensual": 2,
+            "trimestral": 3,
+            "cuatrimestral": 4
         }
-        
-        return jsonify({"series": series, "kpis": kpis, "series_agrupadas": {
-            "bimensual": series, # Aquí podrías añadir la lógica de agrupar() si prefieres backend
-            "trimestral": series,
-            "cuatrimestral": series
-        }}) 
+        agrupacion_meses = modos_validos.get(modo, 1)
+
+        try:
+            desde = datetime.strptime(desde_str, "%Y-%m-%d") if desde_str else None
+            hasta = datetime.strptime(hasta_str, "%Y-%m-%d") if hasta_str else None
+        except:
+            return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+
+        params = {"idcliente": idcliente}
+        wh_ventas = ["f.idcliente = :idcliente"]
+        wh_compras = ["c.idcliente = :idcliente"]
+        filtro_nc_fecha = []
+
+        if desde:
+            wh_ventas.append("f.fecha >= :desde")
+            wh_compras.append("c.fecha >= :desde")
+            filtro_nc_fecha.append("nc.fecha >= :desde")
+            params["desde"] = desde
+        if hasta:
+            wh_ventas.append("f.fecha <= :hasta")
+            wh_compras.append("c.fecha <= :hasta")
+            filtro_nc_fecha.append("nc.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        sql_main = text(f"""
+            WITH notas_credito_ajuste AS (
+                SELECT
+                    EXTRACT(YEAR FROM nc.fecha) AS anio,
+                    EXTRACT(MONTH FROM nc.fecha) AS mes,
+                    SUM(
+                        CASE 
+                            WHEN f.total IS NOT NULL AND nc.total >= 0.9 * f.total THEN f.impuestos_total
+                            ELSE (f.impuestos_total * (nc.total / f.total))
+                        END
+                    ) AS iva_nc
+                FROM siigo_notas_credito nc
+                LEFT JOIN facturas_enriquecidas f 
+                    ON nc.factura_afectada_id = f.idfactura
+                WHERE nc.idcliente = :idcliente
+                {f" AND {' AND '.join(filtro_nc_fecha)}" if filtro_nc_fecha else ""}
+                GROUP BY anio, mes
+            ),
+            ventas AS (
+                SELECT
+                    EXTRACT(YEAR FROM f.fecha) AS anio,
+                    EXTRACT(MONTH FROM f.fecha) AS mes,
+                    SUM(f.impuestos_total) - COALESCE(nc.iva_nc, 0) AS iva_ventas
+                FROM facturas_enriquecidas f
+                LEFT JOIN notas_credito_ajuste nc
+                    ON EXTRACT(YEAR FROM f.fecha) = nc.anio AND EXTRACT(MONTH FROM f.fecha) = nc.mes
+                WHERE {" AND ".join(wh_ventas)}
+                GROUP BY EXTRACT(YEAR FROM f.fecha), EXTRACT(MONTH FROM f.fecha), nc.iva_nc
+            ),
+            compras AS (
+                SELECT
+                    EXTRACT(YEAR FROM c.fecha) AS anio,
+                    EXTRACT(MONTH FROM c.fecha) AS mes,
+                    SUM(ci.impuestos) AS iva_compras
+                FROM siigo_compras_items ci
+                JOIN siigo_compras c ON ci.compra_id = c.id
+                WHERE {" AND ".join(wh_compras)}
+                GROUP BY anio, mes
+            ),
+            combinadas AS (
+                SELECT COALESCE(v.anio, c.anio) AS anio,
+                    COALESCE(v.mes, c.mes) AS mes,
+                    COALESCE(v.iva_ventas, 0) AS iva_ventas,
+                    COALESCE(c.iva_compras, 0) AS iva_compras,
+                    COALESCE(v.iva_ventas, 0) - COALESCE(c.iva_compras, 0) AS saldo_iva
+                FROM ventas v
+                FULL OUTER JOIN compras c
+                ON v.anio = c.anio AND v.mes = c.mes
+            )
+            SELECT anio,
+                mes,
+                TO_CHAR(MAKE_DATE(anio::int, mes::int, 1), 'YYYY-MM') AS periodo,
+                TO_CHAR(MAKE_DATE(anio::int, mes::int, 1) + INTERVAL '1 month', 'YYYY-MM') AS mes_presentacion,
+                SUM(iva_ventas) AS iva_ventas,
+                SUM(iva_compras) AS iva_compras,
+                SUM(saldo_iva) AS saldo_iva
+            FROM combinadas
+            GROUP BY anio, mes
+            ORDER BY anio, mes
+        """)
+
+        try:
+            result = db.session.execute(sql_main, params).mappings().all()
+            rows = [dict(r) for r in result]
+
+            kpis = {
+                "iva_ventas": sum(r["iva_ventas"] for r in rows),
+                "iva_compras": sum(r["iva_compras"] for r in rows),
+                "saldo_iva": sum(r["saldo_iva"] for r in rows),
+            }
+
+            series = [
+                {
+                    "label": r["periodo"],
+                    "mes_presentacion": r["mes_presentacion"],
+                    "iva_ventas": r["iva_ventas"],
+                    "iva_compras": r["iva_compras"],
+                    "saldo_iva": r["saldo_iva"],
+                }
+                for r in rows
+            ]
+
+            def agrupar(rows, step):
+                grupos = []
+                for i in range(0, len(rows), step):
+                    grupo = rows[i:i+step]
+                    if not grupo:
+                        continue
+                    iva_ventas = sum(r["iva_ventas"] or 0 for r in grupo)
+                    iva_compras = sum(r["iva_compras"] or 0 for r in grupo)
+                    saldo_iva = sum(r["saldo_iva"] or 0 for r in grupo)
+
+                    grupos.append({
+                        "label": " + ".join(r["periodo"] for r in grupo),
+                        "mes_presentacion": grupo[-1]["mes_presentacion"],
+                        "iva_ventas": iva_ventas,
+                        "iva_compras": iva_compras,
+                        "saldo_iva": saldo_iva,
+                    })
+
+                # 👉 Aplicar lógica de arrastre
+                saldo_acumulado = 0
+                for g in grupos:
+                    g["arrastre_anterior"] = saldo_acumulado
+                    neto = g["saldo_iva"] + saldo_acumulado
+                    g["iva_neto_a_pagar"] = max(neto, 0)
+                    saldo_acumulado = neto if neto < 0 else 0
+
+                return grupos
+
+            series_agrupadas = {
+                "bimensual": agrupar(rows, 2),
+                "trimestral": agrupar(rows, 3),
+                "cuatrimestral": agrupar(rows, 4),
+            }
+
+            response = {
+                "rows": rows,
+                "series": series,
+                "series_agrupadas": series_agrupadas,
+                "kpis": kpis,
+                "modo": modo,
+                "count": len(rows),
+            }
+
+            if incluir_detalle:
+                detalle_ventas = db.session.execute(text(f"""
+                    SELECT TO_CHAR(DATE_TRUNC('month', fecha), 'YYYY-MM') AS periodo,
+                        idfactura, fecha, cliente_nombre,
+                        impuestos_total, total, public_url
+                    FROM facturas_enriquecidas f
+                    WHERE {" AND ".join(wh_ventas)}
+                    ORDER BY fecha
+                """), params).mappings().all()
+
+                detalle_compras = db.session.execute(text(f"""
+                    SELECT TO_CHAR(DATE_TRUNC('month', c.fecha), 'YYYY-MM') AS periodo,
+                        c.idcompra, c.fecha, c.proveedor_nombre,
+                        SUM(ci.impuestos) AS impuestos_total,
+                        c.total, c.factura_proveedor
+                    FROM siigo_compras_items ci
+                    JOIN siigo_compras c ON ci.compra_id = c.id
+                    WHERE {" AND ".join(wh_compras)}
+                    GROUP BY c.idcompra, c.fecha, c.proveedor_nombre, c.total, c.factura_proveedor
+                    ORDER BY c.fecha
+                """), params).mappings().all()
+
+                def agrupar_facturas(filas):
+                    agrupado = {}
+                    for f in filas:
+                        p = f["periodo"]
+                        agrupado.setdefault(p, []).append(dict(f))
+                    return agrupado
+
+                response["facturas_ventas"] = agrupar_facturas(detalle_ventas)
+                response["facturas_compras"] = agrupar_facturas(detalle_compras)
+
+            return jsonify(response)
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
 

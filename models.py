@@ -792,3 +792,35 @@ class SystemNotification(db.Model):
 
     def __repr__(self):
         return f"<SystemNotification id={self.id} cliente={self.idcliente} tipo={self.tipo}>"
+
+
+
+class AuxiliarContable(db.Model):
+    __tablename__ = "auxiliar_contable"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente"), nullable=False)
+    fecha_contable = db.Column(db.Date, nullable=False)
+    comprobante_tipo = db.Column(db.String(20))
+    comprobante_numero = db.Column(db.String(50))
+    cuenta_codigo = db.Column(db.String(20), nullable=False)
+    cuenta_nombre = db.Column(db.String(255))
+    tercero_nit = db.Column(db.String(50))
+    tercero_nombre = db.Column(db.String(255))
+    detalle = db.Column(db.Text)
+    debito = db.Column(db.Numeric(18, 2))
+    credito = db.Column(db.Numeric(18, 2))
+    base_gravable = db.Column(db.Numeric(18, 2))
+    fecha_carga = db.Column(db.DateTime, default=datetime.utcnow)
+    periodo_anio = db.Column(db.Integer)
+    periodo_mes = db.Column(db.Integer)
+
+    def to_dict(self):
+        return {
+            "fecha": self.fecha_contable.isoformat(),
+            "cuenta": self.cuenta_codigo,
+            "tercero": self.tercero_nombre,
+            "debito": float(self.debito),
+            "credito": float(self.credito),
+            "base": float(self.base_gravable)
+        }
