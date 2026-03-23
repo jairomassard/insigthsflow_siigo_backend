@@ -7109,48 +7109,85 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         
-        # Query optimizado sobre la nueva tabla de Auxiliar
+        # 1. Consulta SQL sobre la tabla de Auxiliar Contable
         sql = text("""
             SELECT 
-                periodo_anio, periodo_mes,
+                periodo_anio, 
+                periodo_mes,
                 SUM(CASE WHEN cuenta_codigo LIKE '240805%' THEN (credito - debito) ELSE 0 END) AS vtas,
                 SUM(CASE WHEN cuenta_codigo LIKE '240810%' THEN (debito - credito) ELSE 0 END) AS comps,
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
+            GROUP BY 1, 2 
+            ORDER BY 1, 2
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
         
-        series = []
+        # 2. Construir Series Mensuales
+        series_mensuales = []
         for r in res:
-            iva_v = float(r['vtas'])
-            iva_c = float(r['comps'])
-            rete = float(r['rete'])
-            series.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+            iva_v = float(r['vtas'] or 0)
+            iva_c = float(r['comps'] or 0)
+            rete = float(r['rete'] or 0)
+            
+            # Etiqueta de periodo (Ej: 2025-01)
+            label = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
+            
+            # Mes de presentación (Mes siguiente)
+            f_mes = datetime(r['periodo_anio'], r['periodo_mes'], 1)
+            mes_pres = (f_mes + timedelta(days=32)).strftime("%Y-%m")
+
+            series_mensuales.append({
+                "label": label,
                 "iva_ventas": iva_v,
                 "iva_compras": iva_c,
                 "reteiva_favor": rete,
-                "saldo_iva": iva_v - iva_c - rete,
-                "mes_presentacion": (datetime(r['periodo_anio'], r['periodo_mes'], 1) + timedelta(days=32)).strftime("%Y-%m")
+                "saldo_iva": iva_v - iva_c - rete, # Neto a pagar
+                "mes_presentacion": mes_pres
             })
 
-        # Agregación por modos (bimensual, etc) - Reutilizamos tu lógica de frontend o backend aquí
-        # Por brevedad, devolvemos las series y los KPIs totales
+        # 3. Función interna para agrupar (Bimensual, Trimestral, Cuatrimestral)
+        def generar_agrupacion(datos, salto):
+            agrupados = []
+            for i in range(0, len(datos), salto):
+                grupo = datos[i : i + salto]
+                if not grupo: continue
+                
+                v = sum(item['iva_ventas'] for item in grupo)
+                c = sum(item['iva_compras'] for item in grupo)
+                r = sum(item['reteiva_favor'] for item in grupo)
+                
+                agrupados.append({
+                    "label": " + ".join([item['label'] for item in grupo]),
+                    "iva_ventas": v,
+                    "iva_compras": c,
+                    "reteiva_favor": r,
+                    "saldo_iva": v - c - r,
+                    "mes_presentacion": grupo[-1]['mes_presentacion']
+                })
+            return agrupados
+
+        # 4. Construir respuesta final
+        series_agrupadas = {
+            "bimensual": generar_agrupacion(series_mensuales, 2),
+            "trimestral": generar_agrupacion(series_mensuales, 3),
+            "cuatrimestral": generar_agrupacion(series_mensuales, 4)
+        }
+
         kpis = {
-            "iva_ventas": sum(s['iva_ventas'] for s in series),
-            "iva_compras": sum(s['iva_compras'] for s in series),
-            "reteiva_favor": sum(s['reteiva_favor'] for s in series),
-            "saldo_iva": sum(s['saldo_iva'] for s in series)
+            "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
+            "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
+            "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
+            "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
         }
         
-        return jsonify({"series": series, "kpis": kpis, "series_agrupadas": {
-            "bimensual": series, # Aquí podrías añadir la lógica de agrupar() si prefieres backend
-            "trimestral": series,
-            "cuatrimestral": series
-        }}) 
+        return jsonify({
+            "series": series_mensuales, 
+            "kpis": kpis, 
+            "series_agrupadas": series_agrupadas
+        }), 200
 
 
 
