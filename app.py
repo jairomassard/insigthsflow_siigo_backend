@@ -7064,13 +7064,11 @@ def create_app():
 
     # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
     # --- Importar Movimiento Auxiliar desde Archivo Excel ---
-    # --- Importar Movimiento Auxiliar con Logger de Auditoría ---
     @app.route("/reportes/cargar_auxiliar", methods=["POST"])
     @jwt_required()
     def importar_auxiliar_desde_excel():
         import pandas as pd
-        from datetime import datetime, timezone
-        from decimal import Decimal
+        from datetime import datetime
         import traceback
 
         claims = get_jwt()
@@ -7082,126 +7080,89 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            
-            # 1. Lectura inicial para auditoría
-            df_debug = pd.read_excel(file, engine="calamine")
-            
-            print("\n" + "="*50)
-            print("🔍 [AUDITORÍA INSIGHTFLOW] ANALIZANDO ESTRUCTURA")
-            print(f"Archivo recibido: {file.filename}")
-            
-            # Imprimimos las primeras 10 filas en la consola del backend
-            for i in range(0, min(10, len(df_debug))):
-                fila_valores = [str(val).strip() for val in df_debug.iloc[i].values]
-                print(f"Fila {i}: {fila_valores}")
-            print("="*50 + "\n")
-
-            # 2. Búsqueda ultra-flexible del encabezado
-            header_row = None
-            for i, row in df_debug.iterrows():
-                # Normalizamos los valores de la fila para la comparación
-                row_str = [str(val).strip().lower() for val in row.values]
-                
-                # Buscamos si la fila contiene 'fecha' y 'cuenta' (en minúsculas por seguridad)
-                if "fecha" in row_str and "cuenta" in row_str:
-                    header_row = i
-                    print(f"✅ ¡ENCABEZADO DETECTADO EN FILA {i+2} (Índice {i})!")
-                    break
-
-            if header_row is None:
-                # Si el logger falló, devolvemos las columnas encontradas en la fila 4 por si acaso
-                cols_fila_4 = [str(val).strip() for val in df_debug.iloc[3].values]
-                return jsonify({
-                    "error": "No se detectaron las columnas 'Fecha' y 'Cuenta'.",
-                    "debug_info": f"La fila 5 contiene: {cols_fila_4}"
-                }), 400
-
-            # 3. Recarga del archivo desde la fila detectada
-            file.seek(0)
-            df = pd.read_excel(file, header=header_row + 1, engine="calamine")
-            
-            # Limpieza de nombres de columnas
+            # Leemos con calamine saltando los encabezados decorativos de Siigo
+            df = pd.read_excel(file, header=4, engine="calamine")
             df.columns = [str(c).strip() for c in df.columns]
-            print(f"Columnas finales detectadas: {list(df.columns)}")
-
-            # 4. Limpieza de datos vacíos
-            df = df.dropna(subset=['Fecha', 'Cuenta'])
-            df = df.where(pd.notnull(df), None)
-
         except Exception as e:
-            print(f"❌ ERROR CRÍTICO: {traceback.format_exc()}")
-            return jsonify({"error": f"Error al procesar estructura: {str(e)}"}), 400
+            return jsonify({"error": f"Error al abrir el Excel: {str(e)}"}), 400
 
-        # --- Lógica de Procesamiento y Guardado ---
+        lista_mapeada = []
+        fechas_procesadas = []
+
+        # Función de limpieza numérica integrada
+        def clean_num(val):
+            if val is None or str(val).lower() == 'nan': return 0.0
+            try:
+                # Quitamos puntos de miles y espacios para evitar errores de float()
+                s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
+                return float(s_val)
+            except:
+                return 0.0
+
+        for idx, row in df.iterrows():
+            try:
+                f_raw = row.get('Fecha Elaboración')
+                if not f_raw or str(f_raw).lower() == 'nan': continue
+                
+                f_dt = pd.to_datetime(f_raw, dayfirst=True)
+                fechas_procesadas.append(f_dt)
+
+                comp_raw = str(row.get('Comprobante') or "")
+                cta_raw = str(row.get('Código cuenta contable') or "").strip()
+
+                # Creamos un diccionario para el bulk_insert
+                lista_mapeada.append({
+                    "idcliente": idcliente,
+                    "fecha_contable": f_dt.date(),
+                    "comprobante_tipo": comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
+                    "comprobante_numero": comp_raw.split('-')[-1] if '-' in comp_raw else "",
+                    "cuenta_codigo": cta_raw,
+                    "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
+                    "tercero_nit": str(row.get('Identificación') or ""),
+                    "tercero_nombre": str(row.get('Nombre tercero') or ""),
+                    "detalle": str(row.get('Detalle') or ""),
+                    "debito": clean_num(row.get('Débito')),
+                    "credito": clean_num(row.get('Crédito')),
+                    "base_gravable": clean_num(row.get('Base')),
+                    "periodo_anio": f_dt.year,
+                    "periodo_mes": f_dt.month,
+                    "archivo_origen": file.filename
+                })
+            except:
+                continue
+
+        if not lista_mapeada:
+             return jsonify({"error": "No se encontraron registros válidos en el archivo."}), 400
+
         try:
-            fechas_excel = pd.to_datetime(df['Fecha'])
-            fecha_min = fechas_excel.min()
-            fecha_max = fechas_excel.max()
-
-            # Borrado preventivo
+            # 1. Identificamos el rango para limpiar la BD
+            fecha_min = min(fechas_procesadas)
+            fecha_max = max(fechas_procesadas)
+            
+            # 2. Borramos lo existente en ese rango para este cliente
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
                 AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({"error": f"Error validando fechas: {str(e)}"}), 500
-
-        registros_creados = 0
-        for idx, row in df.iterrows():
-            try:
-                f_raw = row.get("Fecha")
-                if not f_raw or str(f_raw).lower() == 'nan': continue
-                
-                f_dt = pd.to_datetime(f_raw)
-                cta_raw = str(row.get("Cuenta") or "")
-                comp_raw = str(row.get("Comprobante") or "")
-                
-                def clean_num(val):
-                    if val is None or str(val).lower() == 'nan': return 0.0
-                    s_val = str(val).replace(" ", "").replace("$", "")
-                    if "," in s_val and "." in s_val:
-                        s_val = s_val.replace(".", "").replace(",", ".")
-                    elif "," in s_val:
-                        s_val = s_val.replace(",", ".")
-                    return float(s_val)
-
-                nuevo_reg = AuxiliarContable(
-                    idcliente=idcliente,
-                    fecha_contable=f_dt.date(),
-                    comprobante_tipo=comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
-                    comprobante_numero=comp_raw.split('-')[-1] if '-' in comp_raw else "",
-                    cuenta_codigo=cta_raw.split(' ')[0],
-                    cuenta_nombre=" ".join(cta_raw.split(' ')[1:]),
-                    tercero_nit=str(row.get("Identificación") or ""),
-                    tercero_nombre=str(row.get("Nombre") or ""),
-                    detalle=str(row.get("Detalle") or ""),
-                    debito=clean_num(row.get("Débitos")),
-                    credito=clean_num(row.get("Créditos")),
-                    base_gravable=clean_num(row.get("Base")),
-                    periodo_anio=f_dt.year,
-                    periodo_mes=f_dt.month,
-                    archivo_origen=file.filename
-                )
-                db.session.add(nuevo_reg)
-                registros_creados += 1
-            except:
-                continue
-
-        try:
+            
+            # 3. INSERT MASIVO (Mucho más rápido que add())
+            db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
             db.session.commit()
+            
             return jsonify({
-                "mensaje": "Auxiliar importado correctamente",
+                "mensaje": "Auxiliar importado con éxito",
                 "detalles": {
-                    "registros_procesados": registros_creados,
-                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
-                    "rango_hasta": fecha_max.strftime('%Y-%m-%d')
+                    "registros": len(lista_mapeada),
+                    "desde": fecha_min.strftime('%Y-%m-%d'),
+                    "hasta": fecha_max.strftime('%Y-%m-%d')
                 }
             }), 200
+            
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": f"Error al guardar: {str(e)}"}), 500
+            print(f"Error en DB: {traceback.format_exc()}")
+            return jsonify({"error": f"Error al guardar en la base de datos: {str(e)}"}), 500
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
