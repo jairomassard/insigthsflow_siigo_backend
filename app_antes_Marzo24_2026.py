@@ -514,36 +514,33 @@ def normalizar_valor_auxiliar(valor):
         return Decimal("0.00")
 
 def procesar_excel_auxiliar_v2(file_storage, idcliente):
-    """Parser universal para el reporte de Siigo Nube."""
-    # Leemos el Excel
+    """Parser específico para el reporte Movimiento Auxiliar por Cuenta Contable de Siigo."""
+    # Saltamos 4 filas (encabezado Siigo)
     df = pd.read_excel(file_storage, skiprows=4)
     
+    # Mapeo por índice para evitar problemas si Siigo cambia nombres de columnas
+    # Siigo suele exportar: [Fecha, Cuenta, Comprobante, Identificación, Nombre, Detalle, Débitos, Créditos, Base]
     registros = []
     
     for _, row in df.iterrows():
-        # 1. SEGURIDAD: Evitar filas vacías o totales de Siigo
-        # Si la primera o segunda columna están vacías, saltar.
+        # Validamos que la fila tenga fecha y cuenta (evita totales de Siigo)
         if pd.isna(row.iloc[0]) or pd.isna(row.iloc[1]):
             continue
             
         try:
-            # 2. MANEJO DE FECHA: Asegurar que sea una fecha válida
-            f_val = row.iloc[0]
-            f_contable = pd.to_datetime(f_val) if not isinstance(f_val, datetime) else f_val
-
-            # 3. PROCESAMIENTO DE CUENTA: Separar código y nombre
-            cuenta_raw = str(row.iloc[1]).strip()
-            # Siigo a veces pone "240805 IVA..." o solo "240805"
-            partes_cta = cuenta_raw.split(' ', 1) 
-            codigo_cta = partes_cta[0]
-            nombre_cta = partes_cta[1] if len(partes_cta) > 1 else ""
-            
-            # 4. COMPROBANTE
+            f_contable = pd.to_datetime(row.iloc[0])
+            cuenta_raw = str(row.iloc[1])
             comp_raw = str(row.iloc[2])
+            
+            # Split de cuenta "240805 IVA..."
+            partes_cta = cuenta_raw.split(' ')
+            codigo_cta = partes_cta[0]
+            nombre_cta = " ".join(partes_cta[1:])
+            
+            # Split de comprobante "FC-1-10"
             tipo_comp = comp_raw.split('-')[0] if '-' in comp_raw else comp_raw
             num_comp = comp_raw.split('-')[-1] if '-' in comp_raw else ""
 
-            # 5. CONSTRUCCIÓN DEL DICCIONARIO (Captura TOTAL de cuentas)
             registros.append({
                 "idcliente": idcliente,
                 "fecha_contable": f_contable.date(),
@@ -551,19 +548,17 @@ def procesar_excel_auxiliar_v2(file_storage, idcliente):
                 "comprobante_numero": num_comp,
                 "cuenta_codigo": codigo_cta,
                 "cuenta_nombre": nombre_cta,
-                "tercero_nit": str(row.iloc[3]) if not pd.isna(row.iloc[3]) else "",
-                "tercero_nombre": str(row.iloc[4]) if not pd.isna(row.iloc[4]) else "SIN TERCERO",
-                "detalle": str(row.iloc[5]) if not pd.isna(row.iloc[5]) else "",
+                "tercero_nit": str(row.iloc[3]),
+                "tercero_nombre": str(row.iloc[4]),
+                "detalle": str(row.iloc[5]),
                 "debito": normalizar_valor_auxiliar(row.iloc[6]),
                 "credito": normalizar_valor_auxiliar(row.iloc[7]),
                 "base_gravable": normalizar_valor_auxiliar(row.iloc[8]),
                 "periodo_anio": f_contable.year,
                 "periodo_mes": f_contable.month,
-                "archivo_origen": getattr(file_storage, 'filename', 'upload_excel')
+                "archivo_origen": file_storage.filename
             })
-        except Exception as e:
-            # Opcional: imprimir el error para debug
-            # print(f"Error en fila: {e}")
+        except:
             continue
             
     return registros
@@ -7141,25 +7136,18 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         
-        # 1. Consulta SQL Optimizada
-        # He ajustado los filtros LIKE para que sean más específicos según la normativa contable
+        # 1. Consulta SQL Optimizada para capturar servicios (240806, 240815, etc.)
         sql = text("""
             SELECT 
                 periodo_anio, 
                 periodo_mes,
                 -- IVA GENERADO (Ventas/Servicios: 240801 a 240809)
                 SUM(CASE WHEN cuenta_codigo LIKE '24080%' THEN (credito - debito) ELSE 0 END) AS vtas,
-                
-                -- IVA DESCONTABLE (Compras/Gastos: 240810 al 240880)
-                -- Nota: Excluimos explícitamente el 24089X para que no ensucie el cálculo de compras
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081%' OR cuenta_codigo LIKE '24082%' OR cuenta_codigo LIKE '24084%') 
+                -- IVA DESCONTABLE (Compras/Servicios: 240810 en adelante)
+                SUM(CASE WHEN (cuenta_codigo LIKE '24081%' OR cuenta_codigo LIKE '24089%') 
                         THEN (debito - credito) ELSE 0 END) AS comps,
-                
-                -- RETEIVA A FAVOR (135517)
-                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete,
-
-                -- SALDO DE LIQUIDACIÓN CONTABLE (Para comparar con la fila de cierre que viste en Excel)
-                SUM(CASE WHEN cuenta_codigo LIKE '240890%' THEN (credito - debito) ELSE 0 END) AS saldo_cierre
+                -- RETEIVA (135517)
+                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc 
             AND fecha_contable BETWEEN :d AND :h
@@ -7174,7 +7162,6 @@ def create_app():
             v = float(r['vtas'] or 0)
             c = float(r['comps'] or 0)
             ret = float(r['rete'] or 0)
-            # El saldo_cierre queda aquí por si en el futuro quieres mostrarlo en el frontend
             
             # Cálculo de fecha de presentación (mes siguiente)
             f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
@@ -7189,7 +7176,7 @@ def create_app():
                 "mes_presentacion": mes_pres
             })
 
-        # --- FUNCIÓN INTERNA PARA AGRUPAR ---
+        # --- FUNCIÓN INTERNA PARA AGRUPAR (Soluciona el error de Pylance) ---
         def generar_agrupacion_interna(datos, salto):
             agrupados = []
             for i in range(0, len(datos), salto):
@@ -7210,7 +7197,7 @@ def create_app():
                 })
             return agrupados
 
-        # 2. Respuesta final con KPIs y Series Agrupadas
+        # 2. Generar las series agrupadas usando la función interna
         return jsonify({
             "series": series_mensuales,
             "kpis": {
