@@ -7073,30 +7073,50 @@ def create_app():
 
         claims = get_jwt()
         idcliente = claims.get("idcliente")
-        if not idcliente:
-            return jsonify({"error": "Token sin cliente asociado"}), 400
-
-        # Validar archivo (Usamos "archivo" para ser consistentes con tu otro código)
+        
         if "archivo" not in request.files:
             return jsonify({"error": "Archivo no proporcionado"}), 400
         file = request.files["archivo"]
 
         try:
             from models import AuxiliarContable
-            # Leer Excel con calamine (fila 5 es el encabezado en Siigo Auxiliar)
-            df = pd.read_excel(file, header=4, engine="calamine")
-            df = df.dropna(subset=['Fecha', 'Cuenta']) # Limpiar filas vacías o de totales
-            df = df.where(pd.notnull(df), None)
-        except Exception as e:
-            return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
+            # 1. Leemos el Excel completo sin saltar filas primero para analizarlo
+            df_raw = pd.read_excel(file, engine="calamine")
+            
+            # 2. Buscamos en qué fila están realmente los encabezados 'Fecha' y 'Cuenta'
+            header_row = None
+            for i, row in df_raw.iterrows():
+                row_values = [str(val).strip() for val in row.values]
+                if "Fecha" in row_values and "Cuenta" in row_values:
+                    header_row = i
+                    break
+            
+            if header_row is None:
+                return jsonify({"error": "No se encontró la fila de encabezados (Fecha, Cuenta) en el Excel"}), 400
 
-        # Identificar rango para limpieza atómica
+            # 3. Volvemos a leer el archivo pero ya sabemos desde dónde
+            file.seek(0) # Resetear puntero del archivo
+            df = pd.read_excel(file, header=header_row + 1, engine="calamine")
+            
+            # Limpiar nombres de columnas (quitar espacios locos que mete Siigo)
+            df.columns = [str(c).strip() for c in df.columns]
+            
+            # 4. Validar columnas críticas después de la limpieza
+            if 'Fecha' not in df.columns or 'Cuenta' not in df.columns:
+                 return jsonify({"error": f"Columnas no detectadas. Encontradas: {list(df.columns)}"}), 400
+
+            df = df.dropna(subset=['Fecha', 'Cuenta'])
+            df = df.where(pd.notnull(df), None)
+
+        except Exception as e:
+            return jsonify({"error": f"Error al leer estructura: {str(e)}"}), 400
+
+        # Rango de fechas para borrado
         try:
             fechas_excel = pd.to_datetime(df['Fecha'])
             fecha_min = fechas_excel.min()
             fecha_max = fechas_excel.max()
 
-            # Borrar registros en el rango detectado
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
@@ -7104,24 +7124,29 @@ def create_app():
             ).delete()
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": f"Error al preparar la base de datos: {str(e)}"}), 500
+            return jsonify({"error": f"Error en validación de fechas: {str(e)}"}), 500
 
         registros_creados = 0
         
-        # Procesar filas
+        # Procesar filas con nombres de columna limpios
         for idx, row in df.iterrows():
             try:
                 f_raw = row.get("Fecha")
-                if not f_raw: continue
+                if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw)
                 cta_raw = str(row.get("Cuenta") or "")
                 comp_raw = str(row.get("Comprobante") or "")
                 
-                # Normalización de valores (usando tu lógica de reemplazar comas/espacios)
                 def clean_num(val):
-                    if val is None: return 0.0
-                    return float(str(val).replace(",", "").replace(" ", ""))
+                    if val is None or str(val).lower() == 'nan': return 0.0
+                    # Quitamos puntos de miles y cambiamos coma por punto si es necesario
+                    s_val = str(val).replace(" ", "").replace("$", "")
+                    if "," in s_val and "." in s_val: # Caso 1.234,56
+                        s_val = s_val.replace(".", "").replace(",", ".")
+                    elif "," in s_val: # Caso 1234,56
+                        s_val = s_val.replace(",", ".")
+                    return float(s_val)
 
                 nuevo_reg = AuxiliarContable(
                     idcliente=idcliente,
@@ -7157,8 +7182,7 @@ def create_app():
             }), 200
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": f"Error al guardar: {str(e)}"}), 500
-        
+            return jsonify({"error": f"Error al guardar en BD: {str(e)}"}), 500
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
