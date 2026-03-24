@@ -7080,8 +7080,8 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            # Leemos el Excel saltando las primeras filas decorativas de Siigo
             df = pd.read_excel(file, header=4, engine="calamine")
+            # Limpieza agresiva de nombres de columnas
             df.columns = [str(c).strip() for c in df.columns]
         except Exception as e:
             return jsonify({"error": f"Error al abrir el Excel: {str(e)}"}), 400
@@ -7089,83 +7089,80 @@ def create_app():
         lista_mapeada = []
         fechas_procesadas = []
 
+        # Función para encontrar columnas ignorando tildes y mayúsculas
+        def get_col_name(possible_names):
+            for col in df.columns:
+                if col.lower().replace('é','e').replace('ó','o') in [n.lower() for n in possible_names]:
+                    return col
+            return None
+
+        # Detectamos los nombres reales de las columnas en TU excel
+        col_fecha = get_col_name(['Fecha Elaboracion', 'Fecha'])
+        col_cuenta = get_col_name(['Codigo cuenta contable', 'Cuenta'])
+        col_nombre_cta = get_col_name(['Cuenta contable', 'Nombre Cuenta'])
+        col_debito = get_col_name(['Debito', 'Debitos', 'Débito', 'Débitos'])
+        col_credito = get_col_name(['Credito', 'Creditos', 'Crédito', 'Créditos'])
+        col_base = get_col_name(['Base', 'Base Gravable'])
+
         def clean_num(val):
             if val is None or str(val).lower() == 'nan': return 0.0
             try:
-                # Quitamos puntos de miles, símbolos y normalizamos decimales
                 s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
                 return float(s_val)
-            except: 
-                return 0.0
+            except: return 0.0
 
         for idx, row in df.iterrows():
             try:
-                f_raw = row.get('Fecha Elaboración')
+                f_raw = row.get(col_fecha)
                 if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                # --- LIMPIEZA DE CÓDIGO DE CUENTA ---
-                # Siigo manda: "240805 - IVA..." -> Guardamos solo "240805"
-                cta_raw = str(row.get('Código cuenta contable') or "").strip()
+                cta_raw = str(row.get(col_cuenta) or "").strip()
                 codigo_limpio = cta_raw.split(' ')[0].replace('.', '') 
-
-                comp_raw = str(row.get('Comprobante') or "")
 
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
-                    "comprobante_tipo": comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
-                    "comprobante_numero": comp_raw.split('-')[-1] if '-' in comp_raw else "",
+                    "comprobante_tipo": str(row.get('Comprobante') or "").split('-')[0],
+                    "comprobante_numero": str(row.get('Comprobante') or "").split('-')[-1],
                     "cuenta_codigo": codigo_limpio,
-                    "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
+                    "cuenta_nombre": str(row.get(col_nombre_cta) or "").strip(),
                     "tercero_nit": str(row.get('Identificación') or ""),
                     "tercero_nombre": str(row.get('Nombre tercero') or ""),
                     "detalle": str(row.get('Detalle') or ""),
-                    "debito": clean_num(row.get('Débito')),
-                    "credito": clean_num(row.get('Crédito')),
-                    "base_gravable": clean_num(row.get('Base')),
+                    "debito": clean_num(row.get(col_debito)),
+                    "credito": clean_num(row.get(col_credito)),
+                    "base_gravable": clean_num(row.get(col_base)),
                     "periodo_anio": f_dt.year,
                     "periodo_mes": f_dt.month,
                     "archivo_origen": file.filename
                 })
-            except: 
-                continue
-
-        if not lista_mapeada:
-             return jsonify({"error": "No hay datos válidos en el archivo"}), 400
+            except: continue
 
         try:
-            # Identificamos el rango para limpieza atómica
-            fecha_min = min(fechas_procesadas)
-            fecha_max = max(fechas_procesadas)
-            
-            # Borramos registros previos en el mismo rango de fechas para este cliente
+            fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
                 AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
             
-            # Inserción masiva de alto rendimiento
             db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
             db.session.commit()
             
-            # ESTRUCTURA DE RESPUESTA EXACTA PARA EL FRONTEND
             return jsonify({
-                "mensaje": "Auxiliar importado con éxito",
+                "mensaje": "Cargado con éxito",
                 "detalles": {
                     "registros_procesados": len(lista_mapeada),
                     "rango_desde": fecha_min.strftime('%Y-%m-%d'),
                     "rango_hasta": fecha_max.strftime('%Y-%m-%d')
                 }
             }), 200
-            
         except Exception as e:
             db.session.rollback()
-            print(f"Error en DB: {traceback.format_exc()}")
-            return jsonify({"error": f"Error al guardar en base de datos: {str(e)}"}), 500
+            return jsonify({"error": str(e)}), 500
 
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
