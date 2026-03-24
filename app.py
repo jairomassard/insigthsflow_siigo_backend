@@ -7213,6 +7213,13 @@ def create_app():
             }
         }), 200
 
+
+
+    # --- Registrar rutas de permisos ---
+    from permisos_routes import register_permisos_routes
+    register_permisos_routes(app)
+
+
     @app.before_request
     def verificar_permisos_global():
         # 🔓 Excepciones (rutas públicas o de login)
