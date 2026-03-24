@@ -7063,7 +7063,7 @@ def create_app():
         })
 
     # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
-    # --- Importar Movimiento Auxiliar desde Archivo Excel (VERSIÓN FINAL OPTIMIZADA) ---
+    # --- Importar Movimiento Auxiliar desde Archivo Excel (VERSIÓN FINAL COMPATIBLE) ---
     @app.route("/reportes/cargar_auxiliar", methods=["POST"])
     @jwt_required()
     def importar_auxiliar_desde_excel():
@@ -7092,9 +7092,11 @@ def create_app():
         def clean_num(val):
             if val is None or str(val).lower() == 'nan': return 0.0
             try:
+                # Quitamos puntos de miles, símbolos y normalizamos decimales
                 s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
                 return float(s_val)
-            except: return 0.0
+            except: 
+                return 0.0
 
         for idx, row in df.iterrows():
             try:
@@ -7104,7 +7106,7 @@ def create_app():
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                # --- ESTA ES LA PARTE CLAVE ---
+                # --- LIMPIEZA DE CÓDIGO DE CUENTA ---
                 # Siigo manda: "240805 - IVA..." -> Guardamos solo "240805"
                 cta_raw = str(row.get('Código cuenta contable') or "").strip()
                 codigo_limpio = cta_raw.split(' ')[0].replace('.', '') 
@@ -7128,26 +7130,42 @@ def create_app():
                     "periodo_mes": f_dt.month,
                     "archivo_origen": file.filename
                 })
-            except: continue
+            except: 
+                continue
 
         if not lista_mapeada:
-            return jsonify({"error": "No hay datos válidos"}), 400
+             return jsonify({"error": "No hay datos válidos en el archivo"}), 400
 
         try:
-            # Borrado inteligente del rango que se está subiendo para evitar duplicados
-            fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
+            # Identificamos el rango para limpieza atómica
+            fecha_min = min(fechas_procesadas)
+            fecha_max = max(fechas_procesadas)
+            
+            # Borramos registros previos en el mismo rango de fechas para este cliente
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
                 AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
             
+            # Inserción masiva de alto rendimiento
             db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
             db.session.commit()
-            return jsonify({"mensaje": "Cargado con éxito", "registros": len(lista_mapeada)}), 200
+            
+            # ESTRUCTURA DE RESPUESTA EXACTA PARA EL FRONTEND
+            return jsonify({
+                "mensaje": "Auxiliar importado con éxito",
+                "detalles": {
+                    "registros_procesados": len(lista_mapeada),
+                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
+                    "rango_hasta": fecha_max.strftime('%Y-%m-%d')
+                }
+            }), 200
+            
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": str(e)}), 500
+            print(f"Error en DB: {traceback.format_exc()}")
+            return jsonify({"error": f"Error al guardar en base de datos: {str(e)}"}), 500
 
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
