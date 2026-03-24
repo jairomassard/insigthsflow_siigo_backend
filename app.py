@@ -7069,58 +7069,38 @@ def create_app():
     def importar_auxiliar_desde_excel():
         import pandas as pd
         from datetime import datetime
-        import traceback
+        import re
 
-        claims = get_jwt()
-        idcliente = claims.get("idcliente")
-        
+        idcliente = get_jwt().get("idcliente")
         if "archivo" not in request.files:
-            return jsonify({"error": "Archivo no proporcionado"}), 400
+            return jsonify({"error": "No hay archivo"}), 400
         file = request.files["archivo"]
 
         try:
             from models import AuxiliarContable
+            # Cargamos el Excel
             df = pd.read_excel(file, header=4, engine="calamine")
-            # Limpieza agresiva de nombres de columnas
             df.columns = [str(c).strip() for c in df.columns]
-        except Exception as e:
-            return jsonify({"error": f"Error al abrir el Excel: {str(e)}"}), 400
+            
+            lista_mapeada = []
+            fechas_procesadas = []
 
-        lista_mapeada = []
-        fechas_procesadas = []
-
-        # Función para encontrar columnas ignorando tildes y mayúsculas
-        def get_col_name(possible_names):
-            for col in df.columns:
-                if col.lower().replace('é','e').replace('ó','o') in [n.lower() for n in possible_names]:
-                    return col
-            return None
-
-        # Detectamos los nombres reales de las columnas en TU excel
-        col_fecha = get_col_name(['Fecha Elaboracion', 'Fecha'])
-        col_cuenta = get_col_name(['Codigo cuenta contable', 'Cuenta'])
-        col_nombre_cta = get_col_name(['Cuenta contable', 'Nombre Cuenta'])
-        col_debito = get_col_name(['Debito', 'Debitos', 'Débito', 'Débitos'])
-        col_credito = get_col_name(['Credito', 'Creditos', 'Crédito', 'Créditos'])
-        col_base = get_col_name(['Base', 'Base Gravable'])
-
-        def clean_num(val):
-            if val is None or str(val).lower() == 'nan': return 0.0
-            try:
-                s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
-                return float(s_val)
-            except: return 0.0
-
-        for idx, row in df.iterrows():
-            try:
-                f_raw = row.get(col_fecha)
+            for idx, row in df.iterrows():
+                f_raw = row.get('Fecha Elaboración')
                 if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                cta_raw = str(row.get(col_cuenta) or "").strip()
-                codigo_limpio = cta_raw.split(' ')[0].replace('.', '') 
+                # --- LIMPIEZA ATÓMICA DEL CÓDIGO ---
+                # Extraemos solo los números del inicio (ej: "240805 - IVA" -> "240805")
+                cta_raw = str(row.get('Código cuenta contable') or "").strip()
+                match = re.match(r"(\d+)", cta_raw)
+                codigo_limpio = match.group(1) if match else cta_raw
+
+                def clean_num(val):
+                    if val is None or str(val).lower() == 'nan': return 0.0
+                    return float(str(val).replace(",", "").replace(" ", "").replace("$", ""))
 
                 lista_mapeada.append({
                     "idcliente": idcliente,
@@ -7128,38 +7108,26 @@ def create_app():
                     "comprobante_tipo": str(row.get('Comprobante') or "").split('-')[0],
                     "comprobante_numero": str(row.get('Comprobante') or "").split('-')[-1],
                     "cuenta_codigo": codigo_limpio,
-                    "cuenta_nombre": str(row.get(col_nombre_cta) or "").strip(),
+                    "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
                     "tercero_nit": str(row.get('Identificación') or ""),
                     "tercero_nombre": str(row.get('Nombre tercero') or ""),
-                    "detalle": str(row.get('Detalle') or ""),
-                    "debito": clean_num(row.get(col_debito)),
-                    "credito": clean_num(row.get(col_credito)),
-                    "base_gravable": clean_num(row.get(col_base)),
+                    "debito": clean_num(row.get('Débito')),
+                    "credito": clean_num(row.get('Crédito')),
+                    "base_gravable": clean_num(row.get('Base')),
                     "periodo_anio": f_dt.year,
                     "periodo_mes": f_dt.month,
                     "archivo_origen": file.filename
                 })
-            except: continue
 
-        try:
-            fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
-            AuxiliarContable.query.filter(
-                AuxiliarContable.idcliente == idcliente,
-                AuxiliarContable.fecha_contable >= fecha_min,
-                AuxiliarContable.fecha_contable <= fecha_max
-            ).delete()
-            
-            db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
-            db.session.commit()
-            
-            return jsonify({
-                "mensaje": "Cargado con éxito",
-                "detalles": {
-                    "registros_procesados": len(lista_mapeada),
-                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
-                    "rango_hasta": fecha_max.strftime('%Y-%m-%d')
-                }
-            }), 200
+            if lista_mapeada:
+                fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
+                AuxiliarContable.query.filter(AuxiliarContable.idcliente == idcliente, 
+                                             AuxiliarContable.fecha_contable >= fecha_min, 
+                                             AuxiliarContable.fecha_contable <= fecha_max).delete()
+                db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
+                db.session.commit()
+                
+            return jsonify({"detalles": {"registros_procesados": len(lista_mapeada)}}), 200
         except Exception as e:
             db.session.rollback()
             return jsonify({"error": str(e)}), 500
@@ -7168,15 +7136,13 @@ def create_app():
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
     def get_cruce_iva_v2():
-        from datetime import datetime, timedelta
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         
         sql = text("""
             SELECT 
-                periodo_anio, 
-                periodo_mes,
+                periodo_anio, periodo_mes,
                 SUM(CASE WHEN cuenta_codigo LIKE '240805%' THEN (credito - debito) ELSE 0 END) AS vtas,
                 SUM(CASE WHEN cuenta_codigo LIKE '240810%' THEN (debito - credito) ELSE 0 END) AS comps,
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
@@ -7186,7 +7152,8 @@ def create_app():
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        
+        # ... (resto del código de formateo que ya tienes para agrupar bimensual) ...
+
         series_mensuales = []
         for r in res:
             iva_v, iva_c, rete = float(r['vtas'] or 0), float(r['comps'] or 0), float(r['rete'] or 0)
