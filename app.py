@@ -7131,32 +7131,87 @@ def create_app():
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
     def get_cruce_iva_v2():
+        from datetime import datetime, timedelta
         idcliente = get_jwt().get("idcliente")
-        desde, hasta = request.args.get("desde"), request.args.get("hasta")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
         
+        # 1. Consulta SQL Optimizada para capturar servicios (240806, 240815, etc.)
         sql = text("""
             SELECT 
-                periodo_anio, periodo_mes,
-                -- Sumamos Créditos - Débitos para IVA generado (Ventas)
+                periodo_anio, 
+                periodo_mes,
+                -- IVA GENERADO (Ventas/Servicios: 240801 a 240809)
                 SUM(CASE WHEN cuenta_codigo LIKE '24080%' THEN (credito - debito) ELSE 0 END) AS vtas,
-                -- Sumamos Débitos - Créditos para IVA descontable (Compras/Servicios)
+                -- IVA DESCONTABLE (Compras/Servicios: 240810 en adelante)
                 SUM(CASE WHEN (cuenta_codigo LIKE '24081%' OR cuenta_codigo LIKE '24089%') 
-                         THEN (debito - credito) ELSE 0 END) AS comps,
-                -- ReteIVA
+                        THEN (debito - credito) ELSE 0 END) AS comps,
+                -- RETEIVA (135517)
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
-            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
+            WHERE idcliente = :idc 
+            AND fecha_contable BETWEEN :d AND :h
+            GROUP BY 1, 2 
+            ORDER BY 1, 2
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        # ... (aquí sigue tu lógica de formateo para el frontend que ya tienes)
+        
+        series_mensuales = []
+        for r in res:
+            v = float(r['vtas'] or 0)
+            c = float(r['comps'] or 0)
+            ret = float(r['rete'] or 0)
+            
+            # Cálculo de fecha de presentación (mes siguiente)
+            f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
+            mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
+            series_mensuales.append({
+                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "iva_ventas": v,
+                "iva_compras": c,
+                "reteiva_favor": ret,
+                "saldo_iva": v - c - ret,
+                "mes_presentacion": mes_pres
+            })
 
-    # --- Registrar rutas de permisos ---
-    from permisos_routes import register_permisos_routes
-    register_permisos_routes(app)
+        # --- FUNCIÓN INTERNA PARA AGRUPAR (Soluciona el error de Pylance) ---
+        def generar_agrupacion_interna(datos, salto):
+            agrupados = []
+            for i in range(0, len(datos), salto):
+                grupo = datos[i : i + salto]
+                if not grupo: continue
+                
+                v_sum = sum(item['iva_ventas'] for item in grupo)
+                c_sum = sum(item['iva_compras'] for item in grupo)
+                r_sum = sum(item['reteiva_favor'] for item in grupo)
+                
+                agrupados.append({
+                    "label": " + ".join([item['label'] for item in grupo]),
+                    "iva_ventas": v_sum,
+                    "iva_compras": c_sum,
+                    "reteiva_favor": r_sum,
+                    "saldo_iva": v_sum - c_sum - r_sum,
+                    "mes_presentacion": grupo[-1]['mes_presentacion']
+                })
+            return agrupados
 
+        # 2. Generar las series agrupadas usando la función interna
+        return jsonify({
+            "series": series_mensuales,
+            "kpis": {
+                "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
+                "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
+                "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
+                "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
+            },
+            "series_agrupadas": {
+                "bimensual": generar_agrupacion_interna(series_mensuales, 2),
+                "trimestral": generar_agrupacion_interna(series_mensuales, 3),
+                "cuatrimestral": generar_agrupacion_interna(series_mensuales, 4)
+            }
+        }), 200
 
     @app.before_request
     def verificar_permisos_global():
