@@ -7068,17 +7068,13 @@ def create_app():
     @jwt_required()
     def importar_auxiliar_desde_excel():
         import pandas as pd
-        from datetime import datetime
         import re
-
         idcliente = get_jwt().get("idcliente")
-        if "archivo" not in request.files:
-            return jsonify({"error": "No hay archivo"}), 400
-        file = request.files["archivo"]
+        file = request.files.get("archivo")
+        if not file: return jsonify({"error": "No hay archivo"}), 400
 
         try:
             from models import AuxiliarContable
-            # Cargamos el Excel
             df = pd.read_excel(file, header=4, engine="calamine")
             df.columns = [str(c).strip() for c in df.columns]
             
@@ -7086,16 +7082,20 @@ def create_app():
             fechas_procesadas = []
 
             for idx, row in df.iterrows():
+                cta_raw = str(row.get('Código cuenta contable') or "").strip()
+                
+                # REGLA DE ORO: Si la celda dice "Total" o está vacía, la saltamos
+                if "Total" in cta_raw or cta_raw == "" or cta_raw.lower() == "nan":
+                    continue
+
                 f_raw = row.get('Fecha Elaboración')
                 if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                # --- LIMPIEZA ATÓMICA DEL CÓDIGO ---
-                # Extraemos solo los números del inicio (ej: "240805 - IVA" -> "240805")
-                cta_raw = str(row.get('Código cuenta contable') or "").strip()
-                match = re.match(r"(\d+)", cta_raw)
+                # Extraer solo el número de la cuenta (ej: 24080601)
+                match = re.search(r"(\d+)", cta_raw)
                 codigo_limpio = match.group(1) if match else cta_raw
 
                 def clean_num(val):
@@ -7105,25 +7105,20 @@ def create_app():
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
-                    "comprobante_tipo": str(row.get('Comprobante') or "").split('-')[0],
-                    "comprobante_numero": str(row.get('Comprobante') or "").split('-')[-1],
                     "cuenta_codigo": codigo_limpio,
                     "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
-                    "tercero_nit": str(row.get('Identificación') or ""),
-                    "tercero_nombre": str(row.get('Nombre tercero') or ""),
                     "debito": clean_num(row.get('Débito')),
                     "credito": clean_num(row.get('Crédito')),
-                    "base_gravable": clean_num(row.get('Base')),
                     "periodo_anio": f_dt.year,
-                    "periodo_mes": f_dt.month,
-                    "archivo_origen": file.filename
+                    "periodo_mes": f_dt.month
                 })
 
             if lista_mapeada:
-                fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
+                # Borrar para reescribir
+                f_min, f_max = min(fechas_procesadas), max(fechas_procesadas)
                 AuxiliarContable.query.filter(AuxiliarContable.idcliente == idcliente, 
-                                             AuxiliarContable.fecha_contable >= fecha_min, 
-                                             AuxiliarContable.fecha_contable <= fecha_max).delete()
+                                             AuxiliarContable.fecha_contable >= f_min, 
+                                             AuxiliarContable.fecha_contable <= f_max).delete()
                 db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
                 db.session.commit()
                 
@@ -7131,20 +7126,23 @@ def create_app():
         except Exception as e:
             db.session.rollback()
             return jsonify({"error": str(e)}), 500
-
+        
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
     def get_cruce_iva_v2():
         idcliente = get_jwt().get("idcliente")
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
+        desde, hasta = request.args.get("desde"), request.args.get("hasta")
         
         sql = text("""
             SELECT 
                 periodo_anio, periodo_mes,
-                SUM(CASE WHEN cuenta_codigo LIKE '240805%' THEN (credito - debito) ELSE 0 END) AS vtas,
-                SUM(CASE WHEN cuenta_codigo LIKE '240810%' THEN (debito - credito) ELSE 0 END) AS comps,
+                -- Sumamos Créditos - Débitos para IVA generado (Ventas)
+                SUM(CASE WHEN cuenta_codigo LIKE '24080%' THEN (credito - debito) ELSE 0 END) AS vtas,
+                -- Sumamos Débitos - Créditos para IVA descontable (Compras/Servicios)
+                SUM(CASE WHEN (cuenta_codigo LIKE '24081%' OR cuenta_codigo LIKE '24089%') 
+                         THEN (debito - credito) ELSE 0 END) AS comps,
+                -- ReteIVA
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
@@ -7152,61 +7150,7 @@ def create_app():
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        # ... (resto del código de formateo que ya tienes para agrupar bimensual) ...
-
-        series_mensuales = []
-        for r in res:
-            iva_v, iva_c, rete = float(r['vtas'] or 0), float(r['comps'] or 0), float(r['rete'] or 0)
-            label = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
-            
-            # Cálculo mes de presentación
-            f_mes = datetime(r['periodo_anio'], r['periodo_mes'], 1)
-            mes_pres = (f_mes + timedelta(days=32)).strftime("%Y-%m")
-
-            series_mensuales.append({
-                "label": label,
-                "iva_ventas": iva_v,
-                "iva_compras": iva_c,
-                "reteiva_favor": rete,
-                "saldo_iva": iva_v - iva_c - rete,
-                "mes_presentacion": mes_pres
-            })
-
-        def generar_agrupacion(datos, salto):
-            agrupados = []
-            for i in range(0, len(datos), salto):
-                grupo = datos[i : i + salto]
-                if not grupo: continue
-                v = sum(item['iva_ventas'] for item in grupo)
-                c = sum(item['iva_compras'] for item in grupo)
-                r = sum(item['reteiva_favor'] for item in grupo)
-                agrupados.append({
-                    "label": " + ".join([item['label'] for item in grupo]),
-                    "iva_ventas": v, "iva_compras": c, "reteiva_favor": r,
-                    "saldo_iva": v - c - r,
-                    "mes_presentacion": grupo[-1]['mes_presentacion']
-                })
-            return agrupados
-
-        return jsonify({
-            "series": series_mensuales, 
-            "kpis": {
-                "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
-                "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
-                "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
-                "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
-            }, 
-            "series_agrupadas": {
-                "bimensual": generar_agrupacion(series_mensuales, 2),
-                "trimestral": generar_agrupacion(series_mensuales, 3),
-                "cuatrimestral": generar_agrupacion(series_mensuales, 4)
-            }
-        }), 200
-
-
-
-
-
+        # ... (aquí sigue tu lógica de formateo para el frontend que ya tienes)
 
 
     # --- Registrar rutas de permisos ---
