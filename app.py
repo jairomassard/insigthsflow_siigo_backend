@@ -7064,12 +7064,14 @@ def create_app():
 
     # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
     # --- Importar Movimiento Auxiliar desde Archivo Excel ---
+    # --- Importar Movimiento Auxiliar con Logger de Auditoría ---
     @app.route("/reportes/cargar_auxiliar", methods=["POST"])
     @jwt_required()
     def importar_auxiliar_desde_excel():
         import pandas as pd
         from datetime import datetime, timezone
         from decimal import Decimal
+        import traceback
 
         claims = get_jwt()
         idcliente = claims.get("idcliente")
@@ -7080,43 +7082,63 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            # 1. Leemos el Excel completo sin saltar filas primero para analizarlo
-            df_raw = pd.read_excel(file, engine="calamine")
             
-            # 2. Buscamos en qué fila están realmente los encabezados 'Fecha' y 'Cuenta'
-            header_row = None
-            for i, row in df_raw.iterrows():
-                row_values = [str(val).strip() for val in row.values]
-                if "Fecha" in row_values and "Cuenta" in row_values:
-                    header_row = i
-                    break
+            # 1. Lectura inicial para auditoría
+            df_debug = pd.read_excel(file, engine="calamine")
             
-            if header_row is None:
-                return jsonify({"error": "No se encontró la fila de encabezados (Fecha, Cuenta) en el Excel"}), 400
+            print("\n" + "="*50)
+            print("🔍 [AUDITORÍA INSIGHTFLOW] ANALIZANDO ESTRUCTURA")
+            print(f"Archivo recibido: {file.filename}")
+            
+            # Imprimimos las primeras 10 filas en la consola del backend
+            for i in range(0, min(10, len(df_debug))):
+                fila_valores = [str(val).strip() for val in df_debug.iloc[i].values]
+                print(f"Fila {i}: {fila_valores}")
+            print("="*50 + "\n")
 
-            # 3. Volvemos a leer el archivo pero ya sabemos desde dónde
-            file.seek(0) # Resetear puntero del archivo
+            # 2. Búsqueda ultra-flexible del encabezado
+            header_row = None
+            for i, row in df_debug.iterrows():
+                # Normalizamos los valores de la fila para la comparación
+                row_str = [str(val).strip().lower() for val in row.values]
+                
+                # Buscamos si la fila contiene 'fecha' y 'cuenta' (en minúsculas por seguridad)
+                if "fecha" in row_str and "cuenta" in row_str:
+                    header_row = i
+                    print(f"✅ ¡ENCABEZADO DETECTADO EN FILA {i+2} (Índice {i})!")
+                    break
+
+            if header_row is None:
+                # Si el logger falló, devolvemos las columnas encontradas en la fila 4 por si acaso
+                cols_fila_4 = [str(val).strip() for val in df_debug.iloc[3].values]
+                return jsonify({
+                    "error": "No se detectaron las columnas 'Fecha' y 'Cuenta'.",
+                    "debug_info": f"La fila 5 contiene: {cols_fila_4}"
+                }), 400
+
+            # 3. Recarga del archivo desde la fila detectada
+            file.seek(0)
             df = pd.read_excel(file, header=header_row + 1, engine="calamine")
             
-            # Limpiar nombres de columnas (quitar espacios locos que mete Siigo)
+            # Limpieza de nombres de columnas
             df.columns = [str(c).strip() for c in df.columns]
-            
-            # 4. Validar columnas críticas después de la limpieza
-            if 'Fecha' not in df.columns or 'Cuenta' not in df.columns:
-                 return jsonify({"error": f"Columnas no detectadas. Encontradas: {list(df.columns)}"}), 400
+            print(f"Columnas finales detectadas: {list(df.columns)}")
 
+            # 4. Limpieza de datos vacíos
             df = df.dropna(subset=['Fecha', 'Cuenta'])
             df = df.where(pd.notnull(df), None)
 
         except Exception as e:
-            return jsonify({"error": f"Error al leer estructura: {str(e)}"}), 400
+            print(f"❌ ERROR CRÍTICO: {traceback.format_exc()}")
+            return jsonify({"error": f"Error al procesar estructura: {str(e)}"}), 400
 
-        # Rango de fechas para borrado
+        # --- Lógica de Procesamiento y Guardado ---
         try:
             fechas_excel = pd.to_datetime(df['Fecha'])
             fecha_min = fechas_excel.min()
             fecha_max = fechas_excel.max()
 
+            # Borrado preventivo
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
@@ -7124,11 +7146,9 @@ def create_app():
             ).delete()
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": f"Error en validación de fechas: {str(e)}"}), 500
+            return jsonify({"error": f"Error validando fechas: {str(e)}"}), 500
 
         registros_creados = 0
-        
-        # Procesar filas con nombres de columna limpios
         for idx, row in df.iterrows():
             try:
                 f_raw = row.get("Fecha")
@@ -7140,11 +7160,10 @@ def create_app():
                 
                 def clean_num(val):
                     if val is None or str(val).lower() == 'nan': return 0.0
-                    # Quitamos puntos de miles y cambiamos coma por punto si es necesario
                     s_val = str(val).replace(" ", "").replace("$", "")
-                    if "," in s_val and "." in s_val: # Caso 1.234,56
+                    if "," in s_val and "." in s_val:
                         s_val = s_val.replace(".", "").replace(",", ".")
-                    elif "," in s_val: # Caso 1234,56
+                    elif "," in s_val:
                         s_val = s_val.replace(",", ".")
                     return float(s_val)
 
@@ -7182,7 +7201,7 @@ def create_app():
             }), 200
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": f"Error al guardar en BD: {str(e)}"}), 500
+            return jsonify({"error": f"Error al guardar: {str(e)}"}), 500
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
