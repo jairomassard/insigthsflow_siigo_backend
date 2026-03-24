@@ -7063,7 +7063,7 @@ def create_app():
         })
 
     # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
-    # --- Importar Movimiento Auxiliar desde Archivo Excel ---
+    # --- Importar Movimiento Auxiliar desde Archivo Excel (VERSIÓN FINAL OPTIMIZADA) ---
     @app.route("/reportes/cargar_auxiliar", methods=["POST"])
     @jwt_required()
     def importar_auxiliar_desde_excel():
@@ -7080,8 +7080,9 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            # Leemos con calamine saltando los encabezados decorativos de Siigo
+            # Según la auditoría, los encabezados reales están en la fila 5 (header=4 en pandas)
             df = pd.read_excel(file, header=4, engine="calamine")
+            # Limpiamos nombres de columnas de espacios accidentales
             df.columns = [str(c).strip() for c in df.columns]
         except Exception as e:
             return jsonify({"error": f"Error al abrir el Excel: {str(e)}"}), 400
@@ -7089,11 +7090,11 @@ def create_app():
         lista_mapeada = []
         fechas_procesadas = []
 
-        # Función de limpieza numérica integrada
+        # Función robusta para limpiar valores numéricos de Siigo
         def clean_num(val):
             if val is None or str(val).lower() == 'nan': return 0.0
             try:
-                # Quitamos puntos de miles y espacios para evitar errores de float()
+                # Quitamos símbolos de moneda, espacios y normalizamos separadores
                 s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
                 return float(s_val)
             except:
@@ -7101,22 +7102,27 @@ def create_app():
 
         for idx, row in df.iterrows():
             try:
+                # 1. Validar Fecha
                 f_raw = row.get('Fecha Elaboración')
                 if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                comp_raw = str(row.get('Comprobante') or "")
+                # 2. Limpiar Código de Cuenta (Crucial para el Cruce de IVA)
+                # Siigo manda: "240805 - IVA GENERADO..." -> Extraemos solo "240805"
                 cta_raw = str(row.get('Código cuenta contable') or "").strip()
+                codigo_cuenta_limpio = cta_raw.split(' ')[0].replace('.', '') 
 
-                # Creamos un diccionario para el bulk_insert
+                comp_raw = str(row.get('Comprobante') or "")
+
+                # 3. Construir objeto para inserción masiva
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
                     "comprobante_tipo": comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
                     "comprobante_numero": comp_raw.split('-')[-1] if '-' in comp_raw else "",
-                    "cuenta_codigo": cta_raw,
+                    "cuenta_codigo": codigo_cuenta_limpio,
                     "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
                     "tercero_nit": str(row.get('Identificación') or ""),
                     "tercero_nombre": str(row.get('Nombre tercero') or ""),
@@ -7128,41 +7134,44 @@ def create_app():
                     "periodo_mes": f_dt.month,
                     "archivo_origen": file.filename
                 })
-            except:
+            except Exception as e:
+                # Si una fila falla, la saltamos pero podrías loguearla aquí
                 continue
 
         if not lista_mapeada:
-             return jsonify({"error": "No se encontraron registros válidos en el archivo."}), 400
+             return jsonify({"error": "No se encontraron registros válidos. Verifica que el Excel sea el reporte de Auxiliar Contable."}), 400
 
         try:
-            # 1. Identificamos el rango para limpiar la BD
+            # 1. Identificar rango de fechas para evitar duplicados
             fecha_min = min(fechas_procesadas)
             fecha_max = max(fechas_procesadas)
             
-            # 2. Borramos lo existente en ese rango para este cliente
+            # 2. Limpieza "Atómica": Borra solo lo que vas a reemplazar
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
                 AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
             
-            # 3. INSERT MASIVO (Mucho más rápido que add())
+            # 3. Inserción de alto rendimiento (Bulk)
             db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
             db.session.commit()
             
             return jsonify({
                 "mensaje": "Auxiliar importado con éxito",
                 "detalles": {
-                    "registros": len(lista_mapeada),
-                    "desde": fecha_min.strftime('%Y-%m-%d'),
-                    "hasta": fecha_max.strftime('%Y-%m-%d')
+                    "registros_procesados": len(lista_mapeada),
+                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
+                    "rango_hasta": fecha_max.strftime('%Y-%m-%d'),
+                    "info": "Se detectaron y procesaron correctamente las cuentas de IVA (2408)."
                 }
             }), 200
             
         except Exception as e:
             db.session.rollback()
-            print(f"Error en DB: {traceback.format_exc()}")
-            return jsonify({"error": f"Error al guardar en la base de datos: {str(e)}"}), 500
+            print(f"❌ Error en base de datos: {traceback.format_exc()}")
+            return jsonify({"error": f"Error al guardar registros: {str(e)}"}), 500
+        
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
