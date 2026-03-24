@@ -7063,44 +7063,102 @@ def create_app():
         })
 
     # NUEVO Reporte cruce de IVAs - MArzo 23 2026 con reporte de Auxiliar contable
+    # --- Importar Movimiento Auxiliar desde Archivo Excel ---
     @app.route("/reportes/cargar_auxiliar", methods=["POST"])
     @jwt_required()
-    def endpoint_cargar_auxiliar():
-        idcliente = get_jwt().get("idcliente")
-        if 'file' not in request.files:
-            return jsonify({"error": "No hay archivo"}), 400
-        
-        file = request.files['file']
+    def importar_auxiliar_desde_excel():
+        import pandas as pd
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente asociado"}), 400
+
+        # Validar archivo (Usamos "archivo" para ser consistentes con tu otro código)
+        if "archivo" not in request.files:
+            return jsonify({"error": "Archivo no proporcionado"}), 400
+        file = request.files["archivo"]
+
         try:
             from models import AuxiliarContable
-            datos = procesar_excel_auxiliar_v2(file, idcliente)
-            
-            if not datos:
-                return jsonify({"error": "No se encontraron datos válidos"}), 400
+            # Leer Excel con calamine (fila 5 es el encabezado en Siigo Auxiliar)
+            df = pd.read_excel(file, header=4, engine="calamine")
+            df = df.dropna(subset=['Fecha', 'Cuenta']) # Limpiar filas vacías o de totales
+            df = df.where(pd.notnull(df), None)
+        except Exception as e:
+            return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
-            # Determinamos rango para borrado atómico
-            f_inicio = min(d['fecha_contable'] for d in datos)
-            f_fin = max(d['fecha_contable'] for d in datos)
+        # Identificar rango para limpieza atómica
+        try:
+            fechas_excel = pd.to_datetime(df['Fecha'])
+            fecha_min = fechas_excel.min()
+            fecha_max = fechas_excel.max()
 
+            # Borrar registros en el rango detectado
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
-                AuxiliarContable.fecha_contable >= f_inicio,
-                AuxiliarContable.fecha_contable <= f_fin
+                AuxiliarContable.fecha_contable >= fecha_min,
+                AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": f"Error al preparar la base de datos: {str(e)}"}), 500
 
-            db.session.bulk_insert_mappings(AuxiliarContable, datos)
+        registros_creados = 0
+        
+        # Procesar filas
+        for idx, row in df.iterrows():
+            try:
+                f_raw = row.get("Fecha")
+                if not f_raw: continue
+                
+                f_dt = pd.to_datetime(f_raw)
+                cta_raw = str(row.get("Cuenta") or "")
+                comp_raw = str(row.get("Comprobante") or "")
+                
+                # Normalización de valores (usando tu lógica de reemplazar comas/espacios)
+                def clean_num(val):
+                    if val is None: return 0.0
+                    return float(str(val).replace(",", "").replace(" ", ""))
+
+                nuevo_reg = AuxiliarContable(
+                    idcliente=idcliente,
+                    fecha_contable=f_dt.date(),
+                    comprobante_tipo=comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
+                    comprobante_numero=comp_raw.split('-')[-1] if '-' in comp_raw else "",
+                    cuenta_codigo=cta_raw.split(' ')[0],
+                    cuenta_nombre=" ".join(cta_raw.split(' ')[1:]),
+                    tercero_nit=str(row.get("Identificación") or ""),
+                    tercero_nombre=str(row.get("Nombre") or ""),
+                    detalle=str(row.get("Detalle") or ""),
+                    debito=clean_num(row.get("Débitos")),
+                    credito=clean_num(row.get("Créditos")),
+                    base_gravable=clean_num(row.get("Base")),
+                    periodo_anio=f_dt.year,
+                    periodo_mes=f_dt.month,
+                    archivo_origen=file.filename
+                )
+                db.session.add(nuevo_reg)
+                registros_creados += 1
+            except:
+                continue
+
+        try:
             db.session.commit()
-
             return jsonify({
+                "mensaje": "Auxiliar importado correctamente",
                 "detalles": {
-                    "registros_procesados": len(datos),
-                    "rango_desde": f_inicio.isoformat(),
-                    "rango_hasta": f_fin.isoformat()
+                    "registros_procesados": registros_creados,
+                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
+                    "rango_hasta": fecha_max.strftime('%Y-%m-%d')
                 }
             }), 200
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": f"Error al guardar: {str(e)}"}), 500
+        
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
