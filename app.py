@@ -7080,9 +7080,8 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            # Según la auditoría, los encabezados reales están en la fila 5 (header=4 en pandas)
+            # Leemos el Excel saltando las primeras filas decorativas de Siigo
             df = pd.read_excel(file, header=4, engine="calamine")
-            # Limpiamos nombres de columnas de espacios accidentales
             df.columns = [str(c).strip() for c in df.columns]
         except Exception as e:
             return jsonify({"error": f"Error al abrir el Excel: {str(e)}"}), 400
@@ -7090,39 +7089,34 @@ def create_app():
         lista_mapeada = []
         fechas_procesadas = []
 
-        # Función robusta para limpiar valores numéricos de Siigo
         def clean_num(val):
             if val is None or str(val).lower() == 'nan': return 0.0
             try:
-                # Quitamos símbolos de moneda, espacios y normalizamos separadores
                 s_val = str(val).replace(" ", "").replace("$", "").replace(",", "")
                 return float(s_val)
-            except:
-                return 0.0
+            except: return 0.0
 
         for idx, row in df.iterrows():
             try:
-                # 1. Validar Fecha
                 f_raw = row.get('Fecha Elaboración')
                 if not f_raw or str(f_raw).lower() == 'nan': continue
                 
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
                 fechas_procesadas.append(f_dt)
 
-                # 2. Limpiar Código de Cuenta (Crucial para el Cruce de IVA)
-                # Siigo manda: "240805 - IVA GENERADO..." -> Extraemos solo "240805"
+                # --- ESTA ES LA PARTE CLAVE ---
+                # Siigo manda: "240805 - IVA..." -> Guardamos solo "240805"
                 cta_raw = str(row.get('Código cuenta contable') or "").strip()
-                codigo_cuenta_limpio = cta_raw.split(' ')[0].replace('.', '') 
+                codigo_limpio = cta_raw.split(' ')[0].replace('.', '') 
 
                 comp_raw = str(row.get('Comprobante') or "")
 
-                # 3. Construir objeto para inserción masiva
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
                     "comprobante_tipo": comp_raw.split('-')[0] if '-' in comp_raw else comp_raw,
                     "comprobante_numero": comp_raw.split('-')[-1] if '-' in comp_raw else "",
-                    "cuenta_codigo": codigo_cuenta_limpio,
+                    "cuenta_codigo": codigo_limpio,
                     "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
                     "tercero_nit": str(row.get('Identificación') or ""),
                     "tercero_nombre": str(row.get('Nombre tercero') or ""),
@@ -7134,53 +7128,36 @@ def create_app():
                     "periodo_mes": f_dt.month,
                     "archivo_origen": file.filename
                 })
-            except Exception as e:
-                # Si una fila falla, la saltamos pero podrías loguearla aquí
-                continue
+            except: continue
 
         if not lista_mapeada:
-             return jsonify({"error": "No se encontraron registros válidos. Verifica que el Excel sea el reporte de Auxiliar Contable."}), 400
+            return jsonify({"error": "No hay datos válidos"}), 400
 
         try:
-            # 1. Identificar rango de fechas para evitar duplicados
-            fecha_min = min(fechas_procesadas)
-            fecha_max = max(fechas_procesadas)
-            
-            # 2. Limpieza "Atómica": Borra solo lo que vas a reemplazar
+            # Borrado inteligente del rango que se está subiendo para evitar duplicados
+            fecha_min, fecha_max = min(fechas_procesadas), max(fechas_procesadas)
             AuxiliarContable.query.filter(
                 AuxiliarContable.idcliente == idcliente,
                 AuxiliarContable.fecha_contable >= fecha_min,
                 AuxiliarContable.fecha_contable <= fecha_max
             ).delete()
             
-            # 3. Inserción de alto rendimiento (Bulk)
             db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
             db.session.commit()
-            
-            return jsonify({
-                "mensaje": "Auxiliar importado con éxito",
-                "detalles": {
-                    "registros_procesados": len(lista_mapeada),
-                    "rango_desde": fecha_min.strftime('%Y-%m-%d'),
-                    "rango_hasta": fecha_max.strftime('%Y-%m-%d'),
-                    "info": "Se detectaron y procesaron correctamente las cuentas de IVA (2408)."
-                }
-            }), 200
-            
+            return jsonify({"mensaje": "Cargado con éxito", "registros": len(lista_mapeada)}), 200
         except Exception as e:
             db.session.rollback()
-            print(f"❌ Error en base de datos: {traceback.format_exc()}")
-            return jsonify({"error": f"Error al guardar registros: {str(e)}"}), 500
-        
+            return jsonify({"error": str(e)}), 500
+
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
     def get_cruce_iva_v2():
+        from datetime import datetime, timedelta
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         
-        # 1. Consulta SQL sobre la tabla de Auxiliar Contable
         sql = text("""
             SELECT 
                 periodo_anio, 
@@ -7190,23 +7167,17 @@ def create_app():
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 
-            ORDER BY 1, 2
+            GROUP BY 1, 2 ORDER BY 1, 2
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
         
-        # 2. Construir Series Mensuales
         series_mensuales = []
         for r in res:
-            iva_v = float(r['vtas'] or 0)
-            iva_c = float(r['comps'] or 0)
-            rete = float(r['rete'] or 0)
-            
-            # Etiqueta de periodo (Ej: 2025-01)
+            iva_v, iva_c, rete = float(r['vtas'] or 0), float(r['comps'] or 0), float(r['rete'] or 0)
             label = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
             
-            # Mes de presentación (Mes siguiente)
+            # Cálculo mes de presentación
             f_mes = datetime(r['periodo_anio'], r['periodo_mes'], 1)
             mes_pres = (f_mes + timedelta(days=32)).strftime("%Y-%m")
 
@@ -7215,49 +7186,39 @@ def create_app():
                 "iva_ventas": iva_v,
                 "iva_compras": iva_c,
                 "reteiva_favor": rete,
-                "saldo_iva": iva_v - iva_c - rete, # Neto a pagar
+                "saldo_iva": iva_v - iva_c - rete,
                 "mes_presentacion": mes_pres
             })
 
-        # 3. Función interna para agrupar (Bimensual, Trimestral, Cuatrimestral)
         def generar_agrupacion(datos, salto):
             agrupados = []
             for i in range(0, len(datos), salto):
                 grupo = datos[i : i + salto]
                 if not grupo: continue
-                
                 v = sum(item['iva_ventas'] for item in grupo)
                 c = sum(item['iva_compras'] for item in grupo)
                 r = sum(item['reteiva_favor'] for item in grupo)
-                
                 agrupados.append({
                     "label": " + ".join([item['label'] for item in grupo]),
-                    "iva_ventas": v,
-                    "iva_compras": c,
-                    "reteiva_favor": r,
+                    "iva_ventas": v, "iva_compras": c, "reteiva_favor": r,
                     "saldo_iva": v - c - r,
                     "mes_presentacion": grupo[-1]['mes_presentacion']
                 })
             return agrupados
 
-        # 4. Construir respuesta final
-        series_agrupadas = {
-            "bimensual": generar_agrupacion(series_mensuales, 2),
-            "trimestral": generar_agrupacion(series_mensuales, 3),
-            "cuatrimestral": generar_agrupacion(series_mensuales, 4)
-        }
-
-        kpis = {
-            "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
-            "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
-            "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
-            "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
-        }
-        
         return jsonify({
             "series": series_mensuales, 
-            "kpis": kpis, 
-            "series_agrupadas": series_agrupadas
+            "kpis": {
+                "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
+                "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
+                "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
+                "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
+            }, 
+            "series_agrupadas": {
+                "bimensual": generar_agrupacion(series_mensuales, 2),
+                "trimestral": generar_agrupacion(series_mensuales, 3),
+                "cuatrimestral": generar_agrupacion(series_mensuales, 4)
+            }
         }), 200
 
 
