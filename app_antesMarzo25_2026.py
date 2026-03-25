@@ -7141,76 +7141,76 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         
-        # Parámetros de filtro de tasa
-        inc_19 = request.args.get("inc19", "true").lower() == "true"
-        inc_5 = request.args.get("inc5", "false").lower() == "true"
-
-        # Construcción dinámica para el SQL
-        f_vtas = []
-        f_comps = []
-        if inc_19:
-            f_vtas.append("cuenta_codigo LIKE '24080601%'")
-            f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081501%'"])
-        if inc_5:
-            f_vtas.append("cuenta_codigo LIKE '24080603%'")
-            f_comps.extend(["cuenta_codigo LIKE '24081003%'", "cuenta_codigo LIKE '24081503%'"])
-
-        sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
-        sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
-
-        sql = text(f"""
+        # 1. Consulta SQL Optimizada
+        # He ajustado los filtros LIKE para que sean más específicos según la normativa contable
+        sql = text("""
             SELECT 
-                periodo_anio, periodo_mes,
-                -- Apertura para barras del gráfico
-                SUM(CASE WHEN cuenta_codigo LIKE '24080601%' THEN (credito - debito) ELSE 0 END) AS v19,
-                SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081501%') THEN (debito - credito) ELSE 0 END) AS c19,
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
-                -- Totales calculados según selectores
-                SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
-                SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
-                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
+                periodo_anio, 
+                periodo_mes,
+                -- IVA GENERADO (Ventas/Servicios: 240801 a 240809)
+                SUM(CASE WHEN cuenta_codigo LIKE '24080%' THEN (credito - debito) ELSE 0 END) AS vtas,
+                
+                -- IVA DESCONTABLE (Compras/Gastos: 240810 al 240880)
+                -- Nota: Excluimos explícitamente el 24089X para que no ensucie el cálculo de compras
+                SUM(CASE WHEN (cuenta_codigo LIKE '24081%' OR cuenta_codigo LIKE '24082%' OR cuenta_codigo LIKE '24084%') 
+                        THEN (debito - credito) ELSE 0 END) AS comps,
+                
+                -- RETEIVA A FAVOR (135517)
+                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete,
+
+                -- SALDO DE LIQUIDACIÓN CONTABLE (Para comparar con la fila de cierre que viste en Excel)
+                SUM(CASE WHEN cuenta_codigo LIKE '240890%' THEN (credito - debito) ELSE 0 END) AS saldo_cierre
             FROM auxiliar_contable
-            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
+            WHERE idcliente = :idc 
+            AND fecha_contable BETWEEN :d AND :h
+            GROUP BY 1, 2 
+            ORDER BY 1, 2
         """)
         
         res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
         
         series_mensuales = []
         for r in res:
+            v = float(r['vtas'] or 0)
+            c = float(r['comps'] or 0)
+            ret = float(r['rete'] or 0)
+            # El saldo_cierre queda aquí por si en el futuro quieres mostrarlo en el frontend
+            
+            # Cálculo de fecha de presentación (mes siguiente)
             f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
             mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
             series_mensuales.append({
                 "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-                "iva_v19": float(r['v19'] or 0),
-                "iva_v5": float(r['v5'] or 0),
-                "iva_c19": float(r['c19'] or 0),
-                "iva_c5": float(r['c5'] or 0),
-                "iva_ventas": float(r['v_total'] or 0),
-                "iva_compras": float(r['c_total'] or 0),
-                "reteiva_favor": float(r['rete'] or 0),
-                "saldo_iva": float(r['v_total'] or 0) - float(r['c_total'] or 0) - float(r['rete'] or 0),
+                "iva_ventas": v,
+                "iva_compras": c,
+                "reteiva_favor": ret,
+                "saldo_iva": v - c - ret,
                 "mes_presentacion": mes_pres
             })
 
-        def agrupar(datos, salto):
+        # --- FUNCIÓN INTERNA PARA AGRUPAR ---
+        def generar_agrupacion_interna(datos, salto):
             agrupados = []
             for i in range(0, len(datos), salto):
-                g = datos[i : i + salto]
-                if not g: continue
-                v_s = sum(x['iva_ventas'] for x in g)
-                c_s = sum(x['iva_compras'] for x in g)
-                r_s = sum(x['reteiva_favor'] for x in g)
+                grupo = datos[i : i + salto]
+                if not grupo: continue
+                
+                v_sum = sum(item['iva_ventas'] for item in grupo)
+                c_sum = sum(item['iva_compras'] for item in grupo)
+                r_sum = sum(item['reteiva_favor'] for item in grupo)
+                
                 agrupados.append({
-                    "label": " + ".join([x['label'] for x in g]),
-                    "iva_ventas": v_s, "iva_compras": c_s, "reteiva_favor": r_s,
-                    "saldo_iva": v_s - c_s - r_s,
-                    "mes_presentacion": g[-1]['mes_presentacion']
+                    "label": " + ".join([item['label'] for item in grupo]),
+                    "iva_ventas": v_sum,
+                    "iva_compras": c_sum,
+                    "reteiva_favor": r_sum,
+                    "saldo_iva": v_sum - c_sum - r_sum,
+                    "mes_presentacion": grupo[-1]['mes_presentacion']
                 })
             return agrupados
 
+        # 2. Respuesta final con KPIs y Series Agrupadas
         return jsonify({
             "series": series_mensuales,
             "kpis": {
@@ -7220,10 +7220,12 @@ def create_app():
                 "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
             },
             "series_agrupadas": {
-                "bimensual": agrupar(series_mensuales, 2),
-                "cuatrimestral": agrupar(series_mensuales, 4)
+                "bimensual": generar_agrupacion_interna(series_mensuales, 2),
+                "trimestral": generar_agrupacion_interna(series_mensuales, 3),
+                "cuatrimestral": generar_agrupacion_interna(series_mensuales, 4)
             }
         }), 200
+
 
 
     # --- Registrar rutas de permisos ---
