@@ -7137,6 +7137,8 @@ def create_app():
     @jwt_required()
     def get_cruce_iva_v2():
         from datetime import datetime, timedelta
+        from sqlalchemy import text
+        
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
@@ -7145,34 +7147,41 @@ def create_app():
         inc_19 = request.args.get("inc19", "true").lower() == "true"
         inc_5 = request.args.get("inc5", "false").lower() == "true"
 
-        # 1. Filtros dinámicos para los totales netos (KPIs)
+        # 1. Filtros dinámicos para Totales (KPIs) - Mapeo exacto según tu Excel
         f_vtas = []
         f_comps = []
+        
         if inc_19:
-            # Usamos 240806% para capturar 01(Generado) y 02(Devoluciones)
-            f_vtas.append("cuenta_codigo LIKE '240806%' AND (cuenta_codigo LIKE '%01' OR cuenta_codigo LIKE '%02')")
-            f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081501%'"])
+            # Ventas 19% (Generado 01 + Devoluciones 02)
+            f_vtas.append("(cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%')")
+            # Compras 19% (Descontable 1001/02 + Servicios 1501/02)
+            f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081002%'", 
+                            "cuenta_codigo LIKE '24081501%'", "cuenta_codigo LIKE '24081502%'"])
+        
         if inc_5:
+            # Ventas 5% (Generado 03)
             f_vtas.append("cuenta_codigo LIKE '24080603%'")
+            # Compras 5% (Descontable 1003 + Servicios 1503)
             f_comps.extend(["cuenta_codigo LIKE '24081003%'", "cuenta_codigo LIKE '24081503%'"])
 
         sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
         sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
 
-        # 2. SQL Corregido: Calculamos NETOS (Crédito - Débito) para que las devoluciones resten
+        # 2. SQL Corregido: Calculamos NETOS reales (Crédito - Débito para ventas)
         sql = text(f"""
             SELECT 
                 periodo_anio, periodo_mes,
-                -- Desglose para barras (Gráfico)
-                SUM(CASE WHEN cuenta_codigo LIKE '24080601%' THEN (credito - debito) ELSE 0 END) AS v19,
+                -- Apertura para barras del gráfico (Individuales)
+                SUM(CASE WHEN (cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%') THEN (credito - debito) ELSE 0 END) AS v19,
                 SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081501%') THEN (debito - credito) ELSE 0 END) AS c19,
+                SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081002%' OR cuenta_codigo LIKE '24081501%' OR cuenta_codigo LIKE '24081502%') THEN (debito - credito) ELSE 0 END) AS c19,
                 SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
                 
-                -- Totales Dinámicos (KPIs) considerando devoluciones
+                -- Totales calculados según selectores (KPIs y Tabla)
                 SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
                 SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
                 
+                -- ReteIVA (Cálculo Neto: Débito - Crédito)
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
@@ -7184,7 +7193,6 @@ def create_app():
         series_mensuales = []
         for r in res:
             f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
-            # Cálculo de mes de presentación (mes siguiente)
             mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
             series_mensuales.append({
