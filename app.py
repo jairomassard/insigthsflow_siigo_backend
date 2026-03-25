@@ -7145,11 +7145,12 @@ def create_app():
         inc_19 = request.args.get("inc19", "true").lower() == "true"
         inc_5 = request.args.get("inc5", "false").lower() == "true"
 
-        # Construcción dinámica para el SQL
+        # 1. Filtros dinámicos para los totales netos (KPIs)
         f_vtas = []
         f_comps = []
         if inc_19:
-            f_vtas.append("cuenta_codigo LIKE '24080601%'")
+            # Usamos 240806% para capturar 01(Generado) y 02(Devoluciones)
+            f_vtas.append("cuenta_codigo LIKE '240806%' AND (cuenta_codigo LIKE '%01' OR cuenta_codigo LIKE '%02')")
             f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081501%'"])
         if inc_5:
             f_vtas.append("cuenta_codigo LIKE '24080603%'")
@@ -7158,17 +7159,20 @@ def create_app():
         sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
         sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
 
+        # 2. SQL Corregido: Calculamos NETOS (Crédito - Débito) para que las devoluciones resten
         sql = text(f"""
             SELECT 
                 periodo_anio, periodo_mes,
-                -- Apertura para barras del gráfico
+                -- Desglose para barras (Gráfico)
                 SUM(CASE WHEN cuenta_codigo LIKE '24080601%' THEN (credito - debito) ELSE 0 END) AS v19,
                 SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
                 SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081501%') THEN (debito - credito) ELSE 0 END) AS c19,
                 SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
-                -- Totales calculados según selectores
+                
+                -- Totales Dinámicos (KPIs) considerando devoluciones
                 SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
                 SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
+                
                 SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
             FROM auxiliar_contable
             WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
@@ -7180,6 +7184,7 @@ def create_app():
         series_mensuales = []
         for r in res:
             f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
+            # Cálculo de mes de presentación (mes siguiente)
             mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
             series_mensuales.append({
@@ -7205,7 +7210,9 @@ def create_app():
                 r_s = sum(x['reteiva_favor'] for x in g)
                 agrupados.append({
                     "label": " + ".join([x['label'] for x in g]),
-                    "iva_ventas": v_s, "iva_compras": c_s, "reteiva_favor": r_s,
+                    "iva_ventas": v_s, 
+                    "iva_compras": c_s, 
+                    "reteiva_favor": r_s,
                     "saldo_iva": v_s - c_s - r_s,
                     "mes_presentacion": g[-1]['mes_presentacion']
                 })
