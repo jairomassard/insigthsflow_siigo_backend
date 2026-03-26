@@ -7321,6 +7321,119 @@ def create_app():
         }), 200
 
 
+    #ENDPOINT PARA EL CALCULO DEL ESTADO DE RESULTADOS (P&L)
+    @app.route("/reportes/pnl_v1", methods=["GET"])
+    @jwt_required()
+    def get_pnl_v1():
+        from sqlalchemy import text
+        from datetime import datetime
+        
+        idcliente = get_jwt().get("idcliente")
+        desde = request.args.get("desde", "2026-01-01")
+        hasta = request.args.get("hasta", "2026-12-31")
+
+        # 1. SQL: EVOLUCIÓN MENSUAL PARA GRÁFICOS Y TENDENCIAS
+        sql_evo = text("""
+            SELECT 
+                periodo_anio, periodo_mes,
+                SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) AS ingresos_op,
+                SUM(CASE WHEN cuenta_codigo LIKE '42%' THEN (credito - debito) ELSE 0 END) AS ingresos_no_op,
+                SUM(CASE WHEN cuenta_codigo LIKE '6%' OR cuenta_codigo LIKE '7%' THEN (debito - credito) ELSE 0 END) AS costos,
+                SUM(CASE WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN (debito - credito) ELSE 0 END) AS gastos_op,
+                SUM(CASE WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN (debito - credito) ELSE 0 END) AS gastos_no_op,
+                -- Identificamos Depreciaciones y Amortizaciones (PUC 5160, 5260, 5165, 5265) para el EBITDA
+                SUM(CASE WHEN cuenta_codigo LIKE '5160%' OR cuenta_codigo LIKE '5260%' OR 
+                            cuenta_codigo LIKE '5165%' OR cuenta_codigo LIKE '5265%' 
+                    THEN (debito - credito) ELSE 0 END) AS dep_amort
+            FROM auxiliar_contable
+            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
+            GROUP BY 1, 2 ORDER BY 1, 2
+        """)
+        
+        # 2. SQL: COMPOSICIÓN ESTRUCTURAL A 4 DÍGITOS (Para la tabla estilo árbol)
+        sql_comp = text("""
+            SELECT 
+                LEFT(cuenta_codigo, 4) AS cuenta_mayor,
+                MAX(cuenta_nombre) AS nombre_cuenta,
+                LEFT(cuenta_codigo, 1) AS clase,
+                SUM(CASE WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito) ELSE (debito - credito) END) AS saldo
+            FROM auxiliar_contable
+            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
+            AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
+            GROUP BY 1, 3
+            HAVING SUM(CASE WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito) ELSE (debito - credito) END) <> 0
+            ORDER BY 1
+        """)
+
+        res_evo = db.session.execute(sql_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+        res_comp = db.session.execute(sql_comp, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+        evolucion = []
+        totales = {
+            "ingresos_op": 0, "ingresos_no_op": 0, "costos": 0, "gastos_op": 0, "gastos_no_op": 0, "dep_amort": 0
+        }
+
+        # Procesar meses
+        for r in res_evo:
+            ing_op = float(r['ingresos_op'] or 0)
+            ing_nop = float(r['ingresos_no_op'] or 0)
+            cst = float(r['costos'] or 0)
+            gst_op = float(r['gastos_op'] or 0)
+            gst_nop = float(r['gastos_no_op'] or 0)
+            dep_am = float(r['dep_amort'] or 0)
+
+            # Acumuladores totales
+            totales["ingresos_op"] += ing_op
+            totales["ingresos_no_op"] += ing_nop
+            totales["costos"] += cst
+            totales["gastos_op"] += gst_op
+            totales["gastos_no_op"] += gst_nop
+            totales["dep_amort"] += dep_am
+
+            # Matemáticas Financieras (Mensuales)
+            utilidad_bruta = ing_op - cst
+            # EBITDA = Utilidad Operativa + Depreciaciones/Amortizaciones
+            # Utilidad Operativa = Utilidad Bruta - Gastos Op
+            ebitda = (utilidad_bruta - gst_op) + dep_am
+            utilidad_neta = (utilidad_bruta - gst_op) + ing_nop - gst_nop
+
+            evolucion.append({
+                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "ingresos": ing_op + ing_nop,
+                "costos_gastos": cst + gst_op + gst_nop,
+                "utilidad_bruta": utilidad_bruta,
+                "ebitda": ebitda,
+                "utilidad_neta": utilidad_neta,
+                # Evitar división por cero
+                "margen_ebitda": round((ebitda / ing_op * 100), 2) if ing_op > 0 else 0
+            })
+
+        # Matemáticas Financieras (Totales del Periodo)
+        t_ub = totales["ingresos_op"] - totales["costos"]
+        t_ebitda = (t_ub - totales["gastos_op"]) + totales["dep_amort"]
+        t_un = (t_ub - totales["gastos_op"]) + totales["ingresos_no_op"] - totales["gastos_no_op"]
+
+        # Procesar composición para la tabla (Árbol P&L)
+        composicion = [{"cuenta": c['cuenta_mayor'], "nombre": c['nombre_cuenta'].title(), "clase": c['clase'], "valor": float(c['saldo'])} for c in res_comp]
+
+        return jsonify({
+            "kpis": {
+                "ingresos_totales": totales["ingresos_op"] + totales["ingresos_no_op"],
+                "utilidad_bruta": t_ub,
+                "ebitda": t_ebitda,
+                "utilidad_neta": t_un,
+                "margen_bruto": round((t_ub / totales["ingresos_op"] * 100), 2) if totales["ingresos_op"] > 0 else 0,
+                "margen_ebitda": round((t_ebitda / totales["ingresos_op"] * 100), 2) if totales["ingresos_op"] > 0 else 0,
+                "margen_neto": round((t_un / totales["ingresos_op"] * 100), 2) if totales["ingresos_op"] > 0 else 0
+            },
+            "evolucion": evolucion,
+            "composicion": composicion
+        }), 200
+
+
+
+
+
 
 
 
@@ -7415,6 +7528,8 @@ def create_app():
                 codigo = "ver_reporte_cruceivas"
             elif "retenciones" in request.path:
                 codigo = "ver_reporte_retenciones"
+            elif "pnl_v1" in request.path or "estado-resultados" in request.path or "estado_resultados" in request.path:
+                codigo = "ver_reporte_estado_resultados"
             else:
                 # Si no se reconoce un reporte específico, usa permiso general
                 codigo = "ver_reportes"
