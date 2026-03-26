@@ -38,6 +38,7 @@ import zipfile
 import requests
 import time
 
+import pandas as pd
 
 from sqlalchemy.sql import text
 import math
@@ -7583,6 +7584,112 @@ def create_app():
         }), 200
 
 
+
+    @app.route("/dashboard/pnl-v2", methods=["GET"])
+    def get_pnl_v2():
+        idcliente = request.headers.get("X-ID-CLIENTE")
+        fecha_inicio = request.args.get("fecha_inicio")
+        fecha_fin = request.args.get("fecha_fin")
+
+        if not fecha_inicio or not fecha_fin:
+            return jsonify({"error": "Fechas requeridas"}), 400
+
+        # ================================
+        # 1. CARGAR DATA (ajusta a tu modelo)
+        # ================================
+        df = obtener_auxiliar_contable(idcliente, fecha_inicio, fecha_fin)
+
+        df["fecha"] = pd.to_datetime(df["fecha"])
+        df["mes"] = df["fecha"].dt.to_period("M").astype(str)
+
+        # ================================
+        # 2. PERIODO ANTERIOR
+        # ================================
+        fecha_inicio_dt = datetime.strptime(fecha_inicio, "%Y-%m-%d")
+        fecha_fin_dt = datetime.strptime(fecha_fin, "%Y-%m-%d")
+
+        delta = fecha_fin_dt - fecha_inicio_dt
+
+        prev_fin = fecha_inicio_dt - timedelta(days=1)
+        prev_inicio = prev_fin - delta
+
+        df_prev = obtener_auxiliar_contable(
+            idcliente,
+            prev_inicio.strftime("%Y-%m-%d"),
+            prev_fin.strftime("%Y-%m-%d")
+        )
+
+        # ================================
+        # 3. CLASIFICACIÓN CONTABLE
+        # ================================
+        def clasificar(cuenta):
+            c = str(cuenta)
+            if c.startswith("41"):
+                return "ingreso"
+            elif c.startswith(("6", "7")):
+                return "costo"
+            elif c.startswith(("51", "52")):
+                return "gasto_operacional"
+            elif c.startswith("42"):
+                return "ingreso_no_op"
+            elif c.startswith(("53", "54")):
+                return "gasto_no_op"
+            elif c.startswith(("5160", "5165", "5260", "5265")):
+                return "dep_amort"
+            return "otro"
+
+        df["tipo"] = df["cuenta"].apply(clasificar)
+        df_prev["tipo"] = df_prev["cuenta"].apply(clasificar)
+
+        # ================================
+        # 4. CALCULO KPIs
+        # ================================
+        def calcular(df):
+            ingresos = df[df.tipo == "ingreso"]["valor"].sum()
+            ingresos_no_op = df[df.tipo == "ingreso_no_op"]["valor"].sum()
+            costos = df[df.tipo == "costo"]["valor"].sum()
+            gastos_op = df[df.tipo == "gasto_operacional"]["valor"].sum()
+            gastos_no_op = df[df.tipo == "gasto_no_op"]["valor"].sum()
+            dep = df[df.tipo == "dep_amort"]["valor"].sum()
+
+            utilidad_bruta = ingresos - costos
+            utilidad_operativa = utilidad_bruta - gastos_op
+            ebitda = utilidad_operativa + dep
+            utilidad_neta = utilidad_operativa + ingresos_no_op - gastos_no_op
+
+            return {
+                "ingresos": ingresos + ingresos_no_op,
+                "utilidad_bruta": utilidad_bruta,
+                "utilidad_operativa": utilidad_operativa,
+                "ebitda": ebitda,
+                "utilidad_neta": utilidad_neta
+            }
+
+        actual = calcular(df)
+        anterior = calcular(df_prev)
+
+        # ================================
+        # 5. VARIACIONES
+        # ================================
+        def variacion(act, ant):
+            diff = act - ant
+            pct = (diff / ant * 100) if ant != 0 else 0
+            return {"actual": act, "anterior": ant, "diff": diff, "pct": pct}
+
+        kpis = {
+            k: variacion(actual[k], anterior[k])
+            for k in actual.keys()
+        }
+
+        # ================================
+        # 6. MATRIZ
+        # ================================
+        matriz = df.groupby(["cuenta", "nombre_cuenta"])["valor"].sum().reset_index()
+
+        return jsonify({
+            "kpis": kpis,
+            "matriz": matriz.to_dict(orient="records")
+        })
 
 
     # NO TOCAR DE AQEUI PARA ABAJO
