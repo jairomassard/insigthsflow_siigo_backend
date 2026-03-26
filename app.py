@@ -7241,6 +7241,91 @@ def create_app():
         }), 200
 
 
+
+    #ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES 
+    @app.route("/reportes/retenciones_v1", methods=["GET"])
+    @jwt_required()
+    def get_retenciones_v1():
+        from sqlalchemy import text
+        
+        idcliente = get_jwt().get("idcliente")
+        desde = request.args.get("desde", "2026-01-01")
+        hasta = request.args.get("hasta", "2026-12-31")
+
+        # 1. SQL para Evolución Mensual (Gráfico de Barras)
+        sql_evolucion = text("""
+            SELECT 
+                periodo_anio, 
+                periodo_mes,
+                SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
+                SUM(CASE WHEN cuenta_codigo LIKE '2368%' THEN (credito - debito) ELSE 0 END) AS reteica
+            FROM auxiliar_contable
+            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
+            GROUP BY 1, 2 ORDER BY 1, 2
+        """)
+        
+        # 2. SQL para Composición por Concepto (Tabla y Torta)
+        # Agrupamos por los primeros 6 dígitos para consolidar sub-auxiliares (ej. 236515)
+        sql_composicion = text("""
+            SELECT 
+                LEFT(cuenta_codigo, 6) AS cuenta_base,
+                MAX(cuenta_nombre) AS nombre_concepto,
+                CASE WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente' ELSE 'ReteICA' END AS tipo_impuesto,
+                SUM(credito - debito) AS saldo_pagar
+            FROM auxiliar_contable
+            WHERE idcliente = :idc 
+            AND fecha_contable BETWEEN :d AND :h
+            AND (cuenta_codigo LIKE '2365%' OR cuenta_codigo LIKE '2368%')
+            GROUP BY 1, 3
+            HAVING SUM(credito - debito) <> 0
+            ORDER BY 4 DESC
+        """)
+
+        res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+        res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+        # Formatear la evolución mensual
+        evolucion = []
+        total_rf = 0
+        total_ica = 0
+        
+        for r in res_evo:
+            rf = float(r['retefuente'] or 0)
+            ica = float(r['reteica'] or 0)
+            total_rf += rf
+            total_ica += ica
+            evolucion.append({
+                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "retefuente": rf,
+                "reteica": ica
+            })
+
+        # Formatear la composición
+        composicion = []
+        for c in res_comp:
+            composicion.append({
+                "cuenta": c['cuenta_base'],
+                "concepto": str(c['nombre_concepto']).title(),
+                "tipo": c['tipo_impuesto'],
+                "valor": float(c['saldo_pagar'] or 0)
+            })
+
+        return jsonify({
+            "kpis": {
+                "total_retefuente": total_rf,
+                "total_reteica": total_ica,
+                "total_general": total_rf + total_ica
+            },
+            "evolucion": evolucion,
+            "composicion": composicion
+        }), 200
+
+
+
+
+
+
+    # NO TOCAR DE AQEUI PARA ABAJO
     # --- Registrar rutas de permisos ---
     from permisos_routes import register_permisos_routes
     register_permisos_routes(app)
@@ -7328,6 +7413,8 @@ def create_app():
                 codigo = "ver_reporte_cxc"
             elif "cruce_iva" in request.path:
                 codigo = "ver_reporte_cruceivas"
+            elif "retenciones" in request.path:
+                codigo = "ver_reporte_retenciones"
             else:
                 # Si no se reconoce un reporte específico, usa permiso general
                 codigo = "ver_reportes"
