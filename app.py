@@ -7693,10 +7693,11 @@ def create_app():
 
 
 
-    # ENDPOINT PARA EL CALCULO DEL ESTADO DE RESULTADOS (P&L)
+    # ENDPOINT PARA EL CALCULO DEL ANALISIS VARIACION
+    # ENDPOINT PARA EL CALCULO DEL ANALISIS VARIACION
     @app.route("/reportes/analisis_variacion_v1", methods=["GET"])
     @jwt_required()
-    def get_pnl_v1():
+    def get_analisis_variacion_v1():
         from sqlalchemy import text
 
         idcliente = get_jwt().get("idcliente")
@@ -7756,7 +7757,6 @@ def create_app():
 
         # =========================================================
         # 2) COMPOSICIÓN DETALLADA
-        #    YA NO AGRUPAR SOLO POR 4 DÍGITOS
         # =========================================================
         sql_comp = text("""
             SELECT
@@ -7828,9 +7828,6 @@ def create_app():
             "h": hasta
         }).mappings().all()
 
-        # =========================================================
-        # 3) PROCESAR EVOLUCIÓN
-        # =========================================================
         evolucion = []
         totales = {
             "ingresos_operacionales": 0.0,
@@ -7885,9 +7882,6 @@ def create_app():
                 "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
             })
 
-        # =========================================================
-        # 4) KPIs ACUMULADOS
-        # =========================================================
         ingresos_operacionales = totales["ingresos_operacionales"]
         ingresos_no_operacionales = totales["ingresos_no_operacionales"]
         ingresos_totales = ingresos_operacionales + ingresos_no_operacionales
@@ -7904,9 +7898,6 @@ def create_app():
 
         base_margen = ingresos_totales if ingresos_totales != 0 else 0
 
-        # =========================================================
-        # 5) PROCESAR COMPOSICIÓN
-        # =========================================================
         cuentas_dict = {}
 
         for c in res_comp:
