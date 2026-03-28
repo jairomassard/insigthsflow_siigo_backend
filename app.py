@@ -7692,6 +7692,271 @@ def create_app():
         })
 
 
+
+    # ENDPOINT PARA EL CALCULO DEL ESTADO DE RESULTADOS (P&L)
+    @app.route("/reportes/analisis_variacion_v1", methods=["GET"])
+    @jwt_required()
+    def get_pnl_v1():
+        from sqlalchemy import text
+
+        idcliente = get_jwt().get("idcliente")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+
+        if not desde or not hasta:
+            return jsonify({"error": "Debes enviar desde y hasta"}), 400
+
+        # =========================================================
+        # 1) EVOLUCIÓN MENSUAL
+        # =========================================================
+        sql_evo = text("""
+            SELECT
+                periodo_anio,
+                periodo_mes,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '41%' THEN (credito - debito)
+                    ELSE 0
+                END) AS ingresos_operacionales,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '42%' THEN (credito - debito)
+                    ELSE 0
+                END) AS ingresos_no_operacionales,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '6%' OR cuenta_codigo LIKE '7%' THEN (debito - credito)
+                    ELSE 0
+                END) AS costos_venta,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN (debito - credito)
+                    ELSE 0
+                END) AS gastos_operacionales,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN (debito - credito)
+                    ELSE 0
+                END) AS gastos_no_operacionales,
+
+                SUM(CASE
+                    WHEN cuenta_codigo LIKE '5160%'
+                    OR cuenta_codigo LIKE '5165%'
+                    OR cuenta_codigo LIKE '5260%'
+                    OR cuenta_codigo LIKE '5265%'
+                    THEN (debito - credito)
+                    ELSE 0
+                END) AS dep_amort
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            GROUP BY periodo_anio, periodo_mes
+            ORDER BY periodo_anio, periodo_mes
+        """)
+
+        # =========================================================
+        # 2) COMPOSICIÓN DETALLADA
+        #    YA NO AGRUPAR SOLO POR 4 DÍGITOS
+        # =========================================================
+        sql_comp = text("""
+            SELECT
+                periodo_anio,
+                periodo_mes,
+                cuenta_codigo,
+                LEFT(cuenta_codigo, 4) AS cuenta_padre,
+                MAX(cuenta_nombre) AS nombre_cuenta,
+
+                CASE
+                    WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
+                    WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN 'GASTOS_NO_OPERACIONALES'
+                    ELSE 'OTROS'
+                END AS seccion,
+
+                CASE
+                    WHEN LEFT(cuenta_codigo, 1) = '4' THEN 'CREDITO_MENOS_DEBITO'
+                    ELSE 'DEBITO_MENOS_CREDITO'
+                END AS naturaleza,
+
+                SUM(
+                    CASE
+                        WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito)
+                        ELSE (debito - credito)
+                    END
+                ) AS saldo
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
+            GROUP BY
+                periodo_anio,
+                periodo_mes,
+                cuenta_codigo,
+                LEFT(cuenta_codigo, 4),
+                CASE
+                    WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
+                    WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
+                    WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN 'GASTOS_NO_OPERACIONALES'
+                    ELSE 'OTROS'
+                END,
+                CASE
+                    WHEN LEFT(cuenta_codigo, 1) = '4' THEN 'CREDITO_MENOS_DEBITO'
+                    ELSE 'DEBITO_MENOS_CREDITO'
+                END
+            HAVING SUM(
+                CASE
+                    WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito)
+                    ELSE (debito - credito)
+                END
+            ) <> 0
+            ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+        """)
+
+        res_evo = db.session.execute(sql_evo, {
+            "idc": idcliente,
+            "d": desde,
+            "h": hasta
+        }).mappings().all()
+
+        res_comp = db.session.execute(sql_comp, {
+            "idc": idcliente,
+            "d": desde,
+            "h": hasta
+        }).mappings().all()
+
+        # =========================================================
+        # 3) PROCESAR EVOLUCIÓN
+        # =========================================================
+        evolucion = []
+        totales = {
+            "ingresos_operacionales": 0.0,
+            "ingresos_no_operacionales": 0.0,
+            "costos_venta": 0.0,
+            "gastos_operacionales": 0.0,
+            "gastos_no_operacionales": 0.0,
+            "dep_amort": 0.0,
+        }
+
+        for r in res_evo:
+            ing_op = float(r["ingresos_operacionales"] or 0)
+            ing_no_op = float(r["ingresos_no_operacionales"] or 0)
+            costos = float(r["costos_venta"] or 0)
+            gastos_op = float(r["gastos_operacionales"] or 0)
+            gastos_no_op = float(r["gastos_no_operacionales"] or 0)
+            dep_amort = float(r["dep_amort"] or 0)
+
+            ingresos_totales = ing_op + ing_no_op
+            utilidad_bruta = ing_op - costos
+            utilidad_operativa = utilidad_bruta - gastos_op
+            ebitda = utilidad_operativa + dep_amort
+            utilidad_antes_impuestos = utilidad_operativa + ing_no_op - gastos_no_op
+            utilidad_neta = utilidad_antes_impuestos
+
+            totales["ingresos_operacionales"] += ing_op
+            totales["ingresos_no_operacionales"] += ing_no_op
+            totales["costos_venta"] += costos
+            totales["gastos_operacionales"] += gastos_op
+            totales["gastos_no_operacionales"] += gastos_no_op
+            totales["dep_amort"] += dep_amort
+
+            base_margen = ingresos_totales if ingresos_totales != 0 else 0
+
+            evolucion.append({
+                "label": f"{r['periodo_anio']}-{int(r['periodo_mes']):02d}",
+                "ingresos_operacionales": ing_op,
+                "ingresos_no_operacionales": ing_no_op,
+                "ingresos_totales": ingresos_totales,
+                "costos_venta": costos,
+                "gastos_operacionales": gastos_op,
+                "gastos_no_operacionales": gastos_no_op,
+                "utilidad_bruta": utilidad_bruta,
+                "utilidad_operativa": utilidad_operativa,
+                "ebitda": ebitda,
+                "utilidad_antes_impuestos": utilidad_antes_impuestos,
+                "utilidad_neta": utilidad_neta,
+                "costos_gastos": costos + gastos_op + gastos_no_op,
+                "margen_bruto": round((utilidad_bruta / base_margen) * 100, 2) if base_margen else 0,
+                "margen_operativo": round((utilidad_operativa / base_margen) * 100, 2) if base_margen else 0,
+                "margen_ebitda": round((ebitda / base_margen) * 100, 2) if base_margen else 0,
+                "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
+            })
+
+        # =========================================================
+        # 4) KPIs ACUMULADOS
+        # =========================================================
+        ingresos_operacionales = totales["ingresos_operacionales"]
+        ingresos_no_operacionales = totales["ingresos_no_operacionales"]
+        ingresos_totales = ingresos_operacionales + ingresos_no_operacionales
+        costos_venta = totales["costos_venta"]
+        gastos_operacionales = totales["gastos_operacionales"]
+        gastos_no_operacionales = totales["gastos_no_operacionales"]
+        dep_amort = totales["dep_amort"]
+
+        utilidad_bruta = ingresos_operacionales - costos_venta
+        utilidad_operativa = utilidad_bruta - gastos_operacionales
+        ebitda = utilidad_operativa + dep_amort
+        utilidad_antes_impuestos = utilidad_operativa + ingresos_no_operacionales - gastos_no_operacionales
+        utilidad_neta = utilidad_antes_impuestos
+
+        base_margen = ingresos_totales if ingresos_totales != 0 else 0
+
+        # =========================================================
+        # 5) PROCESAR COMPOSICIÓN
+        # =========================================================
+        cuentas_dict = {}
+
+        for c in res_comp:
+            cuenta_codigo = str(c["cuenta_codigo"])
+            periodo = f"{c['periodo_anio']}-{int(c['periodo_mes']):02d}"
+
+            if cuenta_codigo not in cuentas_dict:
+                cuentas_dict[cuenta_codigo] = {
+                    "cuenta": cuenta_codigo,
+                    "cuenta_padre": str(c["cuenta_padre"]),
+                    "nombre": str(c["nombre_cuenta"]).strip().title(),
+                    "seccion": str(c["seccion"]),
+                    "naturaleza": str(c["naturaleza"]),
+                    "valores_mes": {},
+                    "total": 0.0,
+                }
+
+            val = float(c["saldo"] or 0)
+            cuentas_dict[cuenta_codigo]["valores_mes"][periodo] = val
+            cuentas_dict[cuenta_codigo]["total"] += val
+
+        composicion = list(cuentas_dict.values())
+        composicion.sort(key=lambda x: x["cuenta"])
+
+        return jsonify({
+            "kpis": {
+                "ingresos_operacionales": ingresos_operacionales,
+                "ingresos_no_operacionales": ingresos_no_operacionales,
+                "ingresos_totales": ingresos_totales,
+                "costos_venta": costos_venta,
+                "utilidad_bruta": utilidad_bruta,
+                "gastos_operacionales": gastos_operacionales,
+                "utilidad_operativa": utilidad_operativa,
+                "ebitda": ebitda,
+                "gastos_no_operacionales": gastos_no_operacionales,
+                "utilidad_antes_impuestos": utilidad_antes_impuestos,
+                "utilidad_neta": utilidad_neta,
+                "margen_bruto": round((utilidad_bruta / base_margen) * 100, 2) if base_margen else 0,
+                "margen_operativo": round((utilidad_operativa / base_margen) * 100, 2) if base_margen else 0,
+                "margen_ebitda": round((ebitda / base_margen) * 100, 2) if base_margen else 0,
+                "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
+            },
+            "evolucion": evolucion,
+            "composicion": composicion
+        }), 200
+
+
+
+
+
     # NO TOCAR DE AQEUI PARA ABAJO
     # --- Registrar rutas de permisos ---
     from permisos_routes import register_permisos_routes
@@ -7782,6 +8047,8 @@ def create_app():
                 codigo = "ver_reporte_cruceivas"
             elif "retenciones" in request.path:
                 codigo = "ver_reporte_retenciones"
+            elif "analisis_variacion_v1" in request.path or "analisis-variacion" in request.path:
+                codigo = "ver_reporte_analisis_variacion"
             elif "pnl_v1" in request.path or "estado-resultados" in request.path or "estado_resultados" in request.path:
                 codigo = "ver_reporte_estado_resultados"
             else:
