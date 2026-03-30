@@ -7961,13 +7961,13 @@ def create_app():
         fecha_corte = data.get("fecha_corte")
 
         if not idcliente:
-            return jsonify({"error": "Debes enviar idcliente"}), 400
+            return jsonify({"error": "Falta idcliente"}), 400
 
         if not fecha_corte:
-            return jsonify({"error": "Debes enviar fecha_corte"}), 400
+            return jsonify({"error": "Falta fecha_corte"}), 400
 
         try:
-            result = regenerar_snapshot_saldos_corte(idcliente, fecha_corte)
+            result = regenerar_snapshot_saldos_corte(int(idcliente), fecha_corte)
             return jsonify(result), 200
         except Exception as e:
             db.session.rollback()
@@ -7975,6 +7975,7 @@ def create_app():
                 "error": "No fue posible regenerar el snapshot del balance",
                 "detalle": str(e)
             }), 500
+        
 
     @app.route("/reportes/balance_general_v1", methods=["GET"])
     def get_balance_general_v1():
@@ -7983,10 +7984,10 @@ def create_app():
         comparar_con = request.args.get("comparar_con")
 
         if not idcliente:
-            return jsonify({"error": "Debes enviar idcliente"}), 400
+            return jsonify({"error": "Falta idcliente"}), 400
 
         if not fecha_corte:
-            return jsonify({"error": "Debes enviar fecha_corte"}), 400
+            return jsonify({"error": "Falta fecha_corte"}), 400
 
         try:
             result = construir_balance_general(idcliente, fecha_corte, comparar_con)
