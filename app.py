@@ -7954,12 +7954,15 @@ def create_app():
     # GENERAR BALANCE GENRAL A PARTIR DE LOS AUXILIARES DE CUENTAS CONTABLES
 
     @app.route("/reportes/balance_general/rebuild_snapshot", methods=["POST"])
-    #@jwt_required()
     def rebuild_balance_snapshot():
-        idcliente = get_jwt().get("idcliente")
         data = request.get_json(silent=True) or {}
 
+        idcliente = data.get("idcliente")
         fecha_corte = data.get("fecha_corte")
+
+        if not idcliente:
+            return jsonify({"error": "Debes enviar idcliente"}), 400
+
         if not fecha_corte:
             return jsonify({"error": "Debes enviar fecha_corte"}), 400
 
@@ -7973,13 +7976,14 @@ def create_app():
                 "detalle": str(e)
             }), 500
 
-
     @app.route("/reportes/balance_general_v1", methods=["GET"])
-    #@jwt_required()
     def get_balance_general_v1():
-        idcliente = get_jwt().get("idcliente")
+        idcliente = request.args.get("idcliente", type=int)
         fecha_corte = request.args.get("fecha_corte")
         comparar_con = request.args.get("comparar_con")
+
+        if not idcliente:
+            return jsonify({"error": "Debes enviar idcliente"}), 400
 
         if not fecha_corte:
             return jsonify({"error": "Debes enviar fecha_corte"}), 400
@@ -8000,6 +8004,7 @@ def create_app():
                 "error": "No fue posible consultar el balance general",
                 "detalle": str(e)
             }), 500
+
 
 
     # NO TOCAR DE AQEUI PARA ABAJO
