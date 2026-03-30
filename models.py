@@ -824,3 +824,41 @@ class AuxiliarContable(db.Model):
             "credito": float(self.credito),
             "base": float(self.base_gravable)
         }
+
+
+from decimal import Decimal
+
+
+class AuxiliarSaldosCorte(db.Model):
+    __tablename__ = "auxiliar_saldos_corte"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(
+        db.Integer,
+        db.ForeignKey("clientes.idcliente", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    fecha_corte = db.Column(db.Date, nullable=False, index=True)
+    cuenta_codigo = db.Column(db.String(20), nullable=False, index=True)
+    cuenta_nombre = db.Column(db.String(255))
+    cuenta_padre = db.Column(db.String(10))
+    clase = db.Column(db.String(1))
+    grupo = db.Column(db.String(2))
+    seccion = db.Column(db.String(30), index=True)
+    grupo_balance = db.Column(db.String(50), index=True)
+    naturaleza = db.Column(db.String(30))
+    saldo = db.Column(db.Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    fecha_generacion = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    origen = db.Column(db.String(30), default="AUXILIAR")
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "idcliente",
+            "fecha_corte",
+            "cuenta_codigo",
+            name="uq_aux_saldos_corte_cliente_fecha_cuenta"
+        ),
+    )
+
+
