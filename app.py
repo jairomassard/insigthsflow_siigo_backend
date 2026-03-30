@@ -7951,23 +7951,20 @@ def create_app():
 
 
 
-    # GENERAR BALANCE GENRAL A PARTIR DE LOS AUXILIARES DE CUENTAS CONTABLES
+    # GENERAR BALANCE GENERAL A PARTIR DE LOS AUXILIARES DE CUENTAS CONTABLES
 
     @app.route("/reportes/balance_general/rebuild_snapshot", methods=["POST"])
+    @jwt_required()
     def rebuild_balance_snapshot():
+        idcliente = get_jwt().get("idcliente")
         data = request.get_json(silent=True) or {}
 
-        idcliente = data.get("idcliente")
         fecha_corte = data.get("fecha_corte")
-
-        if not idcliente:
-            return jsonify({"error": "Falta idcliente"}), 400
-
         if not fecha_corte:
-            return jsonify({"error": "Falta fecha_corte"}), 400
+            return jsonify({"error": "Debes enviar fecha_corte"}), 400
 
         try:
-            result = regenerar_snapshot_saldos_corte(int(idcliente), fecha_corte)
+            result = regenerar_snapshot_saldos_corte(idcliente, fecha_corte)
             return jsonify(result), 200
         except Exception as e:
             db.session.rollback()
@@ -7975,19 +7972,17 @@ def create_app():
                 "error": "No fue posible regenerar el snapshot del balance",
                 "detalle": str(e)
             }), 500
-        
+
 
     @app.route("/reportes/balance_general_v1", methods=["GET"])
+    @jwt_required()
     def get_balance_general_v1():
-        idcliente = request.args.get("idcliente", type=int)
+        idcliente = get_jwt().get("idcliente")
         fecha_corte = request.args.get("fecha_corte")
         comparar_con = request.args.get("comparar_con")
 
-        if not idcliente:
-            return jsonify({"error": "Falta idcliente"}), 400
-
         if not fecha_corte:
-            return jsonify({"error": "Falta fecha_corte"}), 400
+            return jsonify({"error": "Debes enviar fecha_corte"}), 400
 
         try:
             result = construir_balance_general(idcliente, fecha_corte, comparar_con)
@@ -8005,7 +8000,6 @@ def create_app():
                 "error": "No fue posible consultar el balance general",
                 "detalle": str(e)
             }), 500
-
 
 
     # NO TOCAR DE AQEUI PARA ABAJO
@@ -8080,6 +8074,8 @@ def create_app():
                 codigo = "ver_reporte_indicadores"
             elif "ventas" in request.path:
                 codigo = "ver_reporte_ventas"
+            elif "balance_general" in request.path or "balance-general" in request.path:
+                codigo = "ver_reporte_balance_general"
             elif "balance" in request.path:
                 codigo = "ver_reporte_balance"
             elif "consolidado" in request.path:
