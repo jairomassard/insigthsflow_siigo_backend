@@ -4,15 +4,30 @@ from sqlalchemy import text
 
 from models import db, AuxiliarSaldosCorte
 
-from datetime import datetime, timedelta
-from decimal import Decimal
-from sqlalchemy import text
 
-from models import db, AuxiliarSaldosCorte
-
+# =========================================================
+# Helpers básicos
+# =========================================================
 
 def safe_float(v):
-    return float(v or 0)
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+
+def redondear(v, dec=2):
+    return round(safe_float(v), dec)
+
+
+def ultimo_dia_del_mes(fecha_str):
+    dt = datetime.strptime(fecha_str, "%Y-%m-%d").date()
+    if dt.month == 12:
+        siguiente = dt.replace(year=dt.year + 1, month=1, day=1)
+    else:
+        siguiente = dt.replace(month=dt.month + 1, day=1)
+    ultimo = siguiente - timedelta(days=1)
+    return ultimo.strftime("%Y-%m-%d")
 
 
 def ultimo_dia_mes_anterior(fecha_str):
@@ -21,6 +36,18 @@ def ultimo_dia_mes_anterior(fecha_str):
     prev_last = first_day - timedelta(days=1)
     return prev_last.strftime("%Y-%m-%d")
 
+
+def normalizar_fecha_comparacion(fecha_str):
+    """
+    Si el usuario manda 2026-01-01 o 2026-01-15,
+    se normaliza al último día de ese mes: 2026-01-31.
+    """
+    return ultimo_dia_del_mes(fecha_str)
+
+
+# =========================================================
+# Clasificación contable
+# =========================================================
 
 def clasificar_cuenta(cuenta_codigo: str):
     codigo = str(cuenta_codigo).strip()
@@ -38,6 +65,7 @@ def clasificar_cuenta(cuenta_codigo: str):
     seccion = "OTROS"
     grupo_balance = "OTROS"
 
+    # Activo
     if clase == "1":
         seccion = "ACTIVO"
         if grupo in ("11", "12", "13", "14"):
@@ -45,27 +73,30 @@ def clasificar_cuenta(cuenta_codigo: str):
         else:
             grupo_balance = "ACTIVO_NO_CORRIENTE"
 
+    # Pasivo
     elif clase == "2":
         seccion = "PASIVO"
-        if grupo in ("21", "22", "23", "24", "25", "27", "28"):
+        if grupo in ("21", "22", "23", "24", "25", "26", "27", "28"):
             grupo_balance = "PASIVO_CORRIENTE"
         else:
             grupo_balance = "PASIVO_NO_CORRIENTE"
 
+    # Patrimonio
     elif clase == "3":
         seccion = "PATRIMONIO"
         grupo_balance = "PATRIMONIO"
 
+    # Resultado
     elif clase == "4":
         seccion = "INGRESOS"
         grupo_balance = "RESULTADO"
 
-    elif clase in ("6", "7"):
-        seccion = "COSTOS"
-        grupo_balance = "RESULTADO"
-
     elif clase == "5":
         seccion = "GASTOS"
+        grupo_balance = "RESULTADO"
+
+    elif clase in ("6", "7"):
+        seccion = "COSTOS"
         grupo_balance = "RESULTADO"
 
     return {
@@ -78,11 +109,17 @@ def clasificar_cuenta(cuenta_codigo: str):
     }
 
 
+# =========================================================
+# Generación de snapshot acumulado por fecha de corte
+# =========================================================
+
 def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
     """
     Recalcula e inserta los saldos acumulados por cuenta
     para un cliente y una fecha de corte.
     """
+
+    fecha_corte = ultimo_dia_del_mes(fecha_corte)
 
     sql = text("""
         SELECT
@@ -100,6 +137,7 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
         FROM auxiliar_contable
         WHERE idcliente = :idc
           AND fecha_contable <= :fc
+          AND LEFT(cuenta_codigo, 1) IN ('1', '2', '3', '4', '5', '6', '7')
         GROUP BY cuenta_codigo
         HAVING SUM(
             CASE
@@ -118,7 +156,6 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
         "fc": fecha_corte
     }).mappings().all()
 
-    # Borrar snapshot previo del mismo cliente y fecha
     AuxiliarSaldosCorte.query.filter_by(
         idcliente=idcliente,
         fecha_corte=fecha_corte
@@ -128,7 +165,7 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
     for r in rows:
         cuenta_codigo = str(r["cuenta_codigo"]).strip()
         cuenta_nombre = str(r["cuenta_nombre"] or "").strip()
-        saldo = float(r["saldo"] or 0)
+        saldo = safe_float(r["saldo"])
 
         meta = clasificar_cuenta(cuenta_codigo)
 
@@ -144,7 +181,7 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
                 seccion=meta["seccion"],
                 grupo_balance=meta["grupo_balance"],
                 naturaleza=meta["naturaleza"],
-                saldo=Decimal(str(round(saldo, 2))),
+                saldo=Decimal(str(redondear(saldo, 2))),
                 origen="AUXILIAR"
             )
         )
@@ -160,8 +197,155 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
     }
 
 
+# =========================================================
+# Helpers de armado del balance
+# =========================================================
+
+def _crear_item_snapshot(row, row_ant=None):
+    saldo_actual = safe_float(row.saldo)
+    saldo_anterior = safe_float(row_ant.saldo if row_ant else 0)
+
+    variacion_abs = redondear(saldo_actual - saldo_anterior, 2)
+    variacion_pct = redondear((variacion_abs / saldo_anterior) * 100, 2) if saldo_anterior != 0 else 0
+
+    return {
+        "cuenta": row.cuenta_codigo,
+        "cuenta_padre": row.cuenta_padre,
+        "nombre": row.cuenta_nombre,
+        "seccion": row.seccion,
+        "grupo_balance": row.grupo_balance,
+        "saldo_actual": redondear(saldo_actual, 2),
+        "saldo_anterior": redondear(saldo_anterior, 2),
+        "variacion_abs": variacion_abs,
+        "variacion_pct": variacion_pct
+    }
+
+
+def _crear_item_sintetico(cuenta, nombre, seccion, grupo_balance, saldo_actual, saldo_anterior=0):
+    variacion_abs = redondear(saldo_actual - saldo_anterior, 2)
+    variacion_pct = redondear((variacion_abs / saldo_anterior) * 100, 2) if saldo_anterior != 0 else 0
+
+    return {
+        "cuenta": cuenta,
+        "cuenta_padre": cuenta[:4] if len(cuenta) >= 4 else cuenta,
+        "nombre": nombre,
+        "seccion": seccion,
+        "grupo_balance": grupo_balance,
+        "saldo_actual": redondear(saldo_actual, 2),
+        "saldo_anterior": redondear(saldo_anterior, 2),
+        "variacion_abs": variacion_abs,
+        "variacion_pct": variacion_pct
+    }
+
+
+def _total(lista, campo):
+    return redondear(sum(safe_float(x.get(campo, 0)) for x in lista), 2)
+
+
+def _ordenar_items(lista):
+    return sorted(lista, key=lambda x: (str(x.get("cuenta_padre", "")), str(x.get("cuenta", ""))))
+
+
+def _armar_alertas(
+    activo_corriente,
+    activo_no_corriente,
+    pasivo_corriente,
+    pasivo_no_corriente,
+    patrimonio,
+    cuadratura
+):
+    alertas = []
+
+    # activos con saldo negativo
+    for item in activo_corriente + activo_no_corriente:
+        if safe_float(item["saldo_actual"]) < 0:
+            alertas.append(
+                f"La cuenta de activo {item['cuenta']} - {item['nombre']} tiene saldo negativo y conviene revisarla."
+            )
+
+    # pasivos con saldo negativo
+    for item in pasivo_corriente + pasivo_no_corriente:
+        if safe_float(item["saldo_actual"]) < 0:
+            alertas.append(
+                f"La cuenta de pasivo {item['cuenta']} - {item['nombre']} tiene saldo negativo y conviene revisarla."
+            )
+
+    # patrimonio vacío o cero
+    if len(patrimonio) == 0 or abs(_total(patrimonio, "saldo_actual")) < 1:
+        alertas.append(
+            "No se encontró patrimonio contable explícito en clase 3; se agregó una línea de ajuste para cuadrar el balance."
+        )
+
+    # balance no cuadra
+    if abs(cuadratura) >= 1:
+        alertas.append(
+            "El balance no cuadraba de forma natural con las cuentas clasificadas, por eso se generó un ajuste de patrimonio calculado."
+        )
+
+    return alertas
+
+
+def _armar_narrativa(
+    activos_totales,
+    pasivos_totales,
+    patrimonio_total,
+    razon_corriente,
+    nivel_endeudamiento_pct,
+    autonomia_financiera_pct,
+    cuadratura_original,
+    ajuste_patrimonio_aplicado
+):
+    narrativa = []
+
+    if abs(cuadratura_original) < 1:
+        narrativa.append("El balance cuadra correctamente con la información clasificada.")
+    else:
+        narrativa.append("El balance requirió un ajuste de patrimonio calculado para cuadrar la ecuación contable.")
+
+    if patrimonio_total > 0:
+        narrativa.append("La empresa presenta una posición patrimonial positiva.")
+    elif patrimonio_total < 0:
+        narrativa.append("La empresa presenta patrimonio negativo, lo que indica una situación financiera delicada.")
+    else:
+        narrativa.append("La empresa no muestra patrimonio neto en el corte evaluado.")
+
+    if razon_corriente >= 1.5:
+        narrativa.append("La liquidez de corto plazo luce saludable.")
+    elif razon_corriente >= 1:
+        narrativa.append("La liquidez es aceptable, pero debe monitorearse.")
+    else:
+        narrativa.append("La liquidez de corto plazo es débil.")
+
+    if nivel_endeudamiento_pct <= 50:
+        narrativa.append("El endeudamiento está en una zona manejable.")
+    elif nivel_endeudamiento_pct <= 70:
+        narrativa.append("El endeudamiento es relevante y debe vigilarse.")
+    else:
+        narrativa.append("El endeudamiento es alto frente al total de activos.")
+
+    if autonomia_financiera_pct >= 40:
+        narrativa.append("La autonomía financiera es sólida.")
+    elif autonomia_financiera_pct >= 20:
+        narrativa.append("La autonomía financiera es moderada.")
+    else:
+        narrativa.append("La autonomía financiera es baja frente al tamaño de los activos.")
+
+    if abs(ajuste_patrimonio_aplicado) >= 1:
+        narrativa.append("Conviene revisar si el auxiliar incluye todas las cuentas de patrimonio o si falta reclasificación contable de cierre.")
+
+    return narrativa
+
+
+# =========================================================
+# Construcción del balance general
+# =========================================================
+
 def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: str = None):
-    if not comparar_con:
+    fecha_corte = ultimo_dia_del_mes(fecha_corte)
+
+    if comparar_con:
+        comparar_con = normalizar_fecha_comparacion(comparar_con)
+    else:
         comparar_con = ultimo_dia_mes_anterior(fecha_corte)
 
     actuales = AuxiliarSaldosCorte.query.filter_by(
@@ -188,23 +372,15 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     pasivo_no_corriente = []
     patrimonio = []
 
+    # resultado del ejercicio / acumulado calculado desde clases 4,5,6,7
+    utilidad_actual = 0.0
+    utilidad_anterior = 0.0
+
     for row in actuales:
         ant = map_ant.get(row.cuenta_codigo)
+        item = _crear_item_snapshot(row, ant)
 
-        item = {
-            "cuenta": row.cuenta_codigo,
-            "cuenta_padre": row.cuenta_padre,
-            "nombre": row.cuenta_nombre,
-            "seccion": row.seccion,
-            "grupo_balance": row.grupo_balance,
-            "saldo_actual": safe_float(row.saldo),
-            "saldo_anterior": safe_float(ant.saldo if ant else 0),
-        }
-
-        item["variacion_abs"] = round(item["saldo_actual"] - item["saldo_anterior"], 2)
-        item["variacion_pct"] = round(
-            (item["variacion_abs"] / item["saldo_anterior"]) * 100, 2
-        ) if item["saldo_anterior"] != 0 else 0
+        clase = str(row.clase or "")[:1]
 
         if row.grupo_balance == "ACTIVO_CORRIENTE":
             activo_corriente.append(item)
@@ -217,54 +393,112 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         elif row.grupo_balance == "PATRIMONIO":
             patrimonio.append(item)
 
-    def total(lista, campo):
-        return round(sum(x[campo] for x in lista), 2)
+        # cálculo de utilidad usando cuentas de resultado
+        if clase == "4":
+            utilidad_actual += safe_float(row.saldo)
+            utilidad_anterior += safe_float(ant.saldo if ant else 0)
+        elif clase in ("5", "6", "7"):
+            utilidad_actual -= safe_float(row.saldo)
+            utilidad_anterior -= safe_float(ant.saldo if ant else 0)
 
-    activo_corriente_total = total(activo_corriente, "saldo_actual")
-    activo_no_corriente_total = total(activo_no_corriente, "saldo_actual")
-    pasivo_corriente_total = total(pasivo_corriente, "saldo_actual")
-    pasivo_no_corriente_total = total(pasivo_no_corriente, "saldo_actual")
-    patrimonio_total = total(patrimonio, "saldo_actual")
+    activo_corriente = _ordenar_items(activo_corriente)
+    activo_no_corriente = _ordenar_items(activo_no_corriente)
+    pasivo_corriente = _ordenar_items(pasivo_corriente)
+    pasivo_no_corriente = _ordenar_items(pasivo_no_corriente)
+    patrimonio = _ordenar_items(patrimonio)
 
-    activos_totales = round(activo_corriente_total + activo_no_corriente_total, 2)
-    pasivos_totales = round(pasivo_corriente_total + pasivo_no_corriente_total, 2)
-    pasivo_mas_patrimonio = round(pasivos_totales + patrimonio_total, 2)
-    capital_trabajo = round(activo_corriente_total - pasivo_corriente_total, 2)
+    # Totales base antes de ajustes
+    activo_corriente_total = _total(activo_corriente, "saldo_actual")
+    activo_no_corriente_total = _total(activo_no_corriente, "saldo_actual")
+    pasivo_corriente_total = _total(pasivo_corriente, "saldo_actual")
+    pasivo_no_corriente_total = _total(pasivo_no_corriente, "saldo_actual")
+    patrimonio_total = _total(patrimonio, "saldo_actual")
 
-    razon_corriente = round(
+    activos_totales = redondear(activo_corriente_total + activo_no_corriente_total, 2)
+    pasivos_totales = redondear(pasivo_corriente_total + pasivo_no_corriente_total, 2)
+
+    cuadratura_original = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
+
+    # =========================================================
+    # Ajuste de patrimonio:
+    # 1) si existe utilidad calculada distinta de cero, se suma como línea
+    # 2) si aún no cuadra, se agrega ajuste final para cuadrar
+    # =========================================================
+    ajuste_patrimonio_aplicado_actual = 0.0
+    ajuste_patrimonio_aplicado_anterior = 0.0
+
+    if abs(utilidad_actual) >= 1 or abs(utilidad_anterior) >= 1:
+        patrimonio.append(
+            _crear_item_sintetico(
+                cuenta="39RESULTADO",
+                nombre="Resultado acumulado calculado desde cuentas 4,5,6,7",
+                seccion="PATRIMONIO",
+                grupo_balance="PATRIMONIO",
+                saldo_actual=utilidad_actual,
+                saldo_anterior=utilidad_anterior
+            )
+        )
+        ajuste_patrimonio_aplicado_actual += utilidad_actual
+        ajuste_patrimonio_aplicado_anterior += utilidad_anterior
+
+    patrimonio = _ordenar_items(patrimonio)
+    patrimonio_total = _total(patrimonio, "saldo_actual")
+
+    cuadratura_post_resultado = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
+
+    if abs(cuadratura_post_resultado) >= 1:
+        patrimonio.append(
+            _crear_item_sintetico(
+                cuenta="39AJUSTE",
+                nombre="Ajuste de patrimonio calculado para cuadratura",
+                seccion="PATRIMONIO",
+                grupo_balance="PATRIMONIO",
+                saldo_actual=cuadratura_post_resultado,
+                saldo_anterior=0
+            )
+        )
+        ajuste_patrimonio_aplicado_actual += cuadratura_post_resultado
+
+    patrimonio = _ordenar_items(patrimonio)
+
+    # Totales finales
+    patrimonio_total = _total(patrimonio, "saldo_actual")
+    pasivo_mas_patrimonio = redondear(pasivos_totales + patrimonio_total, 2)
+    capital_trabajo = redondear(activo_corriente_total - pasivo_corriente_total, 2)
+
+    razon_corriente = redondear(
         activo_corriente_total / pasivo_corriente_total, 2
-    ) if pasivo_corriente_total != 0 else 0
+    ) if abs(pasivo_corriente_total) > 0 else 0
 
-    nivel_endeudamiento_pct = round(
+    nivel_endeudamiento_pct = redondear(
         (pasivos_totales / activos_totales) * 100, 2
-    ) if activos_totales != 0 else 0
+    ) if abs(activos_totales) > 0 else 0
 
-    autonomia_financiera_pct = round(
+    autonomia_financiera_pct = redondear(
         (patrimonio_total / activos_totales) * 100, 2
-    ) if activos_totales != 0 else 0
+    ) if abs(activos_totales) > 0 else 0
 
-    cuadratura = round(activos_totales - pasivo_mas_patrimonio, 2)
+    cuadratura = redondear(activos_totales - pasivo_mas_patrimonio, 2)
 
-    narrativa = []
+    alertas = _armar_alertas(
+        activo_corriente,
+        activo_no_corriente,
+        pasivo_corriente,
+        pasivo_no_corriente,
+        patrimonio,
+        cuadratura_original
+    )
 
-    if cuadratura == 0:
-        narrativa.append("El balance cuadra correctamente.")
-    else:
-        narrativa.append("El balance no cuadra. Conviene revisar patrimonio o clasificación contable.")
-
-    if razon_corriente >= 1.5:
-        narrativa.append("La liquidez de corto plazo luce saludable.")
-    elif razon_corriente >= 1:
-        narrativa.append("La liquidez es aceptable, pero debe monitorearse.")
-    else:
-        narrativa.append("La liquidez de corto plazo es débil.")
-
-    if nivel_endeudamiento_pct <= 50:
-        narrativa.append("El endeudamiento está en una zona manejable.")
-    elif nivel_endeudamiento_pct <= 70:
-        narrativa.append("El endeudamiento es relevante y debe vigilarse.")
-    else:
-        narrativa.append("El endeudamiento es alto frente al total de activos.")
+    narrativa = _armar_narrativa(
+        activos_totales=activos_totales,
+        pasivos_totales=pasivos_totales,
+        patrimonio_total=patrimonio_total,
+        razon_corriente=razon_corriente,
+        nivel_endeudamiento_pct=nivel_endeudamiento_pct,
+        autonomia_financiera_pct=autonomia_financiera_pct,
+        cuadratura_original=cuadratura_original,
+        ajuste_patrimonio_aplicado=ajuste_patrimonio_aplicado_actual
+    )
 
     return {
         "ok": True,
@@ -285,10 +519,16 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             "razon_corriente": razon_corriente,
             "nivel_endeudamiento_pct": nivel_endeudamiento_pct,
             "autonomia_financiera_pct": autonomia_financiera_pct,
-            "cuadratura": cuadratura
+            "cuadratura": cuadratura,
+            "cuadratura_original": cuadratura_original,
+            "utilidad_calculada_actual": redondear(utilidad_actual, 2),
+            "utilidad_calculada_anterior": redondear(utilidad_anterior, 2),
+            "ajuste_patrimonio_aplicado_actual": redondear(ajuste_patrimonio_aplicado_actual, 2),
+            "ajuste_patrimonio_aplicado_anterior": redondear(ajuste_patrimonio_aplicado_anterior, 2)
         },
         "resumen": {
-            "narrativa": narrativa
+            "narrativa": narrativa,
+            "alertas": alertas
         },
         "balance": {
             "activo_corriente": activo_corriente,
