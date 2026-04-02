@@ -38,10 +38,6 @@ def ultimo_dia_mes_anterior(fecha_str):
 
 
 def normalizar_fecha_comparacion(fecha_str):
-    """
-    Si el usuario manda 2026-01-01 o 2026-01-15,
-    se normaliza al último día de ese mes: 2026-01-31.
-    """
     return ultimo_dia_del_mes(fecha_str)
 
 
@@ -65,7 +61,6 @@ def clasificar_cuenta(cuenta_codigo: str):
     seccion = "OTROS"
     grupo_balance = "OTROS"
 
-    # Activo
     if clase == "1":
         seccion = "ACTIVO"
         if grupo in ("11", "12", "13", "14"):
@@ -73,7 +68,6 @@ def clasificar_cuenta(cuenta_codigo: str):
         else:
             grupo_balance = "ACTIVO_NO_CORRIENTE"
 
-    # Pasivo
     elif clase == "2":
         seccion = "PASIVO"
         if grupo in ("21", "22", "23", "24", "25", "26", "27", "28"):
@@ -81,12 +75,10 @@ def clasificar_cuenta(cuenta_codigo: str):
         else:
             grupo_balance = "PASIVO_NO_CORRIENTE"
 
-    # Patrimonio
     elif clase == "3":
         seccion = "PATRIMONIO"
         grupo_balance = "PATRIMONIO"
 
-    # Resultado
     elif clase == "4":
         seccion = "INGRESOS"
         grupo_balance = "RESULTADO"
@@ -110,15 +102,10 @@ def clasificar_cuenta(cuenta_codigo: str):
 
 
 # =========================================================
-# Generación de snapshot acumulado por fecha de corte
+# Snapshot acumulado
 # =========================================================
 
 def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
-    """
-    Recalcula e inserta los saldos acumulados por cuenta
-    para un cliente y una fecha de corte.
-    """
-
     fecha_corte = ultimo_dia_del_mes(fecha_corte)
 
     sql = text("""
@@ -197,16 +184,40 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
     }
 
 
+def regenerar_snapshots_balance(idcliente: int, fecha_corte: str, comparar_con: str = None):
+    fecha_corte = ultimo_dia_del_mes(fecha_corte)
+    comparar_norm = normalizar_fecha_comparacion(comparar_con) if comparar_con else None
+
+    principal = regenerar_snapshot_saldos_corte(idcliente, fecha_corte)
+
+    comparativo = None
+    if comparar_norm and comparar_norm != fecha_corte:
+        comparativo = regenerar_snapshot_saldos_corte(idcliente, comparar_norm)
+
+    return {
+        "ok": True,
+        "idcliente": idcliente,
+        "fecha_corte": fecha_corte,
+        "comparar_con": comparar_norm,
+        "snapshot_principal": principal,
+        "snapshot_comparativo": comparativo
+    }
+
+
 # =========================================================
-# Helpers de armado del balance
+# Helpers armado balance
 # =========================================================
 
-def _crear_item_snapshot(row, row_ant=None):
+def _crear_item_snapshot(row, row_ant=None, modo_comparativo=True):
     saldo_actual = safe_float(row.saldo)
     saldo_anterior = safe_float(row_ant.saldo if row_ant else 0)
 
-    variacion_abs = redondear(saldo_actual - saldo_anterior, 2)
-    variacion_pct = redondear((variacion_abs / saldo_anterior) * 100, 2) if saldo_anterior != 0 else 0
+    variacion_abs = redondear(saldo_actual - saldo_anterior, 2) if modo_comparativo else 0
+    variacion_pct = (
+        redondear((variacion_abs / saldo_anterior) * 100, 2)
+        if modo_comparativo and saldo_anterior != 0
+        else 0
+    )
 
     return {
         "cuenta": row.cuenta_codigo,
@@ -215,15 +226,19 @@ def _crear_item_snapshot(row, row_ant=None):
         "seccion": row.seccion,
         "grupo_balance": row.grupo_balance,
         "saldo_actual": redondear(saldo_actual, 2),
-        "saldo_anterior": redondear(saldo_anterior, 2),
-        "variacion_abs": variacion_abs,
-        "variacion_pct": variacion_pct
+        "saldo_anterior": redondear(saldo_anterior, 2) if modo_comparativo else None,
+        "variacion_abs": variacion_abs if modo_comparativo else None,
+        "variacion_pct": variacion_pct if modo_comparativo else None
     }
 
 
-def _crear_item_sintetico(cuenta, nombre, seccion, grupo_balance, saldo_actual, saldo_anterior=0):
-    variacion_abs = redondear(saldo_actual - saldo_anterior, 2)
-    variacion_pct = redondear((variacion_abs / saldo_anterior) * 100, 2) if saldo_anterior != 0 else 0
+def _crear_item_sintetico(cuenta, nombre, seccion, grupo_balance, saldo_actual, saldo_anterior=0, modo_comparativo=True):
+    variacion_abs = redondear(saldo_actual - saldo_anterior, 2) if modo_comparativo else 0
+    variacion_pct = (
+        redondear((variacion_abs / saldo_anterior) * 100, 2)
+        if modo_comparativo and saldo_anterior != 0
+        else 0
+    )
 
     return {
         "cuenta": cuenta,
@@ -232,9 +247,9 @@ def _crear_item_sintetico(cuenta, nombre, seccion, grupo_balance, saldo_actual, 
         "seccion": seccion,
         "grupo_balance": grupo_balance,
         "saldo_actual": redondear(saldo_actual, 2),
-        "saldo_anterior": redondear(saldo_anterior, 2),
-        "variacion_abs": variacion_abs,
-        "variacion_pct": variacion_pct
+        "saldo_anterior": redondear(saldo_anterior, 2) if modo_comparativo else None,
+        "variacion_abs": variacion_abs if modo_comparativo else None,
+        "variacion_pct": variacion_pct if modo_comparativo else None
     }
 
 
@@ -256,27 +271,23 @@ def _armar_alertas(
 ):
     alertas = []
 
-    # activos con saldo negativo
     for item in activo_corriente + activo_no_corriente:
         if safe_float(item["saldo_actual"]) < 0:
             alertas.append(
                 f"La cuenta de activo {item['cuenta']} - {item['nombre']} tiene saldo negativo y conviene revisarla."
             )
 
-    # pasivos con saldo negativo
     for item in pasivo_corriente + pasivo_no_corriente:
         if safe_float(item["saldo_actual"]) < 0:
             alertas.append(
                 f"La cuenta de pasivo {item['cuenta']} - {item['nombre']} tiene saldo negativo y conviene revisarla."
             )
 
-    # patrimonio vacío o cero
     if len(patrimonio) == 0 or abs(_total(patrimonio, "saldo_actual")) < 1:
         alertas.append(
             "No se encontró patrimonio contable explícito en clase 3; se agregó una línea de ajuste para cuadrar el balance."
         )
 
-    # balance no cuadra
     if abs(cuadratura) >= 1:
         alertas.append(
             "El balance no cuadraba de forma natural con las cuentas clasificadas, por eso se generó un ajuste de patrimonio calculado."
@@ -286,14 +297,13 @@ def _armar_alertas(
 
 
 def _armar_narrativa(
-    activos_totales,
-    pasivos_totales,
     patrimonio_total,
     razon_corriente,
     nivel_endeudamiento_pct,
     autonomia_financiera_pct,
     cuadratura_original,
-    ajuste_patrimonio_aplicado
+    ajuste_patrimonio_aplicado,
+    modo_comparativo
 ):
     narrativa = []
 
@@ -333,6 +343,9 @@ def _armar_narrativa(
     if abs(ajuste_patrimonio_aplicado) >= 1:
         narrativa.append("Conviene revisar si el auxiliar incluye todas las cuentas de patrimonio o si falta reclasificación contable de cierre.")
 
+    if not modo_comparativo:
+        narrativa.append("Este balance se está mostrando en modo simple, sin comparación contra otro corte.")
+
     return narrativa
 
 
@@ -343,19 +356,12 @@ def _armar_narrativa(
 def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: str = None):
     fecha_corte = ultimo_dia_del_mes(fecha_corte)
 
-    if comparar_con:
-        comparar_con = normalizar_fecha_comparacion(comparar_con)
-    else:
-        comparar_con = ultimo_dia_mes_anterior(fecha_corte)
+    modo_comparativo = bool(comparar_con)
+    comparar_con_norm = normalizar_fecha_comparacion(comparar_con) if comparar_con else None
 
     actuales = AuxiliarSaldosCorte.query.filter_by(
         idcliente=idcliente,
         fecha_corte=fecha_corte
-    ).all()
-
-    anteriores = AuxiliarSaldosCorte.query.filter_by(
-        idcliente=idcliente,
-        fecha_corte=comparar_con
     ).all()
 
     if not actuales:
@@ -363,6 +369,16 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             "ok": False,
             "error": "No existe snapshot para la fecha_corte solicitada. Debes regenerarlo primero."
         }
+
+    anteriores = []
+    snapshot_comparativo_existe = False
+
+    if comparar_con_norm:
+        anteriores = AuxiliarSaldosCorte.query.filter_by(
+            idcliente=idcliente,
+            fecha_corte=comparar_con_norm
+        ).all()
+        snapshot_comparativo_existe = len(anteriores) > 0
 
     map_ant = {x.cuenta_codigo: x for x in anteriores}
 
@@ -372,13 +388,12 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     pasivo_no_corriente = []
     patrimonio = []
 
-    # resultado del ejercicio / acumulado calculado desde clases 4,5,6,7
     utilidad_actual = 0.0
     utilidad_anterior = 0.0
 
     for row in actuales:
-        ant = map_ant.get(row.cuenta_codigo)
-        item = _crear_item_snapshot(row, ant)
+        ant = map_ant.get(row.cuenta_codigo) if modo_comparativo and snapshot_comparativo_existe else None
+        item = _crear_item_snapshot(row, ant, modo_comparativo=modo_comparativo and snapshot_comparativo_existe)
 
         clase = str(row.clase or "")[:1]
 
@@ -393,7 +408,6 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         elif row.grupo_balance == "PATRIMONIO":
             patrimonio.append(item)
 
-        # cálculo de utilidad usando cuentas de resultado
         if clase == "4":
             utilidad_actual += safe_float(row.saldo)
             utilidad_anterior += safe_float(ant.saldo if ant else 0)
@@ -407,7 +421,6 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     pasivo_no_corriente = _ordenar_items(pasivo_no_corriente)
     patrimonio = _ordenar_items(patrimonio)
 
-    # Totales base antes de ajustes
     activo_corriente_total = _total(activo_corriente, "saldo_actual")
     activo_no_corriente_total = _total(activo_no_corriente, "saldo_actual")
     pasivo_corriente_total = _total(pasivo_corriente, "saldo_actual")
@@ -419,11 +432,6 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
     cuadratura_original = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
 
-    # =========================================================
-    # Ajuste de patrimonio:
-    # 1) si existe utilidad calculada distinta de cero, se suma como línea
-    # 2) si aún no cuadra, se agrega ajuste final para cuadrar
-    # =========================================================
     ajuste_patrimonio_aplicado_actual = 0.0
     ajuste_patrimonio_aplicado_anterior = 0.0
 
@@ -435,7 +443,8 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
                 seccion="PATRIMONIO",
                 grupo_balance="PATRIMONIO",
                 saldo_actual=utilidad_actual,
-                saldo_anterior=utilidad_anterior
+                saldo_anterior=utilidad_anterior,
+                modo_comparativo=modo_comparativo and snapshot_comparativo_existe
             )
         )
         ajuste_patrimonio_aplicado_actual += utilidad_actual
@@ -454,14 +463,14 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
                 seccion="PATRIMONIO",
                 grupo_balance="PATRIMONIO",
                 saldo_actual=cuadratura_post_resultado,
-                saldo_anterior=0
+                saldo_anterior=0,
+                modo_comparativo=modo_comparativo and snapshot_comparativo_existe
             )
         )
         ajuste_patrimonio_aplicado_actual += cuadratura_post_resultado
 
     patrimonio = _ordenar_items(patrimonio)
 
-    # Totales finales
     patrimonio_total = _total(patrimonio, "saldo_actual")
     pasivo_mas_patrimonio = redondear(pasivos_totales + patrimonio_total, 2)
     capital_trabajo = redondear(activo_corriente_total - pasivo_corriente_total, 2)
@@ -489,22 +498,35 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         cuadratura_original
     )
 
+    if modo_comparativo and comparar_con_norm and not snapshot_comparativo_existe:
+        alertas.append(
+            f"No existe snapshot del corte comparativo {comparar_con_norm}. Se está mostrando solo el balance del corte principal."
+        )
+
     narrativa = _armar_narrativa(
-        activos_totales=activos_totales,
-        pasivos_totales=pasivos_totales,
         patrimonio_total=patrimonio_total,
         razon_corriente=razon_corriente,
         nivel_endeudamiento_pct=nivel_endeudamiento_pct,
         autonomia_financiera_pct=autonomia_financiera_pct,
         cuadratura_original=cuadratura_original,
-        ajuste_patrimonio_aplicado=ajuste_patrimonio_aplicado_actual
+        ajuste_patrimonio_aplicado=ajuste_patrimonio_aplicado_actual,
+        modo_comparativo=modo_comparativo and snapshot_comparativo_existe
     )
 
     return {
         "ok": True,
         "fechas": {
             "fecha_corte": fecha_corte,
-            "comparar_con": comparar_con
+            "comparar_con": comparar_con_norm
+        },
+        "meta": {
+            "modo_comparativo": bool(modo_comparativo and snapshot_comparativo_existe),
+            "comparacion_solicitada": bool(comparar_con),
+            "snapshot_comparativo_existe": snapshot_comparativo_existe,
+            "explicacion_filtros": {
+                "fecha_corte": "Muestra la situación financiera acumulada hasta esa fecha.",
+                "comparar_con": "Permite comparar contra otro corte para analizar variaciones. Se recomienda usar cierres de mes."
+            }
         },
         "kpis": {
             "activo_corriente": activo_corriente_total,
@@ -522,9 +544,9 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             "cuadratura": cuadratura,
             "cuadratura_original": cuadratura_original,
             "utilidad_calculada_actual": redondear(utilidad_actual, 2),
-            "utilidad_calculada_anterior": redondear(utilidad_anterior, 2),
+            "utilidad_calculada_anterior": redondear(utilidad_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None,
             "ajuste_patrimonio_aplicado_actual": redondear(ajuste_patrimonio_aplicado_actual, 2),
-            "ajuste_patrimonio_aplicado_anterior": redondear(ajuste_patrimonio_aplicado_anterior, 2)
+            "ajuste_patrimonio_aplicado_anterior": redondear(ajuste_patrimonio_aplicado_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None
         },
         "resumen": {
             "narrativa": narrativa,

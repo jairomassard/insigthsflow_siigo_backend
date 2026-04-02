@@ -65,8 +65,7 @@ import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
 
-from balance import regenerar_snapshot_saldos_corte, construir_balance_general
-
+from balance import regenerar_snapshots_balance, construir_balance_general
 
 
 HEADER_MAP = {
@@ -7960,16 +7959,18 @@ def create_app():
         data = request.get_json(silent=True) or {}
 
         fecha_corte = data.get("fecha_corte")
+        comparar_con = data.get("comparar_con")
+
         if not fecha_corte:
             return jsonify({"error": "Debes enviar fecha_corte"}), 400
 
         try:
-            result = regenerar_snapshot_saldos_corte(idcliente, fecha_corte)
+            result = regenerar_snapshots_balance(idcliente, fecha_corte, comparar_con)
             return jsonify(result), 200
         except Exception as e:
             db.session.rollback()
             return jsonify({
-                "error": "No fue posible regenerar el snapshot del balance",
+                "error": "No fue posible regenerar los snapshots del balance",
                 "detalle": str(e)
             }), 500
 
@@ -8000,7 +8001,6 @@ def create_app():
                 "error": "No fue posible consultar el balance general",
                 "detalle": str(e)
             }), 500
-
 
     # NO TOCAR DE AQEUI PARA ABAJO
     # --- Registrar rutas de permisos ---
