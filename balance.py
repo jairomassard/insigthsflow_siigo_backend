@@ -494,17 +494,19 @@ def _agrupar_alertas(alertas_dict):
 
 def _armar_alertas(
     activo_corriente,
-    activo_no_corriente,
+    activo_no_corriente_bruto,
+    activo_no_corriente_contra,
     pasivo_corriente,
     pasivo_no_corriente,
-    patrimonio,
+    patrimonio_explicito,
+    patrimonio_calculado,
     cuadratura_original,
     patrimonio_explicito_total,
     ajuste_patrimonio_aplicado_actual
 ):
     alertas = []
 
-    for item in activo_corriente + activo_no_corriente:
+    for item in activo_corriente + activo_no_corriente_bruto + activo_no_corriente_contra:
         alerta = _clasificar_alerta_item(item, "ACTIVO")
         if alerta:
             alertas.append(alerta)
@@ -537,6 +539,9 @@ def _armar_narrativa(
     patrimonio_total,
     patrimonio_explicito_total,
     patrimonio_calculado_total,
+    activo_no_corriente_bruto_total,
+    activo_no_corriente_contra_total,
+    activo_no_corriente_neto_total,
     razon_corriente,
     nivel_endeudamiento_pct,
     autonomia_financiera_pct,
@@ -560,6 +565,11 @@ def _armar_narrativa(
 
     if abs(patrimonio_explicito_total) < 1 and abs(patrimonio_calculado_total) >= 1:
         narrativa.append("El patrimonio visible proviene principalmente del resultado acumulado calculado desde las cuentas de ingresos, costos y gastos.")
+
+    if abs(activo_no_corriente_contra_total) >= 1:
+        narrativa.append(
+            f"El activo no corriente se está presentando en forma neta: base por {redondear(activo_no_corriente_bruto_total, 2)} y depreciaciones/ajustes acumulados por {redondear(activo_no_corriente_contra_total, 2)}."
+        )
 
     if razon_corriente >= 1.5:
         narrativa.append("La liquidez de corto plazo luce saludable.")
@@ -625,10 +635,12 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     map_ant = {x.cuenta_codigo: x for x in anteriores}
 
     activo_corriente = []
-    activo_no_corriente = []
+    activo_no_corriente_bruto = []
+    activo_no_corriente_contra = []
     pasivo_corriente = []
     pasivo_no_corriente = []
-    patrimonio = []
+    patrimonio_explicito = []
+    patrimonio_calculado = []
 
     utilidad_actual = 0.0
     utilidad_anterior = 0.0
@@ -644,14 +656,21 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
         if row.grupo_balance == "ACTIVO_CORRIENTE":
             activo_corriente.append(item)
+
         elif row.grupo_balance == "ACTIVO_NO_CORRIENTE":
-            activo_no_corriente.append(item)
+            if es_cuenta_contra_activo(row.cuenta_codigo, row.cuenta_nombre):
+                activo_no_corriente_contra.append(item)
+            else:
+                activo_no_corriente_bruto.append(item)
+
         elif row.grupo_balance == "PASIVO_CORRIENTE":
             pasivo_corriente.append(item)
+
         elif row.grupo_balance == "PASIVO_NO_CORRIENTE":
             pasivo_no_corriente.append(item)
+
         elif row.grupo_balance == "PATRIMONIO":
-            patrimonio.append(item)
+            patrimonio_explicito.append(item)
             patrimonio_explicito_actual += safe_float(row.saldo)
             patrimonio_explicito_anterior += safe_float(ant.saldo if ant else 0)
 
@@ -663,21 +682,26 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             utilidad_anterior -= safe_float(ant.saldo if ant else 0)
 
     activo_corriente = _ordenar_items(activo_corriente)
-    activo_no_corriente = _ordenar_items(activo_no_corriente)
+    activo_no_corriente_bruto = _ordenar_items(activo_no_corriente_bruto)
+    activo_no_corriente_contra = _ordenar_items(activo_no_corriente_contra)
     pasivo_corriente = _ordenar_items(pasivo_corriente)
     pasivo_no_corriente = _ordenar_items(pasivo_no_corriente)
-    patrimonio = _ordenar_items(patrimonio)
+    patrimonio_explicito = _ordenar_items(patrimonio_explicito)
 
     activo_corriente_total = _total(activo_corriente, "saldo_actual")
-    activo_no_corriente_total = _total(activo_no_corriente, "saldo_actual")
+    activo_no_corriente_bruto_total = _total(activo_no_corriente_bruto, "saldo_actual")
+    activo_no_corriente_contra_total = _total(activo_no_corriente_contra, "saldo_actual")
+    activo_no_corriente_total = redondear(activo_no_corriente_bruto_total + activo_no_corriente_contra_total, 2)
+
     pasivo_corriente_total = _total(pasivo_corriente, "saldo_actual")
     pasivo_no_corriente_total = _total(pasivo_no_corriente, "saldo_actual")
-    patrimonio_total = _total(patrimonio, "saldo_actual")
+
+    patrimonio_explicito_total = _total(patrimonio_explicito, "saldo_actual")
 
     activos_totales = redondear(activo_corriente_total + activo_no_corriente_total, 2)
     pasivos_totales = redondear(pasivo_corriente_total + pasivo_no_corriente_total, 2)
 
-    cuadratura_original = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
+    cuadratura_original = redondear(activos_totales - (pasivos_totales + patrimonio_explicito_total), 2)
 
     ajuste_patrimonio_aplicado_actual = 0.0
     ajuste_patrimonio_aplicado_anterior = 0.0
@@ -685,45 +709,45 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     patrimonio_calculado_total_anterior = 0.0
 
     if abs(utilidad_actual) >= 1 or abs(utilidad_anterior) >= 1:
-        patrimonio.append(
-            _crear_item_sintetico(
-                cuenta="39RESULTADO",
-                nombre="Resultado acumulado calculado desde cuentas 4,5,6,7",
-                seccion="PATRIMONIO",
-                grupo_balance="PATRIMONIO",
-                saldo_actual=utilidad_actual,
-                saldo_anterior=utilidad_anterior,
-                modo_comparativo=modo_comparativo and snapshot_comparativo_existe
-            )
+        item_resultado = _crear_item_sintetico(
+            cuenta="39RESULTADO",
+            nombre="Resultado acumulado calculado desde cuentas 4,5,6,7",
+            seccion="PATRIMONIO",
+            grupo_balance="PATRIMONIO",
+            saldo_actual=utilidad_actual,
+            saldo_anterior=utilidad_anterior,
+            modo_comparativo=modo_comparativo and snapshot_comparativo_existe
         )
+        patrimonio_calculado.append(item_resultado)
         ajuste_patrimonio_aplicado_actual += utilidad_actual
         ajuste_patrimonio_aplicado_anterior += utilidad_anterior
         patrimonio_calculado_total_actual += utilidad_actual
         patrimonio_calculado_total_anterior += utilidad_anterior
 
-    patrimonio = _ordenar_items(patrimonio)
-    patrimonio_total = _total(patrimonio, "saldo_actual")
-
-    cuadratura_post_resultado = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
+    patrimonio_total_temporal = redondear(patrimonio_explicito_total + patrimonio_calculado_total_actual, 2)
+    cuadratura_post_resultado = redondear(activos_totales - (pasivos_totales + patrimonio_total_temporal), 2)
 
     if abs(cuadratura_post_resultado) >= 1:
-        patrimonio.append(
-            _crear_item_sintetico(
-                cuenta="39AJUSTE",
-                nombre="Ajuste de patrimonio calculado para cuadratura",
-                seccion="PATRIMONIO",
-                grupo_balance="PATRIMONIO",
-                saldo_actual=cuadratura_post_resultado,
-                saldo_anterior=0,
-                modo_comparativo=modo_comparativo and snapshot_comparativo_existe
-            )
+        item_ajuste = _crear_item_sintetico(
+            cuenta="39AJUSTE",
+            nombre="Ajuste de patrimonio calculado para cuadratura",
+            seccion="PATRIMONIO",
+            grupo_balance="PATRIMONIO",
+            saldo_actual=cuadratura_post_resultado,
+            saldo_anterior=0,
+            modo_comparativo=modo_comparativo and snapshot_comparativo_existe
         )
+        patrimonio_calculado.append(item_ajuste)
         ajuste_patrimonio_aplicado_actual += cuadratura_post_resultado
         patrimonio_calculado_total_actual += cuadratura_post_resultado
 
-    patrimonio = _ordenar_items(patrimonio)
+    patrimonio_calculado = _ordenar_items(patrimonio_calculado)
 
-    patrimonio_total = _total(patrimonio, "saldo_actual")
+    patrimonio_calculado_total = _total(patrimonio_calculado, "saldo_actual")
+    patrimonio_total = redondear(patrimonio_explicito_total + patrimonio_calculado_total, 2)
+
+    patrimonio_total_items = _ordenar_items(patrimonio_explicito + patrimonio_calculado)
+
     pasivo_mas_patrimonio = redondear(pasivos_totales + patrimonio_total, 2)
     capital_trabajo = redondear(activo_corriente_total - pasivo_corriente_total, 2)
 
@@ -743,10 +767,12 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
     alertas_dict = _armar_alertas(
         activo_corriente,
-        activo_no_corriente,
+        activo_no_corriente_bruto,
+        activo_no_corriente_contra,
         pasivo_corriente,
         pasivo_no_corriente,
-        patrimonio,
+        patrimonio_explicito,
+        patrimonio_calculado,
         cuadratura_original,
         patrimonio_explicito_actual,
         ajuste_patrimonio_aplicado_actual
@@ -765,6 +791,9 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         patrimonio_total=patrimonio_total,
         patrimonio_explicito_total=patrimonio_explicito_actual,
         patrimonio_calculado_total=patrimonio_calculado_total_actual,
+        activo_no_corriente_bruto_total=activo_no_corriente_bruto_total,
+        activo_no_corriente_contra_total=activo_no_corriente_contra_total,
+        activo_no_corriente_neto_total=activo_no_corriente_total,
         razon_corriente=razon_corriente,
         nivel_endeudamiento_pct=nivel_endeudamiento_pct,
         autonomia_financiera_pct=autonomia_financiera_pct,
@@ -790,18 +819,28 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
                 "comparar_con": "Permite comparar contra otro corte para analizar variaciones. Se recomienda usar cierres de mes."
             },
             "patrimonio": {
-                "patrimonio_explicito_total": redondear(patrimonio_explicito_actual, 2),
-                "patrimonio_calculado_total": redondear(patrimonio_calculado_total_actual, 2),
-                "usa_patrimonio_calculado": abs(patrimonio_calculado_total_actual) >= 1
+                "patrimonio_explicito_total": redondear(patrimonio_explicito_total, 2),
+                "patrimonio_calculado_total": redondear(patrimonio_calculado_total, 2),
+                "patrimonio_total": redondear(patrimonio_total, 2),
+                "usa_patrimonio_calculado": abs(patrimonio_calculado_total) >= 1
+            },
+            "activo_no_corriente": {
+                "bruto_total": redondear(activo_no_corriente_bruto_total, 2),
+                "contra_total": redondear(activo_no_corriente_contra_total, 2),
+                "neto_total": redondear(activo_no_corriente_total, 2)
             }
         },
         "kpis": {
             "activo_corriente": activo_corriente_total,
             "activo_no_corriente": activo_no_corriente_total,
+            "activo_no_corriente_bruto": activo_no_corriente_bruto_total,
+            "activo_no_corriente_contra": activo_no_corriente_contra_total,
             "activos_totales": activos_totales,
             "pasivo_corriente": pasivo_corriente_total,
             "pasivo_no_corriente": pasivo_no_corriente_total,
             "pasivos_totales": pasivos_totales,
+            "patrimonio_explicito_total": patrimonio_explicito_total,
+            "patrimonio_calculado_total": patrimonio_calculado_total,
             "patrimonio_total": patrimonio_total,
             "pasivo_mas_patrimonio": pasivo_mas_patrimonio,
             "capital_trabajo": capital_trabajo,
@@ -823,9 +862,13 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         },
         "balance": {
             "activo_corriente": activo_corriente,
-            "activo_no_corriente": activo_no_corriente,
+            "activo_no_corriente_bruto": activo_no_corriente_bruto,
+            "activo_no_corriente_contra": activo_no_corriente_contra,
+            "activo_no_corriente": _ordenar_items(activo_no_corriente_bruto + activo_no_corriente_contra),
             "pasivo_corriente": pasivo_corriente,
             "pasivo_no_corriente": pasivo_no_corriente,
-            "patrimonio": patrimonio
+            "patrimonio_explicito": patrimonio_explicito,
+            "patrimonio_calculado": patrimonio_calculado,
+            "patrimonio": patrimonio_total_items
         }
     }
