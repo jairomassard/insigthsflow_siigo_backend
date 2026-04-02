@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
+from collections import defaultdict
 from sqlalchemy import text
 
 from models import db, AuxiliarSaldosCorte
@@ -49,7 +50,6 @@ def es_cuenta_contra_activo(cuenta_codigo: str, nombre: str = ""):
     codigo = str(cuenta_codigo or "").strip()
     nombre_l = str(nombre or "").strip().lower()
 
-    # Depreciaciones/amortizaciones acumuladas y devoluciones/ajustes
     if codigo.startswith(("1592", "1596", "1698", "1798")):
         return True
 
@@ -69,7 +69,6 @@ def es_cuenta_contra_pasivo(cuenta_codigo: str, nombre: str = ""):
     if "devolución" in nombre_l or "devolucion" in nombre_l:
         return True
 
-    # muchas subcuentas de impuestos/retenciones pueden moverse con signo contrario
     if codigo.startswith(("236", "240", "250", "251")):
         if "devol" in nombre_l or "descontable" in nombre_l:
             return True
@@ -96,8 +95,8 @@ def es_cuenta_transitoria_o_legalizacion(cuenta_codigo: str, nombre: str = ""):
     return (
         "legalizar" in nombre_l
         or "anticip" in nombre_l
-        or "otros" == nombre_l
-        or "otros " in nombre_l
+        or nombre_l == "otros"
+        or nombre_l.startswith("otros ")
     )
 
 
@@ -329,51 +328,168 @@ def _clasificar_alerta_item(item, seccion):
     if saldo >= 0:
         return None
 
-    # Activos
     if seccion == "ACTIVO":
         if es_cuenta_contra_activo(cuenta, nombre):
             return {
                 "nivel": "info",
-                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo y parece corresponder a una cuenta contra o de ajuste."
+                "categoria": "activo_contra_o_ajuste",
+                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo y parece corresponder a una cuenta contra o de ajuste.",
+                "cuenta": cuenta,
+                "nombre": nombre,
+                "saldo": redondear(saldo, 2),
             }
 
         if es_cuenta_impuesto_o_retencion(cuenta, nombre):
             return {
                 "nivel": "info",
-                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a devolución, compensación o cruce tributario."
+                "categoria": "activo_impuesto_retencion_negativo",
+                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a devolución, compensación o cruce tributario.",
+                "cuenta": cuenta,
+                "nombre": nombre,
+                "saldo": redondear(saldo, 2),
             }
 
         if es_cuenta_transitoria_o_legalizacion(cuenta, nombre):
             return {
                 "nivel": "warning",
-                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; conviene revisar su legalización o reclasificación."
+                "categoria": "activo_transitorio_negativo",
+                "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; conviene revisar su legalización o reclasificación.",
+                "cuenta": cuenta,
+                "nombre": nombre,
+                "saldo": redondear(saldo, 2),
             }
 
         return {
             "nivel": "warning",
-            "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; revisar si su naturaleza contable o presentación es correcta."
+            "categoria": "activo_negativo_otro",
+            "mensaje": f"La cuenta de activo {cuenta} - {nombre} presenta saldo negativo; revisar si su naturaleza contable o presentación es correcta.",
+            "cuenta": cuenta,
+            "nombre": nombre,
+            "saldo": redondear(saldo, 2),
         }
 
-    # Pasivos
     if seccion == "PASIVO":
         if es_cuenta_contra_pasivo(cuenta, nombre):
             return {
                 "nivel": "info",
-                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo y podría corresponder a devolución, compensación o cuenta contra."
+                "categoria": "pasivo_contra_o_compensacion",
+                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo y podría corresponder a devolución, compensación o cuenta contra.",
+                "cuenta": cuenta,
+                "nombre": nombre,
+                "saldo": redondear(saldo, 2),
             }
 
         if es_cuenta_impuesto_o_retencion(cuenta, nombre):
             return {
                 "nivel": "info",
-                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a IVA descontable, devolución o compensación tributaria."
+                "categoria": "pasivo_impuesto_retencion_negativo",
+                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a IVA descontable, devolución o compensación tributaria.",
+                "cuenta": cuenta,
+                "nombre": nombre,
+                "saldo": redondear(saldo, 2),
             }
 
         return {
             "nivel": "warning",
-            "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; revisar si corresponde a la naturaleza esperada de la cuenta."
+            "categoria": "pasivo_negativo_otro",
+            "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; revisar si corresponde a la naturaleza esperada de la cuenta.",
+            "cuenta": cuenta,
+            "nombre": nombre,
+            "saldo": redondear(saldo, 2),
         }
 
     return None
+
+
+def _label_categoria_alerta(categoria: str):
+    labels = {
+        "activo_contra_o_ajuste": "Cuentas de activo que parecen contra cuenta o ajuste",
+        "activo_impuesto_retencion_negativo": "Activos tributarios/retenciones con saldo negativo",
+        "activo_transitorio_negativo": "Activos transitorios o por legalizar con saldo negativo",
+        "activo_negativo_otro": "Activos con saldo negativo a revisar",
+        "pasivo_contra_o_compensacion": "Pasivos que parecen devolución, compensación o cuenta contra",
+        "pasivo_impuesto_retencion_negativo": "Pasivos tributarios/retenciones con saldo negativo",
+        "pasivo_negativo_otro": "Pasivos con saldo negativo a revisar",
+        "patrimonio_sin_clase_3": "Patrimonio explícito no identificado",
+        "ajuste_cuadratura": "Ajuste automático de cuadratura",
+        "snapshot_comparativo_faltante": "Snapshot comparativo faltante",
+    }
+    return labels.get(categoria, categoria)
+
+
+def _formatear_muestra_cuentas(items, max_items=6):
+    if not items:
+        return ""
+
+    partes = []
+    for item in items[:max_items]:
+        cuenta = str(item.get("cuenta", ""))
+        nombre = str(item.get("nombre", ""))
+        partes.append(f"{cuenta} {nombre}")
+
+    texto = "; ".join(partes)
+    restante = len(items) - max_items
+    if restante > 0:
+        texto += f"; y {restante} más"
+
+    return texto
+
+
+def _agrupar_alertas(alertas_dict):
+    grupos = defaultdict(list)
+    for alerta in alertas_dict:
+        categoria = alerta.get("categoria", "otros")
+        grupos[categoria].append(alerta)
+
+    alertas_resumen = []
+    alertas_grupo = []
+
+    orden = [
+        "activo_transitorio_negativo",
+        "activo_contra_o_ajuste",
+        "activo_impuesto_retencion_negativo",
+        "activo_negativo_otro",
+        "pasivo_contra_o_compensacion",
+        "pasivo_impuesto_retencion_negativo",
+        "pasivo_negativo_otro",
+        "patrimonio_sin_clase_3",
+        "ajuste_cuadratura",
+        "snapshot_comparativo_faltante",
+    ]
+
+    categorias = [c for c in orden if c in grupos] + [c for c in grupos if c not in orden]
+
+    for categoria in categorias:
+        items = grupos[categoria]
+        titulo = _label_categoria_alerta(categoria)
+
+        if categoria in ("patrimonio_sin_clase_3", "ajuste_cuadratura", "snapshot_comparativo_faltante"):
+            principal = items[0].get("mensaje", titulo)
+            alertas_resumen.append(principal)
+            alertas_grupo.append({
+                "categoria": categoria,
+                "titulo": titulo,
+                "cantidad": len(items),
+                "mensajes": [x.get("mensaje") for x in items],
+                "items": items,
+            })
+            continue
+
+        muestra = _formatear_muestra_cuentas(items, max_items=6)
+        mensaje_resumen = f"{titulo}: {len(items)} cuenta(s)."
+        if muestra:
+            mensaje_resumen += f" Ejemplos: {muestra}."
+
+        alertas_resumen.append(mensaje_resumen)
+        alertas_grupo.append({
+            "categoria": categoria,
+            "titulo": titulo,
+            "cantidad": len(items),
+            "mensajes": [x.get("mensaje") for x in items],
+            "items": items,
+        })
+
+    return alertas_resumen, alertas_grupo
 
 
 def _armar_alertas(
@@ -388,7 +504,6 @@ def _armar_alertas(
 ):
     alertas = []
 
-    # Alertas por signos en activos y pasivos
     for item in activo_corriente + activo_no_corriente:
         alerta = _clasificar_alerta_item(item, "ACTIVO")
         if alerta:
@@ -399,17 +514,17 @@ def _armar_alertas(
         if alerta:
             alertas.append(alerta)
 
-    # Patrimonio explícito ausente
     if abs(patrimonio_explicito_total) < 1:
         alertas.append({
             "nivel": "warning",
+            "categoria": "patrimonio_sin_clase_3",
             "mensaje": "No se identificaron cuentas explícitas de patrimonio clase 3 en el snapshot; el sistema completó el patrimonio con resultado calculado."
         })
 
-    # Ajuste final de cuadratura
     if abs(ajuste_patrimonio_aplicado_actual) >= 1 and abs(cuadratura_original) >= 1:
         alertas.append({
             "nivel": "warning",
+            "categoria": "ajuste_cuadratura",
             "mensaje": "El balance no cuadraba de forma natural con las cuentas clasificadas, por eso se generó un ajuste de patrimonio calculado."
         })
 
@@ -569,7 +684,6 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     patrimonio_calculado_total_actual = 0.0
     patrimonio_calculado_total_anterior = 0.0
 
-    # Resultado calculado
     if abs(utilidad_actual) >= 1 or abs(utilidad_anterior) >= 1:
         patrimonio.append(
             _crear_item_sintetico(
@@ -592,7 +706,6 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
     cuadratura_post_resultado = redondear(activos_totales - (pasivos_totales + patrimonio_total), 2)
 
-    # Ajuste final si aún no cuadra
     if abs(cuadratura_post_resultado) >= 1:
         patrimonio.append(
             _crear_item_sintetico(
@@ -642,6 +755,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     if modo_comparativo and comparar_con_norm and not snapshot_comparativo_existe:
         alertas_dict.append({
             "nivel": "warning",
+            "categoria": "snapshot_comparativo_faltante",
             "mensaje": f"No existe snapshot del corte comparativo {comparar_con_norm}. Se está mostrando solo el balance del corte principal."
         })
 
@@ -659,8 +773,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         modo_comparativo=modo_comparativo and snapshot_comparativo_existe
     )
 
-    # compatibilidad con tu frontend actual: array de strings
-    alertas_texto = [a["mensaje"] for a in alertas_dict]
+    alertas_texto, alertas_grupo = _agrupar_alertas(alertas_dict)
 
     return {
         "ok": True,
@@ -705,7 +818,8 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         "resumen": {
             "narrativa": narrativa,
             "alertas": alertas_texto,
-            "alertas_detalle": alertas_dict
+            "alertas_detalle": alertas_grupo,
+            "alertas_detalle_raw": alertas_dict
         },
         "balance": {
             "activo_corriente": activo_corriente,
