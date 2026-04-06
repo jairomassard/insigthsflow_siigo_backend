@@ -7259,30 +7259,28 @@ def create_app():
 
         # 1) EVOLUCIÓN MENSUAL
         # - retefuente: todo 2365%
-        # - reteica_conceptos: solo conceptos operativos de ICA (236805%)
-        # - ica_por_pagar: cuenta de pasivo / saldo por pagar (236898%)
-        # - reteica_neto: todo 2368% para ver el neto real del bloque ICA
+        # - reteica_conceptos: solo ICA operativo del período (236805%)
+        # - 236898 NO participa en KPIs ni neteos del período
         sql_evolucion = text("""
             SELECT
                 periodo_anio,
                 periodo_mes,
                 SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
-                SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos,
-                SUM(CASE WHEN cuenta_codigo = '236898' THEN (credito - debito) ELSE 0 END) AS ica_por_pagar,
-                SUM(CASE WHEN cuenta_codigo LIKE '2368%' THEN (credito - debito) ELSE 0 END) AS reteica_neto
+                SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
             FROM auxiliar_contable
             WHERE idcliente = :idc
             AND fecha_contable BETWEEN :d AND :h
             AND (
                     cuenta_codigo LIKE '2365%'
-                    OR cuenta_codigo LIKE '2368%'
+                    OR cuenta_codigo LIKE '236805%'
                 )
             GROUP BY periodo_anio, periodo_mes
             ORDER BY periodo_anio, periodo_mes
         """)
 
         # 2) COMPOSICIÓN DETALLADA POR CUENTA REAL
-        # Ya NO agrupamos por LEFT(cuenta_codigo, 6), sino por cuenta exacta.
+        # Ya NO agrupamos por LEFT(cuenta_codigo, 6)
+        # y no incluimos 236898 en la composición principal
         sql_composicion = text("""
             SELECT
                 cuenta_codigo AS cuenta,
@@ -7290,8 +7288,6 @@ def create_app():
                 CASE
                     WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente'
                     WHEN cuenta_codigo LIKE '236805%' THEN 'ReteICA'
-                    WHEN cuenta_codigo = '236898' THEN 'ICA_POR_PAGAR'
-                    WHEN cuenta_codigo LIKE '2368%' THEN 'ReteICA_Otros'
                     ELSE 'Otros'
                 END AS tipo,
                 SUM(credito - debito) AS valor
@@ -7300,15 +7296,15 @@ def create_app():
             AND fecha_contable BETWEEN :d AND :h
             AND (
                     cuenta_codigo LIKE '2365%'
-                    OR cuenta_codigo LIKE '2368%'
+                    OR cuenta_codigo LIKE '236805%'
                 )
             GROUP BY cuenta_codigo, cuenta_nombre
             HAVING SUM(credito - debito) <> 0
             ORDER BY SUM(credito - debito) DESC
         """)
 
-        # 3) DETALLE MENSUAL SOLO DE ICA, POR SUBCUENTA
-        # Para que el frontend pueda mostrar claramente 9.66, 11.04, 8.66, devoluciones, etc.
+        # 3) DETALLE MENSUAL SOLO DE ICA OPERATIVO
+        # Aquí sí se verán 9,66 / 11,04 / 8,66 / devoluciones
         sql_ica_detalle_mensual = text("""
             SELECT
                 periodo_anio,
@@ -7319,13 +7315,21 @@ def create_app():
             FROM auxiliar_contable
             WHERE idcliente = :idc
             AND fecha_contable BETWEEN :d AND :h
-            AND (
-                    cuenta_codigo LIKE '236805%'
-                    OR cuenta_codigo = '236898'
-                )
+            AND cuenta_codigo LIKE '236805%'
             GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
             HAVING SUM(credito - debito) <> 0
             ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+        """)
+
+        # 4) REFERENCIA CONTABLE OPCIONAL DE 236898
+        # No se usa en KPIs ni total_general
+        sql_referencia_236898 = text("""
+            SELECT
+                SUM(credito - debito) AS valor_236898
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            AND cuenta_codigo = '236898'
         """)
 
         res_evo = db.session.execute(
@@ -7343,6 +7347,11 @@ def create_app():
             {"idc": idcliente, "d": desde, "h": hasta}
         ).mappings().all()
 
+        ref_236898 = db.session.execute(
+            sql_referencia_236898,
+            {"idc": idcliente, "d": desde, "h": hasta}
+        ).mappings().first()
+
         def normalizar_concepto(cuenta: str, nombre: str) -> str:
             nombre_l = (nombre or "").strip().lower()
 
@@ -7353,32 +7362,26 @@ def create_app():
                 return "ReteICA 11,04"
             if cuenta == "23680507":
                 return "ReteICA 8,66"
-            if cuenta == "236898":
-                return "ICA retenido por pagar"
 
             # Detectar devoluciones ICA por nombre
             if cuenta.startswith("236805"):
                 if "devol" in nombre_l and "11" in nombre_l:
                     return "Devolución ReteICA 11,04"
-                if "devol" in nombre_l and "8" in nombre_l:
+                if "devol" in nombre_l and "8,66" in nombre_l:
                     return "Devolución ReteICA 8,66"
                 if "devol" in nombre_l and ("9,66" in nombre_l or "966" in nombre_l or "9.66" in nombre_l):
                     return "Devolución ReteICA 9,66"
                 if "devol" in nombre_l:
                     return f"Devolución ICA ({cuenta})"
 
-            # --- RETEFUENTE: conserva nombre real, limpio ---
+            # --- RETEFUENTE ---
             if cuenta.startswith("2365"):
                 return (nombre or cuenta).strip().title()
 
-            # fallback
             return (nombre or cuenta).strip().title()
 
         def clasificar_visual(cuenta: str, nombre: str) -> str:
             nombre_l = (nombre or "").strip().lower()
-
-            if cuenta == "236898":
-                return "ICA_POR_PAGAR"
 
             if cuenta.startswith("236805"):
                 if "devol" in nombre_l:
@@ -7388,35 +7391,24 @@ def create_app():
             if cuenta.startswith("2365"):
                 return "ReteFuente"
 
-            if cuenta.startswith("2368"):
-                return "ReteICA_Otros"
-
             return "Otros"
 
         # --- EVOLUCIÓN ---
         evolucion = []
         total_rf = 0.0
         total_ica_conceptos = 0.0
-        total_ica_por_pagar = 0.0
-        total_ica_neto = 0.0
 
         for r in res_evo:
             rf = float(r["retefuente"] or 0)
             ica_conceptos = float(r["reteica_conceptos"] or 0)
-            ica_pagar = float(r["ica_por_pagar"] or 0)
-            ica_neto = float(r["reteica_neto"] or 0)
 
             total_rf += rf
             total_ica_conceptos += ica_conceptos
-            total_ica_por_pagar += ica_pagar
-            total_ica_neto += ica_neto
 
             evolucion.append({
                 "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
                 "retefuente": rf,
-                "reteica_conceptos": ica_conceptos,
-                "ica_por_pagar": ica_pagar,
-                "reteica_neto": ica_neto
+                "reteica_conceptos": ica_conceptos
             })
 
         # --- COMPOSICIÓN / TABLA PRINCIPAL ---
@@ -7448,17 +7440,21 @@ def create_app():
                 "valor": valor
             })
 
+        valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
+
         return jsonify({
             "kpis": {
                 "total_retefuente": total_rf,
                 "total_reteica_conceptos": total_ica_conceptos,
-                "total_ica_por_pagar": total_ica_por_pagar,
-                "total_reteica_neto": total_ica_neto,
-                "total_general": total_rf + total_ica_neto
+                "total_general": total_rf + total_ica_conceptos
             },
             "evolucion": evolucion,
             "composicion": composicion,
-            "ica_detalle_mensual": ica_detalle_mensual
+            "ica_detalle_mensual": ica_detalle_mensual,
+            "referencias_contables": {
+                "cuenta_236898": valor_236898,
+                "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
+            }
         }), 200
 
 
