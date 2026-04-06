@@ -7279,8 +7279,6 @@ def create_app():
         """)
 
         # 2) COMPOSICIÓN DETALLADA POR CUENTA REAL
-        # Ya NO agrupamos por LEFT(cuenta_codigo, 6)
-        # y no incluimos 236898 en la composición principal
         sql_composicion = text("""
             SELECT
                 cuenta_codigo AS cuenta,
@@ -7300,11 +7298,10 @@ def create_app():
                 )
             GROUP BY cuenta_codigo, cuenta_nombre
             HAVING SUM(credito - debito) <> 0
-            ORDER BY SUM(credito - debito) DESC
+            ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
         """)
 
         # 3) DETALLE MENSUAL SOLO DE ICA OPERATIVO
-        # Aquí sí se verán 9,66 / 11,04 / 8,66 / devoluciones
         sql_ica_detalle_mensual = text("""
             SELECT
                 periodo_anio,
@@ -7321,8 +7318,24 @@ def create_app():
             ORDER BY periodo_anio, periodo_mes, cuenta_codigo
         """)
 
-        # 4) REFERENCIA CONTABLE OPCIONAL DE 236898
-        # No se usa en KPIs ni total_general
+        # 4) DETALLE MENSUAL DE RETEFUENTE
+        sql_retefuente_detalle_mensual = text("""
+            SELECT
+                periodo_anio,
+                periodo_mes,
+                cuenta_codigo,
+                cuenta_nombre,
+                SUM(credito - debito) AS valor
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            AND cuenta_codigo LIKE '2365%'
+            GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
+            HAVING SUM(credito - debito) <> 0
+            ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+        """)
+
+        # 5) REFERENCIA CONTABLE OPCIONAL DE 236898
         sql_referencia_236898 = text("""
             SELECT
                 SUM(credito - debito) AS valor_236898
@@ -7347,6 +7360,11 @@ def create_app():
             {"idc": idcliente, "d": desde, "h": hasta}
         ).mappings().all()
 
+        res_rf_det = db.session.execute(
+            sql_retefuente_detalle_mensual,
+            {"idc": idcliente, "d": desde, "h": hasta}
+        ).mappings().all()
+
         ref_236898 = db.session.execute(
             sql_referencia_236898,
             {"idc": idcliente, "d": desde, "h": hasta}
@@ -7367,9 +7385,9 @@ def create_app():
             if cuenta.startswith("236805"):
                 if "devol" in nombre_l and "11" in nombre_l:
                     return "Devolución ReteICA 11,04"
-                if "devol" in nombre_l and "8,66" in nombre_l:
+                if "devol" in nombre_l and ("8,66" in nombre_l or "8.66" in nombre_l or "866" in nombre_l):
                     return "Devolución ReteICA 8,66"
-                if "devol" in nombre_l and ("9,66" in nombre_l or "966" in nombre_l or "9.66" in nombre_l):
+                if "devol" in nombre_l and ("9,66" in nombre_l or "9.66" in nombre_l or "966" in nombre_l):
                     return "Devolución ReteICA 9,66"
                 if "devol" in nombre_l:
                     return f"Devolución ICA ({cuenta})"
@@ -7440,6 +7458,21 @@ def create_app():
                 "valor": valor
             })
 
+        # --- DETALLE RETEFUENTE MENSUAL ---
+        retefuente_detalle_mensual = []
+        for r in res_rf_det:
+            cuenta = str(r["cuenta_codigo"])
+            nombre = str(r["cuenta_nombre"] or "")
+            valor = float(r["valor"] or 0)
+
+            retefuente_detalle_mensual.append({
+                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "cuenta": cuenta,
+                "concepto": normalizar_concepto(cuenta, nombre),
+                "tipo": clasificar_visual(cuenta, nombre),
+                "valor": valor
+            })
+
         valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
 
         return jsonify({
@@ -7451,6 +7484,7 @@ def create_app():
             "evolucion": evolucion,
             "composicion": composicion,
             "ica_detalle_mensual": ica_detalle_mensual,
+            "retefuente_detalle_mensual": retefuente_detalle_mensual,
             "referencias_contables": {
                 "cuenta_236898": valor_236898,
                 "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
