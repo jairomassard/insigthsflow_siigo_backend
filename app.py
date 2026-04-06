@@ -7247,81 +7247,218 @@ def create_app():
 
 
     #ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES 
+    # ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES
     @app.route("/reportes/retenciones_v1", methods=["GET"])
     @jwt_required()
     def get_retenciones_v1():
         from sqlalchemy import text
-        
+
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde", "2026-01-01")
         hasta = request.args.get("hasta", "2026-12-31")
 
-        # 1. SQL para Evolución Mensual (Gráfico de Barras)
+        # 1) EVOLUCIÓN MENSUAL
+        # - retefuente: todo 2365%
+        # - reteica_conceptos: solo conceptos operativos de ICA (236805%)
+        # - ica_por_pagar: cuenta de pasivo / saldo por pagar (236898%)
+        # - reteica_neto: todo 2368% para ver el neto real del bloque ICA
         sql_evolucion = text("""
-            SELECT 
-                periodo_anio, 
+            SELECT
+                periodo_anio,
                 periodo_mes,
                 SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
-                SUM(CASE WHEN cuenta_codigo LIKE '2368%' THEN (credito - debito) ELSE 0 END) AS reteica
+                SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos,
+                SUM(CASE WHEN cuenta_codigo = '236898' THEN (credito - debito) ELSE 0 END) AS ica_por_pagar,
+                SUM(CASE WHEN cuenta_codigo LIKE '2368%' THEN (credito - debito) ELSE 0 END) AS reteica_neto
             FROM auxiliar_contable
-            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
-        """)
-        
-        # 2. SQL para Composición por Concepto (Tabla y Torta)
-        # Agrupamos por los primeros 6 dígitos para consolidar sub-auxiliares (ej. 236515)
-        sql_composicion = text("""
-            SELECT 
-                LEFT(cuenta_codigo, 6) AS cuenta_base,
-                MAX(cuenta_nombre) AS nombre_concepto,
-                CASE WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente' ELSE 'ReteICA' END AS tipo_impuesto,
-                SUM(credito - debito) AS saldo_pagar
-            FROM auxiliar_contable
-            WHERE idcliente = :idc 
+            WHERE idcliente = :idc
             AND fecha_contable BETWEEN :d AND :h
-            AND (cuenta_codigo LIKE '2365%' OR cuenta_codigo LIKE '2368%')
-            GROUP BY 1, 3
-            HAVING SUM(credito - debito) <> 0
-            ORDER BY 4 DESC
+            AND (
+                    cuenta_codigo LIKE '2365%'
+                    OR cuenta_codigo LIKE '2368%'
+                )
+            GROUP BY periodo_anio, periodo_mes
+            ORDER BY periodo_anio, periodo_mes
         """)
 
-        res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+        # 2) COMPOSICIÓN DETALLADA POR CUENTA REAL
+        # Ya NO agrupamos por LEFT(cuenta_codigo, 6), sino por cuenta exacta.
+        sql_composicion = text("""
+            SELECT
+                cuenta_codigo AS cuenta,
+                cuenta_nombre AS concepto_original,
+                CASE
+                    WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente'
+                    WHEN cuenta_codigo LIKE '236805%' THEN 'ReteICA'
+                    WHEN cuenta_codigo = '236898' THEN 'ICA_POR_PAGAR'
+                    WHEN cuenta_codigo LIKE '2368%' THEN 'ReteICA_Otros'
+                    ELSE 'Otros'
+                END AS tipo,
+                SUM(credito - debito) AS valor
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            AND (
+                    cuenta_codigo LIKE '2365%'
+                    OR cuenta_codigo LIKE '2368%'
+                )
+            GROUP BY cuenta_codigo, cuenta_nombre
+            HAVING SUM(credito - debito) <> 0
+            ORDER BY SUM(credito - debito) DESC
+        """)
 
-        # Formatear la evolución mensual
+        # 3) DETALLE MENSUAL SOLO DE ICA, POR SUBCUENTA
+        # Para que el frontend pueda mostrar claramente 9.66, 11.04, 8.66, devoluciones, etc.
+        sql_ica_detalle_mensual = text("""
+            SELECT
+                periodo_anio,
+                periodo_mes,
+                cuenta_codigo,
+                cuenta_nombre,
+                SUM(credito - debito) AS valor
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+            AND fecha_contable BETWEEN :d AND :h
+            AND (
+                    cuenta_codigo LIKE '236805%'
+                    OR cuenta_codigo = '236898'
+                )
+            GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
+            HAVING SUM(credito - debito) <> 0
+            ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+        """)
+
+        res_evo = db.session.execute(
+            sql_evolucion,
+            {"idc": idcliente, "d": desde, "h": hasta}
+        ).mappings().all()
+
+        res_comp = db.session.execute(
+            sql_composicion,
+            {"idc": idcliente, "d": desde, "h": hasta}
+        ).mappings().all()
+
+        res_ica_det = db.session.execute(
+            sql_ica_detalle_mensual,
+            {"idc": idcliente, "d": desde, "h": hasta}
+        ).mappings().all()
+
+        def normalizar_concepto(cuenta: str, nombre: str) -> str:
+            nombre_l = (nombre or "").strip().lower()
+
+            # --- ICA DETALLADO ---
+            if cuenta == "23680505":
+                return "ReteICA 9,66"
+            if cuenta == "23680501":
+                return "ReteICA 11,04"
+            if cuenta == "23680507":
+                return "ReteICA 8,66"
+            if cuenta == "236898":
+                return "ICA retenido por pagar"
+
+            # Detectar devoluciones ICA por nombre
+            if cuenta.startswith("236805"):
+                if "devol" in nombre_l and "11" in nombre_l:
+                    return "Devolución ReteICA 11,04"
+                if "devol" in nombre_l and "8" in nombre_l:
+                    return "Devolución ReteICA 8,66"
+                if "devol" in nombre_l and ("9,66" in nombre_l or "966" in nombre_l or "9.66" in nombre_l):
+                    return "Devolución ReteICA 9,66"
+                if "devol" in nombre_l:
+                    return f"Devolución ICA ({cuenta})"
+
+            # --- RETEFUENTE: conserva nombre real, limpio ---
+            if cuenta.startswith("2365"):
+                return (nombre or cuenta).strip().title()
+
+            # fallback
+            return (nombre or cuenta).strip().title()
+
+        def clasificar_visual(cuenta: str, nombre: str) -> str:
+            nombre_l = (nombre or "").strip().lower()
+
+            if cuenta == "236898":
+                return "ICA_POR_PAGAR"
+
+            if cuenta.startswith("236805"):
+                if "devol" in nombre_l:
+                    return "ReteICA_Devolucion"
+                return "ReteICA"
+
+            if cuenta.startswith("2365"):
+                return "ReteFuente"
+
+            if cuenta.startswith("2368"):
+                return "ReteICA_Otros"
+
+            return "Otros"
+
+        # --- EVOLUCIÓN ---
         evolucion = []
-        total_rf = 0
-        total_ica = 0
-        
+        total_rf = 0.0
+        total_ica_conceptos = 0.0
+        total_ica_por_pagar = 0.0
+        total_ica_neto = 0.0
+
         for r in res_evo:
-            rf = float(r['retefuente'] or 0)
-            ica = float(r['reteica'] or 0)
+            rf = float(r["retefuente"] or 0)
+            ica_conceptos = float(r["reteica_conceptos"] or 0)
+            ica_pagar = float(r["ica_por_pagar"] or 0)
+            ica_neto = float(r["reteica_neto"] or 0)
+
             total_rf += rf
-            total_ica += ica
+            total_ica_conceptos += ica_conceptos
+            total_ica_por_pagar += ica_pagar
+            total_ica_neto += ica_neto
+
             evolucion.append({
                 "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
                 "retefuente": rf,
-                "reteica": ica
+                "reteica_conceptos": ica_conceptos,
+                "ica_por_pagar": ica_pagar,
+                "reteica_neto": ica_neto
             })
 
-        # Formatear la composición
+        # --- COMPOSICIÓN / TABLA PRINCIPAL ---
         composicion = []
         for c in res_comp:
+            cuenta = str(c["cuenta"])
+            concepto_original = str(c["concepto_original"] or "")
+            valor = float(c["valor"] or 0)
+
             composicion.append({
-                "cuenta": c['cuenta_base'],
-                "concepto": str(c['nombre_concepto']).title(),
-                "tipo": c['tipo_impuesto'],
-                "valor": float(c['saldo_pagar'] or 0)
+                "cuenta": cuenta,
+                "concepto": normalizar_concepto(cuenta, concepto_original),
+                "tipo": clasificar_visual(cuenta, concepto_original),
+                "valor": valor
+            })
+
+        # --- DETALLE ICA MENSUAL ---
+        ica_detalle_mensual = []
+        for r in res_ica_det:
+            cuenta = str(r["cuenta_codigo"])
+            nombre = str(r["cuenta_nombre"] or "")
+            valor = float(r["valor"] or 0)
+
+            ica_detalle_mensual.append({
+                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "cuenta": cuenta,
+                "concepto": normalizar_concepto(cuenta, nombre),
+                "tipo": clasificar_visual(cuenta, nombre),
+                "valor": valor
             })
 
         return jsonify({
             "kpis": {
                 "total_retefuente": total_rf,
-                "total_reteica": total_ica,
-                "total_general": total_rf + total_ica
+                "total_reteica_conceptos": total_ica_conceptos,
+                "total_ica_por_pagar": total_ica_por_pagar,
+                "total_reteica_neto": total_ica_neto,
+                "total_general": total_rf + total_ica_neto
             },
             "evolucion": evolucion,
-            "composicion": composicion
+            "composicion": composicion,
+            "ica_detalle_mensual": ica_detalle_mensual
         }), 200
 
 
