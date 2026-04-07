@@ -8169,6 +8169,221 @@ def create_app():
                 "detalle": str(e)
             }), 500
 
+
+    # ENDPOINT: Buscador inteligente de facturas por contenido
+    @app.route("/reportes/facturas-buscador", methods=["GET"])
+    @jwt_required()
+    def get_facturas_buscador():
+        from sqlalchemy import text
+        from decimal import Decimal
+        from datetime import datetime, timedelta
+
+        idcliente = get_jwt().get("idcliente")
+
+        q = (request.args.get("q") or "").strip()
+        idfactura = (request.args.get("idfactura") or "").strip()
+        cliente = (request.args.get("cliente") or "").strip()
+        estado_pago = (request.args.get("estado_pago") or "").strip()
+        estado = (request.args.get("estado") or "").strip()
+
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+
+        # límites sanos
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+
+        # fechas por defecto
+        if not desde:
+            desde = "2025-01-01"
+        if not hasta:
+            hasta = datetime.now().strftime("%Y-%m-%d")
+
+        # aliases / tolerancia de escritura
+        aliases = {
+            "zapier": ["zapier", "zappier"],
+            "zappier": ["zapier", "zappier"],
+        }
+
+        q_lower = q.lower()
+        terminos = aliases.get(q_lower, [q_lower] if q_lower else [])
+
+        # filtros dinámicos sobre items
+        params = {
+            "idcliente": idcliente,
+            "desde": desde,
+            "hasta": hasta,
+            "limit": limit,
+            "offset": offset,
+            "q_vacio": 1 if not q else 0,
+        }
+
+        item_term_clauses = []
+        for i, term in enumerate(terminos):
+            key = f"term_{i}"
+            params[key] = f"%{term}%"
+            item_term_clauses.append(f"LOWER(fi.descripcion) LIKE LOWER(:{key})")
+
+        item_filter_sql = ""
+        if item_term_clauses:
+            item_filter_sql = " AND (" + " OR ".join(item_term_clauses) + ")"
+
+        where_clauses = [
+            "fe.idcliente = :idcliente",
+            "fe.fecha >= :desde",
+            "fe.fecha <= :hasta",
+        ]
+
+        if idfactura:
+            where_clauses.append("fe.idfactura ILIKE :idfactura")
+            params["idfactura"] = f"%{idfactura}%"
+
+        if cliente:
+            where_clauses.append("fe.cliente_nombre ILIKE :cliente")
+            params["cliente"] = f"%{cliente}%"
+
+        if estado_pago:
+            where_clauses.append("fe.estado_pago = :estado_pago")
+            params["estado_pago"] = estado_pago
+
+        if estado:
+            where_clauses.append("fe.estado = :estado")
+            params["estado"] = estado
+
+        where_sql = " AND ".join(where_clauses)
+
+        base_cte = f"""
+        WITH base AS (
+            SELECT
+                fe.factura_id,
+                fe.idfactura,
+                fe.fecha,
+                fe.vencimiento,
+                fe.cliente_nombre,
+                fe.estado,
+                fe.estado_pago,
+                fe.subtotal,
+                fe.impuestos_total,
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE r->>'type' = 'ReteICA'
+                ), 0) AS reteica,
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE r->>'type' = 'ReteIVA'
+                ), 0) AS reteiva,
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE r->>'type' = 'Autorretencion'
+                ), 0) AS autorretencion,
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                ), 0) AS total_retenciones,
+                fe.total,
+                fe.saldo,
+                fe.public_url,
+                fe.centro_costo_nombre,
+                fe.centro_costo_codigo,
+                fe.vendedor_nombre,
+                mi.descripcion,
+                mi.coincidencias
+            FROM facturas_enriquecidas fe
+            JOIN LATERAL (
+                SELECT
+                    STRING_AGG(DISTINCT TRIM(fi.descripcion), ' || ' ORDER BY TRIM(fi.descripcion)) AS descripcion,
+                    COUNT(*) AS coincidencias
+                FROM siigo_factura_items fi
+                WHERE fi.factura_id = fe.factura_id
+                AND fi.idcliente = fe.idcliente
+                {item_filter_sql}
+            ) mi ON (:q_vacio = 1 OR mi.coincidencias > 0)
+            WHERE {where_sql}
+        )
+        """
+
+        sql_rows = text(base_cte + """
+        SELECT
+            factura_id,
+            idfactura,
+            fecha,
+            vencimiento,
+            cliente_nombre,
+            estado,
+            estado_pago,
+            subtotal,
+            impuestos_total,
+            reteica,
+            reteiva,
+            autorretencion,
+            total_retenciones,
+            total,
+            saldo,
+            public_url,
+            centro_costo_nombre,
+            centro_costo_codigo,
+            vendedor_nombre,
+            descripcion,
+            coincidencias
+        FROM base
+        ORDER BY fecha DESC, idfactura DESC
+        LIMIT :limit OFFSET :offset
+        """)
+
+        sql_summary = text(base_cte + """
+        SELECT
+            COUNT(*) AS total_registros,
+            COALESCE(SUM(subtotal), 0) AS subtotal_total,
+            COALESCE(SUM(impuestos_total), 0) AS iva_total,
+            COALESCE(SUM(reteica), 0) AS reteica_total,
+            COALESCE(SUM(reteiva), 0) AS reteiva_total,
+            COALESCE(SUM(autorretencion), 0) AS autorretencion_total,
+            COALESCE(SUM(total_retenciones), 0) AS retenciones_total,
+            COALESCE(SUM(total), 0) AS total_facturado,
+            COALESCE(SUM(saldo), 0) AS saldo_total
+        FROM base
+        """)
+
+        rows = db.session.execute(sql_rows, params).mappings().all()
+        summary = db.session.execute(sql_summary, params).mappings().first()
+
+        def to_jsonable(value):
+            if isinstance(value, Decimal):
+                return float(value)
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return value
+
+        data = [{k: to_jsonable(v) for k, v in row.items()} for row in rows]
+        resumen = {k: to_jsonable(v) for k, v in (summary or {}).items()}
+
+        return jsonify({
+            "filters": {
+                "q": q,
+                "idfactura": idfactura,
+                "cliente": cliente,
+                "estado_pago": estado_pago,
+                "estado": estado,
+                "desde": desde,
+                "hasta": hasta,
+                "limit": limit,
+                "offset": offset,
+                "terminos_aplicados": terminos,
+            },
+            "summary": resumen,
+            "rows": data
+        })
+
+
+ 
+# No tocar de qui para abajo 
+ 
     # NO TOCAR DE AQEUI PARA ABAJO
     # --- Registrar rutas de permisos ---
     from permisos_routes import register_permisos_routes
@@ -8235,6 +8450,8 @@ def create_app():
 
         elif request.path.startswith("/reportes"):
             # Detectar permisos específicos
+            if "facturas-buscador" in request.path or "buscador-facturas" in request.path:
+                codigo = "ver_reporte_buscador_facturas"
             if "compras-gastos" in request.path:
                 codigo = "ver_reporte_compras_gastos"
             elif "indicadores" in request.path:
