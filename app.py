@@ -8609,6 +8609,388 @@ def create_app():
 
 
     # ----------------------------------------------------------
+    # Indicadores financieros construidos desde AuxiliarContable
+    @app.route("/reportes/auxiliares/indicadores-financieros", methods=["GET"])
+    @jwt_required()
+    def indicadores_financieros_auxiliares():
+        from sqlalchemy import func
+        from datetime import date
+        from calendar import monthrange
+        from models import AuxiliarContable
+
+        idcliente = get_jwt().get("idcliente")
+        anio = request.args.get("anio", type=int)
+        mes_inicio = request.args.get("mes_inicio", type=int)
+        mes_fin = request.args.get("mes_fin", type=int)
+
+        if not idcliente or not anio or not mes_inicio or not mes_fin:
+            return jsonify({"error": "Faltan parámetros"}), 400
+
+        if mes_inicio < 1 or mes_inicio > 12 or mes_fin < 1 or mes_fin > 12 or mes_inicio > mes_fin:
+            return jsonify({"error": "Rango de meses inválido"}), 400
+
+        fecha_desde = date(anio, mes_inicio, 1)
+        fecha_hasta = date(anio, mes_fin, monthrange(anio, mes_fin)[1])
+        fecha_inicio_anual = date(anio, 1, 1)
+
+        def saldo_por_naturaleza(codigo, debito, credito):
+            codigo = str(codigo or "").strip()
+            debito = float(debito or 0)
+            credito = float(credito or 0)
+
+            # Naturaleza débito
+            if codigo.startswith(("1", "5", "6", "7", "8", "9")):
+                return debito - credito
+
+            # Naturaleza crédito
+            if codigo.startswith(("2", "3", "4")):
+                return credito - debito
+
+            return debito - credito
+
+        def interpretar_indicador_local(k, v):
+            if v is None:
+                return "Sin datos suficientes para interpretar."
+            if k == "liquidez":
+                if v < 1:
+                    return "La empresa no alcanza a cubrir sus obligaciones de corto plazo."
+                if v < 2:
+                    return "La liquidez es aceptable."
+                return "La posición de liquidez es holgada."
+            if k == "apalancamiento":
+                if v > 0.8:
+                    return "La empresa depende fuertemente de deuda."
+                if v > 0.6:
+                    return "El endeudamiento es moderado."
+                return "El endeudamiento está controlado."
+            if k == "rentabilidad":
+                if v < 0:
+                    return "La operación generó pérdidas."
+                if v < 0.1:
+                    return "La rentabilidad es positiva pero baja."
+                return "La rentabilidad es saludable."
+            if k == "autonomia":
+                if v < 0.3:
+                    return "Existe alta dependencia de recursos de terceros."
+                if v < 0.5:
+                    return "La autonomía financiera es media."
+                return "La autonomía financiera es buena."
+            if k == "solvencia":
+                if v < 1:
+                    return "Existe riesgo para cubrir pasivos con activos."
+                if v < 1.5:
+                    return "La solvencia es ajustada."
+                return "La solvencia es sólida."
+            if k == "capital_trabajo":
+                return "Capital de trabajo positivo." if v >= 0 else "Capital de trabajo negativo."
+            return "Indicador calculado correctamente."
+
+        # Grupos contables
+        grupos_balance = {
+            "Activo Corriente": ["11", "12", "13", "14"],
+            "Activo No Corriente": ["15", "16", "17", "18", "19"],
+            "Pasivo a Corto Plazo": ["21", "22"],
+            "Pasivo a Largo Plazo": ["23", "24", "25", "26", "27", "28", "29"],
+            "Patrimonio": ["3"],
+        }
+
+        grupos_resultado = {
+            "Ingresos": ["4"],
+            "Costos": ["6", "7"],
+            "Gastos": ["5"],
+        }
+
+        # ---------------------------
+        # 1) BALANCE GENERAL
+        #    Acumulado desde 1 de enero hasta fecha_hasta
+        # ---------------------------
+        registros_balance = db.session.query(
+            AuxiliarContable.cuenta_codigo,
+            AuxiliarContable.cuenta_nombre,
+            func.sum(AuxiliarContable.debito).label("debito"),
+            func.sum(AuxiliarContable.credito).label("credito")
+        ).filter(
+            AuxiliarContable.idcliente == idcliente,
+            AuxiliarContable.fecha_contable >= fecha_inicio_anual,
+            AuxiliarContable.fecha_contable <= fecha_hasta
+        ).group_by(
+            AuxiliarContable.cuenta_codigo,
+            AuxiliarContable.cuenta_nombre
+        ).all()
+
+        # ---------------------------
+        # 2) ESTADO DE RESULTADOS
+        #    Solo el rango seleccionado
+        # ---------------------------
+        registros_resultado = db.session.query(
+            AuxiliarContable.cuenta_codigo,
+            AuxiliarContable.cuenta_nombre,
+            func.sum(AuxiliarContable.debito).label("debito"),
+            func.sum(AuxiliarContable.credito).label("credito")
+        ).filter(
+            AuxiliarContable.idcliente == idcliente,
+            AuxiliarContable.fecha_contable >= fecha_desde,
+            AuxiliarContable.fecha_contable <= fecha_hasta
+        ).group_by(
+            AuxiliarContable.cuenta_codigo,
+            AuxiliarContable.cuenta_nombre
+        ).all()
+
+        resumen_map = {
+            "Activo Corriente": 0.0,
+            "Activo No Corriente": 0.0,
+            "Pasivo a Corto Plazo": 0.0,
+            "Pasivo a Largo Plazo": 0.0,
+            "Patrimonio": 0.0,
+            "Ingresos": 0.0,
+            "Costos": 0.0,
+            "Gastos": 0.0,
+        }
+
+        # Balance general
+        for codigo, nombre, debito, credito in registros_balance:
+            saldo = saldo_por_naturaleza(codigo, debito, credito)
+            cod = str(codigo or "").strip()
+
+            for grupo, prefijos in grupos_balance.items():
+                if any(cod.startswith(pref) for pref in prefijos):
+                    resumen_map[grupo] += float(saldo)
+                    break
+
+        # Estado de resultados
+        for codigo, nombre, debito, credito in registros_resultado:
+            saldo = saldo_por_naturaleza(codigo, debito, credito)
+            cod = str(codigo or "").strip()
+
+            for grupo, prefijos in grupos_resultado.items():
+                if any(cod.startswith(pref) for pref in prefijos):
+                    resumen_map[grupo] += float(saldo)
+                    break
+
+        # Variables base
+        activo_corriente = float(resumen_map.get("Activo Corriente", 0))
+        activo_no_corriente = float(resumen_map.get("Activo No Corriente", 0))
+        pasivo_corto = abs(float(resumen_map.get("Pasivo a Corto Plazo", 0)))
+        pasivo_largo = abs(float(resumen_map.get("Pasivo a Largo Plazo", 0)))
+        patrimonio = float(resumen_map.get("Patrimonio", 0))
+
+        ingresos = abs(float(resumen_map.get("Ingresos", 0)))
+        costos = abs(float(resumen_map.get("Costos", 0)))
+        gastos = abs(float(resumen_map.get("Gastos", 0)))
+
+        activo_total = activo_corriente + activo_no_corriente
+        pasivo_total = pasivo_corto + pasivo_largo
+        utilidad_neta = ingresos - costos - gastos
+
+        indicadores = {
+            "liquidez": round(activo_corriente / pasivo_corto, 2) if pasivo_corto else None,
+            "apalancamiento": round(pasivo_total / activo_total, 2) if activo_total else None,
+            "rentabilidad": round(utilidad_neta / ingresos, 2) if ingresos else None,
+            "capital_trabajo": round(activo_corriente - pasivo_corto, 2),
+            "solvencia": round(activo_total / pasivo_total, 2) if pasivo_total else None,
+            "autonomia": round(patrimonio / activo_total, 2) if activo_total else None,
+            "porcentaje_pasivo_corto": round(pasivo_corto / pasivo_total, 2) if pasivo_total else None,
+            "porcentaje_activo_no_corriente": round(activo_no_corriente / activo_total, 2) if activo_total else None,
+            "cobertura_activo_pasivo": round(activo_total / pasivo_total, 2) if pasivo_total else None,
+            "endeudamiento_largo_plazo": round(pasivo_largo / patrimonio, 2) if patrimonio and patrimonio > 0 else None,
+
+            # Extras útiles
+            "activo_total": round(activo_total, 2),
+            "pasivo_total": round(pasivo_total, 2),
+            "patrimonio": round(patrimonio, 2),
+            "ingresos": round(ingresos, 2),
+            "costos": round(costos, 2),
+            "gastos": round(gastos, 2),
+            "utilidad_neta": round(utilidad_neta, 2),
+        }
+
+        interpretaciones = {
+            k: interpretar_indicador_local(k, v)
+            for k, v in indicadores.items()
+        }
+
+        explicaciones = {
+            "liquidez": "Activo corriente / Pasivo a corto. >1 saludable; >2 holgado.",
+            "apalancamiento": "Pasivo total / Activo total. <0.6 ideal; >0.8 alto.",
+            "rentabilidad": "Utilidad neta / Ingresos. >0 indica margen neto positivo.",
+            "capital_trabajo": "Activo corriente − Pasivo corto. >0 indica colchón operativo.",
+            "solvencia": "Activo total / Pasivo total. >1 indica cobertura de deudas.",
+            "autonomia": "Patrimonio / Activo total. >0.5 indica menor dependencia de deuda.",
+            "porcentaje_pasivo_corto": "Proporción de deuda exigible en el corto plazo.",
+            "porcentaje_activo_no_corriente": "Proporción de activos menos líquidos.",
+            "cobertura_activo_pasivo": "Cobertura de pasivos con activos.",
+            "endeudamiento_largo_plazo": "Deuda de largo plazo frente al patrimonio.",
+        }
+
+        resumen_financiero = [
+            {"clase": "Activo corriente", "valor": round(activo_corriente, 2), "interpretacion": "Recursos líquidos o realizables en el corto plazo."},
+            {"clase": "Activo no corriente", "valor": round(activo_no_corriente, 2), "interpretacion": "Activos de permanencia o recuperación a largo plazo."},
+            {"clase": "Activo total", "valor": round(activo_total, 2), "interpretacion": "Total de recursos controlados por la empresa."},
+            {"clase": "Pasivo corto plazo", "valor": round(pasivo_corto, 2), "interpretacion": "Obligaciones exigibles en el corto plazo."},
+            {"clase": "Pasivo largo plazo", "valor": round(pasivo_largo, 2), "interpretacion": "Obligaciones financieras y deudas a largo plazo."},
+            {"clase": "Pasivo total", "valor": round(pasivo_total, 2), "interpretacion": "Total de obligaciones con terceros."},
+            {"clase": "Patrimonio", "valor": round(patrimonio, 2), "interpretacion": "Recursos propios de los socios o acumulados."},
+            {"clase": "Ingresos", "valor": round(ingresos, 2), "interpretacion": "Ventas o ingresos operacionales del período."},
+            {"clase": "Costos", "valor": round(costos, 2), "interpretacion": "Costos directos asociados a la operación."},
+            {"clase": "Gastos", "valor": round(gastos, 2), "interpretacion": "Gastos administrativos, operativos y otros del período."},
+            {"clase": "Utilidad neta", "valor": round(utilidad_neta, 2), "interpretacion": "Resultado neto del período analizado."},
+        ]
+
+        # ----------------------------------------------------------
+        # Evolución mensual
+        # - Balance: acumulado desde enero hasta cierre de cada mes
+        # - Resultado: solo movimientos del mes
+        # ----------------------------------------------------------
+        evolucion_mensual = []
+
+        for mes in range(mes_inicio, mes_fin + 1):
+            fecha_mes_desde = date(anio, mes, 1)
+            fecha_mes_hasta = date(anio, mes, monthrange(anio, mes)[1])
+
+            # Balance acumulado al cierre del mes
+            regs_balance_mes = db.session.query(
+                AuxiliarContable.cuenta_codigo,
+                AuxiliarContable.cuenta_nombre,
+                func.sum(AuxiliarContable.debito).label("debito"),
+                func.sum(AuxiliarContable.credito).label("credito")
+            ).filter(
+                AuxiliarContable.idcliente == idcliente,
+                AuxiliarContable.fecha_contable >= fecha_inicio_anual,
+                AuxiliarContable.fecha_contable <= fecha_mes_hasta
+            ).group_by(
+                AuxiliarContable.cuenta_codigo,
+                AuxiliarContable.cuenta_nombre
+            ).all()
+
+            # Resultado solo del mes
+            regs_resultado_mes = db.session.query(
+                AuxiliarContable.cuenta_codigo,
+                AuxiliarContable.cuenta_nombre,
+                func.sum(AuxiliarContable.debito).label("debito"),
+                func.sum(AuxiliarContable.credito).label("credito")
+            ).filter(
+                AuxiliarContable.idcliente == idcliente,
+                AuxiliarContable.fecha_contable >= fecha_mes_desde,
+                AuxiliarContable.fecha_contable <= fecha_mes_hasta
+            ).group_by(
+                AuxiliarContable.cuenta_codigo,
+                AuxiliarContable.cuenta_nombre
+            ).all()
+
+            resumen_mes = {
+                "Activo Corriente": 0.0,
+                "Activo No Corriente": 0.0,
+                "Pasivo a Corto Plazo": 0.0,
+                "Pasivo a Largo Plazo": 0.0,
+                "Patrimonio": 0.0,
+                "Ingresos": 0.0,
+                "Costos": 0.0,
+                "Gastos": 0.0,
+            }
+
+            for codigo, nombre, debito, credito in regs_balance_mes:
+                saldo = saldo_por_naturaleza(codigo, debito, credito)
+                cod = str(codigo or "").strip()
+
+                for grupo, prefijos in grupos_balance.items():
+                    if any(cod.startswith(pref) for pref in prefijos):
+                        resumen_mes[grupo] += float(saldo)
+                        break
+
+            for codigo, nombre, debito, credito in regs_resultado_mes:
+                saldo = saldo_por_naturaleza(codigo, debito, credito)
+                cod = str(codigo or "").strip()
+
+                for grupo, prefijos in grupos_resultado.items():
+                    if any(cod.startswith(pref) for pref in prefijos):
+                        resumen_mes[grupo] += float(saldo)
+                        break
+
+            activo_corriente_mes = float(resumen_mes.get("Activo Corriente", 0))
+            activo_no_corriente_mes = float(resumen_mes.get("Activo No Corriente", 0))
+            pasivo_corto_mes = abs(float(resumen_mes.get("Pasivo a Corto Plazo", 0)))
+            pasivo_largo_mes = abs(float(resumen_mes.get("Pasivo a Largo Plazo", 0)))
+            patrimonio_mes = float(resumen_mes.get("Patrimonio", 0))
+
+            ingresos_mes = abs(float(resumen_mes.get("Ingresos", 0)))
+            costos_mes = abs(float(resumen_mes.get("Costos", 0)))
+            gastos_mes = abs(float(resumen_mes.get("Gastos", 0)))
+
+            activo_total_mes = activo_corriente_mes + activo_no_corriente_mes
+            pasivo_total_mes = pasivo_corto_mes + pasivo_largo_mes
+            utilidad_neta_mes = ingresos_mes - costos_mes - gastos_mes
+
+            liquidez_mes = round(activo_corriente_mes / pasivo_corto_mes, 2) if pasivo_corto_mes else None
+            apalancamiento_mes = round(pasivo_total_mes / activo_total_mes, 2) if activo_total_mes else None
+            rentabilidad_mes = round(utilidad_neta_mes / ingresos_mes, 2) if ingresos_mes else None
+            autonomia_mes = round(patrimonio_mes / activo_total_mes, 2) if activo_total_mes else None
+
+            evolucion_mensual.append({
+                "mes": f"{anio}-{mes:02d}",
+                "utilidad_neta": round(utilidad_neta_mes, 2),
+                "liquidez": liquidez_mes,
+                "apalancamiento": apalancamiento_mes,
+                "rentabilidad": rentabilidad_mes,
+                "autonomia": autonomia_mes,
+                "activo_total": round(activo_total_mes, 2),
+                "pasivo_total": round(pasivo_total_mes, 2),
+                "patrimonio": round(patrimonio_mes, 2),
+            })
+
+        conclusiones = []
+
+        if indicadores["liquidez"] is not None:
+            if indicadores["liquidez"] < 1:
+                conclusiones.append("⚠ Riesgo de iliquidez: el activo corriente no cubre el pasivo de corto plazo.")
+            elif indicadores["liquidez"] > 3:
+                conclusiones.append("⚠ Exceso de liquidez: podría existir dinero ocioso o baja eficiencia en el uso del capital.")
+            else:
+                conclusiones.append("✅ Liquidez saludable para responder a obligaciones cercanas.")
+
+        if indicadores["apalancamiento"] is not None:
+            if indicadores["apalancamiento"] > 0.8:
+                conclusiones.append("⚠ Alto nivel de apalancamiento: una porción importante de los activos está financiada con deuda.")
+            elif indicadores["apalancamiento"] > 0.6:
+                conclusiones.append("• El apalancamiento es moderado y conviene monitorearlo.")
+            else:
+                conclusiones.append("✅ La estructura de endeudamiento luce controlada.")
+
+        if indicadores["rentabilidad"] is not None:
+            if indicadores["rentabilidad"] < 0:
+                conclusiones.append("🔻 La empresa presenta pérdida neta en el período analizado.")
+            elif indicadores["rentabilidad"] < 0.1:
+                conclusiones.append("• La empresa sí genera utilidad, pero con margen bajo.")
+            else:
+                conclusiones.append("✅ La rentabilidad neta del período es positiva y saludable.")
+
+        if indicadores["autonomia"] is not None and indicadores["autonomia"] < 0.3:
+            conclusiones.append("⚠ La autonomía financiera es baja y existe fuerte dependencia de terceros.")
+
+        if patrimonio <= 0:
+            conclusiones.append("❗ El patrimonio es nulo o negativo, situación que requiere revisión prioritaria.")
+
+        if indicadores["endeudamiento_largo_plazo"] is not None and indicadores["endeudamiento_largo_plazo"] > 1:
+            conclusiones.append("⚠ La deuda de largo plazo supera el patrimonio, lo que presiona la estructura financiera.")
+
+        return jsonify({
+            "resumen_financiero": resumen_financiero,
+            "indicadores": indicadores,
+            "explicaciones": explicaciones,
+            "interpretaciones": interpretaciones,
+            "conclusiones": conclusiones,
+            "evolucion_mensual": evolucion_mensual,
+            "meta": {
+                "fuente": "auxiliar_contable",
+                "anio": anio,
+                "mes_inicio": mes_inicio,
+                "mes_fin": mes_fin,
+                "fecha_desde": str(fecha_desde),
+                "fecha_hasta": str(fecha_hasta),
+                "nota": "Los indicadores de balance se reconstruyen acumulando movimientos desde enero hasta el cierre del mes; ingresos, costos y gastos se calculan sobre el rango o mes correspondiente."
+            }
+        }), 200
+
+
 
     # ----------------------------------------------------------
     # ENDPOINT: BÚSQUEDA INTELIGENTE DE FACTURAS
