@@ -574,6 +574,7 @@ def procesar_excel_auxiliar_v2(file_storage, idcliente):
 
 # ==========================================================
 # BÚSQUEDA INTELIGENTE DE FACTURAS + EXPORTACIÓN A EXCEL
+# BASADO EN facturas_enriquecidas
 # ==========================================================
 
 def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
@@ -602,7 +603,6 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
     hasta_dt = datetime.strptime(hasta, "%Y-%m-%d") + timedelta(days=1)
     hasta_sql = hasta_dt.strftime("%Y-%m-%d")
 
-    # alias tolerantes
     aliases = {
         "zapier": ["zapier", "zappier"],
         "zappier": ["zapier", "zappier"],
@@ -617,31 +617,31 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
         "estado_pago": estado_pago,
     }
 
-    wh = [
-        "f.idcliente = :idcliente",
-        "f.fecha >= :desde",
-        "f.fecha < :hasta",
+    where_main = [
+        "fe.idcliente = :idcliente",
+        "fe.fecha >= :desde",
+        "fe.fecha < :hasta",
     ]
 
     if factura:
-        wh.append("LOWER(COALESCE(f.idfactura, '')) LIKE :factura")
+        where_main.append("LOWER(COALESCE(fe.idfactura, '')) LIKE :factura")
         params["factura"] = f"%{factura.lower()}%"
 
     if cliente:
         # catálogo de clientes usa nombre como id
-        wh.append("f.cliente_nombre = :cliente")
+        where_main.append("fe.cliente_nombre = :cliente")
         params["cliente"] = cliente
 
     if cost_center:
-        wh.append("f.cost_center = :cost_center")
+        where_main.append("fe.cost_center = :cost_center")
         params["cost_center"] = cost_center
 
     if estado_factura:
-        wh.append("LOWER(COALESCE(f.estado, '')) = :estado_factura")
+        where_main.append("LOWER(COALESCE(fe.estado, '')) = :estado_factura")
         params["estado_factura"] = estado_factura
 
+    exists_filter = ""
     descripcion_filter = ""
-    busqueda_compuesta = ""
 
     if terminos:
         term_clauses_exists = []
@@ -656,138 +656,100 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
             term_clauses_desc.append(f"LOWER(COALESCE(fi2.descripcion, '')) LIKE LOWER(:{key})")
 
             term_clauses_header.extend([
-                f"LOWER(COALESCE(f.idfactura, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(f.cliente_nombre, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(f.observaciones, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(f.medio_pago, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(fe.idfactura, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(fe.cliente_nombre, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(fe.observaciones, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(fe.medio_pago, '')) LIKE LOWER(:{key})",
             ])
 
-        descripcion_filter = f"""
-            AND ({' OR '.join(term_clauses_desc)})
-        """
-
-        busqueda_compuesta = f"""
+        exists_filter = f"""
             AND (
                 {' OR '.join(term_clauses_header)}
                 OR EXISTS (
                     SELECT 1
                     FROM siigo_factura_items fi
-                    WHERE fi.factura_id = f.id
-                      AND fi.idcliente = f.idcliente
+                    WHERE fi.factura_id = fe.factura_id
+                      AND fi.idcliente = fe.idcliente
                       AND ({' OR '.join(term_clauses_exists)})
                 )
             )
         """
 
-    where_clause = " AND ".join(wh)
+        descripcion_filter = f"""
+            AND ({' OR '.join(term_clauses_desc)})
+        """
 
-    cte_base = f"""
+    where_clause = " AND ".join(where_main)
+
+    sql_rows = text(f"""
         WITH base AS (
             SELECT
-                f.id,
-                f.idfactura,
-                f.fecha,
-                f.vencimiento,
-                f.cliente_nombre,
-                f.estado,
-                f.subtotal,
-                COALESCE(f.impuestos_total, 0) AS impuestos,
-                COALESCE(f.total, 0) AS total,
-                COALESCE(f.pagos_total, 0) AS pagado_informado,
-                COALESCE(f.saldo, 0) AS saldo,
-                f.observaciones,
-                f.medio_pago,
-                f.public_url,
-                f.cost_center,
-                COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                cc.codigo AS centro_costo_codigo,
+                fe.factura_id,
+                fe.idfactura,
+                fe.fecha,
+                fe.vencimiento,
+                fe.cliente_nombre,
+                fe.estado,
+                fe.subtotal,
+                COALESCE(fe.impuestos_total, 0) AS impuestos,
+                COALESCE(fe.total, 0) AS total,
+                COALESCE(fe.saldo, 0) AS saldo,
+                fe.public_url,
+                fe.observaciones,
+                fe.medio_pago,
+                fe.cost_center,
+                fe.centro_costo_nombre,
+                fe.centro_costo_codigo,
+                fe.vendedor_nombre,
 
                 COALESCE((
                     SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(f.retenciones) AS r
-                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE jsonb_typeof(fe.retenciones) = 'array'
                       AND LOWER(COALESCE(r->>'type', '')) = 'reteica'
                 ), 0) AS reteica,
 
                 COALESCE((
                     SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(f.retenciones) AS r
-                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE jsonb_typeof(fe.retenciones) = 'array'
                       AND LOWER(COALESCE(r->>'type', '')) = 'reteiva'
                 ), 0) AS reteiva,
 
                 COALESCE((
                     SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(f.retenciones) AS r
-                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE jsonb_typeof(fe.retenciones) = 'array'
                       AND LOWER(COALESCE(r->>'type', '')) LIKE '%autorretencion%'
                 ), 0) AS autorretencion,
 
                 COALESCE((
                     SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(f.retenciones) AS r
-                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                    FROM jsonb_array_elements(fe.retenciones) AS r
+                    WHERE jsonb_typeof(fe.retenciones) = 'array'
                 ), 0) AS total_retenciones,
 
                 (
                     SELECT STRING_AGG(TRIM(fi2.descripcion), ' || ' ORDER BY TRIM(fi2.descripcion))
                     FROM siigo_factura_items fi2
-                    WHERE fi2.factura_id = f.id
-                      AND fi2.idcliente = f.idcliente
+                    WHERE fi2.factura_id = fe.factura_id
+                      AND fi2.idcliente = fe.idcliente
                       {descripcion_filter}
                 ) AS descripcion,
 
                 CASE
-                    WHEN ABS(COALESCE(f.saldo, 0)) <= 1 THEN 'pagada'
-                    WHEN ABS(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)) <= 1 THEN 'pendiente'
+                    WHEN ABS(COALESCE(fe.saldo, 0)) <= 1 THEN 'pagada'
+                    WHEN ABS(COALESCE(fe.total, 0) - COALESCE(fe.saldo, 0)) <= 1 THEN 'pendiente'
                     ELSE 'parcial'
-                END AS estado_pago_real,
-
-                GREATEST(COALESCE(f.total, 0) - COALESCE(f.saldo, 0), 0) AS pagado_real
-            FROM siigo_facturas f
-            LEFT JOIN siigo_centros_costo cc
-                ON cc.id = f.cost_center
+                END AS estado_pago_real
+            FROM facturas_enriquecidas fe
             WHERE {where_clause}
-            {busqueda_compuesta}
-        ),
-        filtrado AS (
-            SELECT *
-            FROM base
-            WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
+            {exists_filter}
         )
-    """
-
-    # -------------------------
-    # ROWS
-    # -------------------------
-    sql_rows = text(cte_base + """
-        SELECT
-            id,
-            id AS factura_id,
-            idfactura,
-            fecha,
-            vencimiento,
-            cliente_nombre,
-            estado,
-            estado_pago_real AS estado_pago,
-            estado_pago_real,
-            subtotal,
-            impuestos,
-            reteica,
-            reteiva,
-            autorretencion,
-            total_retenciones,
-            total,
-            saldo,
-            observaciones,
-            descripcion,
-            medio_pago,
-            public_url,
-            centro_costo_nombre,
-            centro_costo_codigo,
-            pagado_real
-        FROM filtrado
-        ORDER BY fecha DESC, id DESC
+        SELECT *
+        FROM base
+        WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
+        ORDER BY fecha DESC, idfactura DESC
         LIMIT :limit
     """)
 
@@ -802,35 +764,38 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
 
     rows = [{k: norm(v) for k, v in row.items()} for row in rows_raw]
 
-    # -------------------------
-    # KPIS
-    # -------------------------
-    sql_kpis = text(cte_base + """
-        SELECT
-            COALESCE(COUNT(*), 0) AS total_registros,
-            COALESCE(SUM(subtotal), 0) AS subtotal,
-            COALESCE(SUM(impuestos), 0) AS iva,
-            COALESCE(SUM(reteica), 0) AS reteica_total,
-            COALESCE(SUM(reteiva), 0) AS reteiva_total,
-            COALESCE(SUM(autorretencion), 0) AS autorretencion_total,
-            COALESCE(SUM(total_retenciones), 0) AS retenciones,
-            COALESCE(SUM(total), 0) AS total_facturado,
-            COALESCE(SUM(saldo), 0) AS saldo
-        FROM filtrado
-    """)
+    summary = {
+        "total_registros": len(rows),
+        "subtotal": float(sum((r.get("subtotal") or 0) for r in rows)),
+        "iva": float(sum((r.get("impuestos") or 0) for r in rows)),
+        "reteica_total": float(sum((r.get("reteica") or 0) for r in rows)),
+        "reteiva_total": float(sum((r.get("reteiva") or 0) for r in rows)),
+        "autorretencion_total": float(sum((r.get("autorretencion") or 0) for r in rows)),
+        "retenciones": float(sum((r.get("total_retenciones") or 0) for r in rows)),
+        "total_facturado": float(sum((r.get("total") or 0) for r in rows)),
+        "saldo": float(sum((r.get("saldo") or 0) for r in rows)),
+    }
 
-    kpis_row = db.session.execute(sql_kpis, params).mappings().first() or {}
-    kpis = {k: norm(v) for k, v in dict(kpis_row).items()}
-
-    # -------------------------
-    # SERIES
-    # -------------------------
-    sql_series = text(cte_base + """
+    sql_series = text(f"""
+        WITH base AS (
+            SELECT
+                fe.fecha,
+                COALESCE(fe.total, 0) AS total,
+                CASE
+                    WHEN ABS(COALESCE(fe.saldo, 0)) <= 1 THEN 'pagada'
+                    WHEN ABS(COALESCE(fe.total, 0) - COALESCE(fe.saldo, 0)) <= 1 THEN 'pendiente'
+                    ELSE 'parcial'
+                END AS estado_pago_real
+            FROM facturas_enriquecidas fe
+            WHERE {where_clause}
+            {exists_filter}
+        )
         SELECT
             TO_CHAR(date_trunc('month', fecha), 'YYYY-MM') AS mes,
             COALESCE(SUM(total), 0) AS total_facturado,
-            COALESCE(COUNT(*), 0) AS cantidad
-        FROM filtrado
+            COUNT(*) AS cantidad
+        FROM base
+        WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
         GROUP BY 1
         ORDER BY 1
     """)
@@ -841,7 +806,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
     return {
         "rows": rows,
         "count": len(rows),
-        "kpis": kpis,
+        "kpis": summary,
         "series": series,
         "filters": {
             "q": q,
@@ -8644,6 +8609,8 @@ def create_app():
 
 
     # ----------------------------------------------------------
+
+    # ----------------------------------------------------------
     # ENDPOINT: BÚSQUEDA INTELIGENTE DE FACTURAS
     # ----------------------------------------------------------
     @app.route("/reportes/busqueda-inteligente-facturas", methods=["GET"])
@@ -8654,7 +8621,10 @@ def create_app():
             perfilid = claims.get("perfilid")
             idcliente = claims.get("idcliente")
 
-            data = _obtener_busqueda_inteligente_facturas_data(idcliente=idcliente, perfilid=perfilid)
+            data = _obtener_busqueda_inteligente_facturas_data(
+                idcliente=idcliente,
+                perfilid=perfilid
+            )
 
             return jsonify({
                 "ok": True,
@@ -8688,7 +8658,11 @@ def create_app():
             perfilid = claims.get("perfilid")
             idcliente = claims.get("idcliente")
 
-            data = _obtener_busqueda_inteligente_facturas_data(idcliente=idcliente, perfilid=perfilid)
+            data = _obtener_busqueda_inteligente_facturas_data(
+                idcliente=idcliente,
+                perfilid=perfilid
+            )
+
             rows = data["rows"]
             kpis = data["kpis"]
             filtros = data["filters"]
@@ -8749,39 +8723,34 @@ def create_app():
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
 
-            # Formato moneda
-            money_cols = ["J", "K", "L", "M", "N", "O", "P", "Q"]
-            for col in money_cols:
+            for col in ["J", "K", "L", "M", "N", "O", "P", "Q"]:
                 for cell in ws[col]:
                     if cell.row > 1:
                         cell.number_format = '$ #,##0.00'
 
-            # Anchos
             widths = {
-                1: 14,   # Fecha
-                2: 18,   # Factura
-                3: 35,   # Cliente
-                4: 28,   # Centro de costo
-                5: 18,   # Código CC
-                6: 18,   # Estado factura
-                7: 18,   # Estado pago
-                8: 60,   # Descripción
-                9: 45,   # Observaciones
-                10: 16,  # Subtotal
-                11: 16,  # IVA
-                12: 16,  # ReteICA
-                13: 16,  # ReteIVA
-                14: 18,  # Autorretención
-                15: 18,  # Total retenciones
-                16: 16,  # Total
-                17: 16,  # Saldo
-                18: 28,  # URL
+                1: 14,
+                2: 18,
+                3: 35,
+                4: 28,
+                5: 18,
+                6: 18,
+                7: 18,
+                8: 60,
+                9: 45,
+                10: 16,
+                11: 16,
+                12: 16,
+                13: 16,
+                14: 18,
+                15: 18,
+                16: 16,
+                17: 16,
+                18: 28,
             }
-
             for i, width in widths.items():
                 ws.column_dimensions[get_column_letter(i)].width = width
 
-            # Hoja resumen
             rs = wb.create_sheet("Resumen")
             rs["A1"] = "Resumen búsqueda inteligente de facturas"
             rs["A1"].font = Font(bold=True, size=14)
@@ -8808,14 +8777,11 @@ def create_app():
             rs.append(["Desde", filtros.get("desde") or ""])
             rs.append(["Hasta", filtros.get("hasta") or ""])
 
-            for cell in rs["A"]:
-                cell.font = Font(bold=cell.row in [1, 13])
-
             for row in range(3, 11):
                 rs[f"B{row}"].number_format = '$ #,##0.00'
 
             rs.column_dimensions["A"].width = 28
-            rs.column_dimensions["B"].width = 24
+            rs.column_dimensions["B"].width = 28
 
             output = BytesIO()
             wb.save(output)
