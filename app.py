@@ -9253,8 +9253,10 @@ def create_app():
             # Detectar permisos específicos
             if "facturas-buscador" in request.path or "buscador-facturas" in request.path:
                 codigo = "ver_reporte_buscador_facturas"
-            if "compras-gastos" in request.path:
+            elif "compras-gastos" in request.path:
                 codigo = "ver_reporte_compras_gastos"
+            elif "auxiliares/indicadores-financieros" in request.path or "indicadores-financieros-auxiliares" in request.path:
+                codigo = "ver_reporte_indicadores_auxiliares"
             elif "indicadores" in request.path:
                 codigo = "ver_reporte_indicadores"
             elif "ventas" in request.path:
@@ -9284,7 +9286,6 @@ def create_app():
             elif "pnl_v1" in request.path or "estado-resultados" in request.path or "estado_resultados" in request.path:
                 codigo = "ver_reporte_estado_resultados"
             else:
-                # Si no se reconoce un reporte específico, usa permiso general
                 codigo = "ver_reportes"
 
         # Si no hay permiso requerido, no aplica control
