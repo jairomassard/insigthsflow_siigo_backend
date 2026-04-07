@@ -572,6 +572,293 @@ def procesar_excel_auxiliar_v2(file_storage, idcliente):
             
     return registros
 
+# ==========================================================
+# BÚSQUEDA INTELIGENTE DE FACTURAS + EXPORTACIÓN A EXCEL
+# ==========================================================
+
+def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    q_idcliente = request.args.get("idcliente", type=int)
+    if perfilid == 0 and q_idcliente:
+        idcliente = q_idcliente
+
+    if not idcliente:
+        raise ValueError("No autorizado")
+
+    q = (request.args.get("q") or "").strip().lower()
+    factura = (request.args.get("factura") or request.args.get("idfactura") or "").strip()
+    cliente = (request.args.get("cliente") or "").strip()
+    desde = request.args.get("desde") or "2025-01-01"
+    hasta = request.args.get("hasta") or datetime.now().strftime("%Y-%m-%d")
+    cost_center = request.args.get("cost_center", type=int)
+    estado_pago = (request.args.get("estado_pago") or "").strip().lower()
+    estado_factura = (request.args.get("estado_factura") or request.args.get("estado") or "").strip().lower()
+    limit = request.args.get("limit", type=int) or 5000
+
+    # incluir completo el día final
+    hasta_dt = datetime.strptime(hasta, "%Y-%m-%d") + timedelta(days=1)
+    hasta_sql = hasta_dt.strftime("%Y-%m-%d")
+
+    # alias tolerantes
+    aliases = {
+        "zapier": ["zapier", "zappier"],
+        "zappier": ["zapier", "zappier"],
+    }
+    terminos = aliases.get(q, [q] if q else [])
+
+    params = {
+        "idcliente": idcliente,
+        "desde": desde,
+        "hasta": hasta_sql,
+        "limit": limit,
+        "estado_pago": estado_pago,
+    }
+
+    wh = [
+        "f.idcliente = :idcliente",
+        "f.fecha >= :desde",
+        "f.fecha < :hasta",
+    ]
+
+    if factura:
+        wh.append("LOWER(COALESCE(f.idfactura, '')) LIKE :factura")
+        params["factura"] = f"%{factura.lower()}%"
+
+    if cliente:
+        # catálogo de clientes usa nombre como id
+        wh.append("f.cliente_nombre = :cliente")
+        params["cliente"] = cliente
+
+    if cost_center:
+        wh.append("f.cost_center = :cost_center")
+        params["cost_center"] = cost_center
+
+    if estado_factura:
+        wh.append("LOWER(COALESCE(f.estado, '')) = :estado_factura")
+        params["estado_factura"] = estado_factura
+
+    descripcion_filter = ""
+    busqueda_compuesta = ""
+
+    if terminos:
+        term_clauses_exists = []
+        term_clauses_desc = []
+        term_clauses_header = []
+
+        for i, term in enumerate(terminos):
+            key = f"term_{i}"
+            params[key] = f"%{term}%"
+
+            term_clauses_exists.append(f"LOWER(COALESCE(fi.descripcion, '')) LIKE LOWER(:{key})")
+            term_clauses_desc.append(f"LOWER(COALESCE(fi2.descripcion, '')) LIKE LOWER(:{key})")
+
+            term_clauses_header.extend([
+                f"LOWER(COALESCE(f.idfactura, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(f.cliente_nombre, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(f.observaciones, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(f.medio_pago, '')) LIKE LOWER(:{key})",
+            ])
+
+        descripcion_filter = f"""
+            AND ({' OR '.join(term_clauses_desc)})
+        """
+
+        busqueda_compuesta = f"""
+            AND (
+                {' OR '.join(term_clauses_header)}
+                OR EXISTS (
+                    SELECT 1
+                    FROM siigo_factura_items fi
+                    WHERE fi.factura_id = f.id
+                      AND fi.idcliente = f.idcliente
+                      AND ({' OR '.join(term_clauses_exists)})
+                )
+            )
+        """
+
+    where_clause = " AND ".join(wh)
+
+    cte_base = f"""
+        WITH base AS (
+            SELECT
+                f.id,
+                f.idfactura,
+                f.fecha,
+                f.vencimiento,
+                f.cliente_nombre,
+                f.estado,
+                f.subtotal,
+                COALESCE(f.impuestos_total, 0) AS impuestos,
+                COALESCE(f.total, 0) AS total,
+                COALESCE(f.pagos_total, 0) AS pagado_informado,
+                COALESCE(f.saldo, 0) AS saldo,
+                f.observaciones,
+                f.medio_pago,
+                f.public_url,
+                f.cost_center,
+                COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                cc.codigo AS centro_costo_codigo,
+
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(f.retenciones) AS r
+                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                      AND LOWER(COALESCE(r->>'type', '')) = 'reteica'
+                ), 0) AS reteica,
+
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(f.retenciones) AS r
+                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                      AND LOWER(COALESCE(r->>'type', '')) = 'reteiva'
+                ), 0) AS reteiva,
+
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(f.retenciones) AS r
+                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                      AND LOWER(COALESCE(r->>'type', '')) LIKE '%autorretencion%'
+                ), 0) AS autorretencion,
+
+                COALESCE((
+                    SELECT SUM((r->>'value')::numeric)
+                    FROM jsonb_array_elements(f.retenciones) AS r
+                    WHERE jsonb_typeof(f.retenciones) = 'array'
+                ), 0) AS total_retenciones,
+
+                (
+                    SELECT STRING_AGG(TRIM(fi2.descripcion), ' || ' ORDER BY TRIM(fi2.descripcion))
+                    FROM siigo_factura_items fi2
+                    WHERE fi2.factura_id = f.id
+                      AND fi2.idcliente = f.idcliente
+                      {descripcion_filter}
+                ) AS descripcion,
+
+                CASE
+                    WHEN ABS(COALESCE(f.saldo, 0)) <= 1 THEN 'pagada'
+                    WHEN ABS(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)) <= 1 THEN 'pendiente'
+                    ELSE 'parcial'
+                END AS estado_pago_real,
+
+                GREATEST(COALESCE(f.total, 0) - COALESCE(f.saldo, 0), 0) AS pagado_real
+            FROM siigo_facturas f
+            LEFT JOIN siigo_centros_costo cc
+                ON cc.id = f.cost_center
+            WHERE {where_clause}
+            {busqueda_compuesta}
+        ),
+        filtrado AS (
+            SELECT *
+            FROM base
+            WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
+        )
+    """
+
+    # -------------------------
+    # ROWS
+    # -------------------------
+    sql_rows = text(cte_base + """
+        SELECT
+            id,
+            id AS factura_id,
+            idfactura,
+            fecha,
+            vencimiento,
+            cliente_nombre,
+            estado,
+            estado_pago_real AS estado_pago,
+            estado_pago_real,
+            subtotal,
+            impuestos,
+            reteica,
+            reteiva,
+            autorretencion,
+            total_retenciones,
+            total,
+            saldo,
+            observaciones,
+            descripcion,
+            medio_pago,
+            public_url,
+            centro_costo_nombre,
+            centro_costo_codigo,
+            pagado_real
+        FROM filtrado
+        ORDER BY fecha DESC, id DESC
+        LIMIT :limit
+    """)
+
+    rows_raw = db.session.execute(sql_rows, params).mappings().all()
+
+    def norm(v):
+        if isinstance(v, Decimal):
+            return float(v)
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return v
+
+    rows = [{k: norm(v) for k, v in row.items()} for row in rows_raw]
+
+    # -------------------------
+    # KPIS
+    # -------------------------
+    sql_kpis = text(cte_base + """
+        SELECT
+            COALESCE(COUNT(*), 0) AS total_registros,
+            COALESCE(SUM(subtotal), 0) AS subtotal,
+            COALESCE(SUM(impuestos), 0) AS iva,
+            COALESCE(SUM(reteica), 0) AS reteica_total,
+            COALESCE(SUM(reteiva), 0) AS reteiva_total,
+            COALESCE(SUM(autorretencion), 0) AS autorretencion_total,
+            COALESCE(SUM(total_retenciones), 0) AS retenciones,
+            COALESCE(SUM(total), 0) AS total_facturado,
+            COALESCE(SUM(saldo), 0) AS saldo
+        FROM filtrado
+    """)
+
+    kpis_row = db.session.execute(sql_kpis, params).mappings().first() or {}
+    kpis = {k: norm(v) for k, v in dict(kpis_row).items()}
+
+    # -------------------------
+    # SERIES
+    # -------------------------
+    sql_series = text(cte_base + """
+        SELECT
+            TO_CHAR(date_trunc('month', fecha), 'YYYY-MM') AS mes,
+            COALESCE(SUM(total), 0) AS total_facturado,
+            COALESCE(COUNT(*), 0) AS cantidad
+        FROM filtrado
+        GROUP BY 1
+        ORDER BY 1
+    """)
+
+    series_raw = db.session.execute(sql_series, params).mappings().all()
+    series = [{k: norm(v) for k, v in row.items()} for row in series_raw]
+
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "kpis": kpis,
+        "series": series,
+        "filters": {
+            "q": q,
+            "factura": factura,
+            "cliente": cliente,
+            "cost_center": cost_center,
+            "estado_pago": estado_pago,
+            "estado_factura": estado_factura,
+            "desde": desde,
+            "hasta": hasta,
+            "terminos_aplicados": terminos,
+        },
+    }
+
+
+
+
 
 def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
@@ -8356,249 +8643,195 @@ def create_app():
             }), 500
 
 
-    # Endpoint para hacer la busqueda inteligente de facturas pro criterios de busqueda
+    # ----------------------------------------------------------
+    # ENDPOINT: BÚSQUEDA INTELIGENTE DE FACTURAS
+    # ----------------------------------------------------------
     @app.route("/reportes/busqueda-inteligente-facturas", methods=["GET"])
     @jwt_required()
     def busqueda_inteligente_facturas():
-        from sqlalchemy import text
-
-        claims = get_jwt()
-        perfilid = claims.get("perfilid")
-        idcliente = claims.get("idcliente")
-
-        q_idcliente = request.args.get("idcliente", type=int)
-        if perfilid == 0 and q_idcliente:
-            idcliente = q_idcliente
-
-        if not idcliente:
-            return jsonify({"error": "No autorizado"}), 403
-
-        q = (request.args.get("q") or "").strip()
-        factura = (request.args.get("factura") or "").strip()
-        cliente = (request.args.get("cliente") or "").strip()
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        cost_center = request.args.get("cost_center", type=int)
-        estado_pago = (request.args.get("estado_pago") or "").strip().lower()
-        estado_factura = (request.args.get("estado_factura") or "").strip().lower()
-        limit = request.args.get("limit", type=int) or 5000
-
         try:
-            wh = ["f.idcliente = :idcliente"]
-            params = {"idcliente": idcliente, "limit": limit}
+            claims = get_jwt()
+            perfilid = claims.get("perfilid")
+            idcliente = claims.get("idcliente")
 
-            if desde:
-                wh.append("f.fecha >= :desde")
-                params["desde"] = desde
-
-            if hasta:
-                wh.append("f.fecha <= :hasta")
-                params["hasta"] = hasta
-
-            if factura:
-                wh.append("LOWER(COALESCE(f.idfactura, '')) LIKE :factura")
-                params["factura"] = f"%{factura.lower()}%"
-
-            if cliente:
-                wh.append("f.cliente_nombre = :cliente")
-                params["cliente"] = cliente
-
-            if cost_center:
-                wh.append("f.cost_center = :cost_center")
-                params["cost_center"] = cost_center
-
-            if estado_factura:
-                wh.append("LOWER(COALESCE(f.estado, '')) = :estado_factura")
-                params["estado_factura"] = estado_factura
-
-            if q:
-                wh.append("""
-                    (
-                        LOWER(COALESCE(f.idfactura, '')) LIKE :q
-                        OR LOWER(COALESCE(f.cliente_nombre, '')) LIKE :q
-                        OR LOWER(COALESCE(f.observaciones, '')) LIKE :q
-                        OR LOWER(COALESCE(f.medio_pago, '')) LIKE :q
-                    )
-                """)
-                params["q"] = f"%{q.lower()}%"
-
-            where_clause = " AND ".join(wh)
-
-            sql = text(f"""
-                WITH base AS (
-                    SELECT
-                        f.id,
-                        f.idfactura,
-                        f.fecha,
-                        f.vencimiento,
-                        f.cliente_nombre,
-                        f.estado,
-                        f.subtotal,
-                        COALESCE(f.impuestos_total, 0) AS impuestos,
-                        COALESCE(f.total, 0) AS total,
-                        COALESCE(f.pagos_total, 0) AS pagado_informado,
-                        COALESCE(f.saldo, 0) AS saldo,
-                        f.observaciones,
-                        f.medio_pago,
-                        f.public_url,
-                        f.cost_center,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                        CASE
-                            WHEN ABS(COALESCE(f.saldo, 0)) <= 1 THEN 'pagada'
-                            WHEN ABS(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)) <= 1 THEN 'pendiente'
-                            ELSE 'parcial'
-                        END AS estado_pago_real,
-                        GREATEST(COALESCE(f.total, 0) - COALESCE(f.saldo, 0), 0) AS pagado_real
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON cc.id = f.cost_center
-                    WHERE {where_clause}
-                )
-                SELECT *
-                FROM base
-                WHERE (
-                    :estado_pago = ''
-                    OR estado_pago_real = :estado_pago
-                )
-                ORDER BY fecha DESC, id DESC
-                LIMIT :limit
-            """)
-
-            params["estado_pago"] = estado_pago
-
-            rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
-
-            # KPIs
-            subtotal = sum(float(r["subtotal"] or 0) for r in rows)
-            iva = sum(float(r["impuestos"] or 0) for r in rows)
-            total = sum(float(r["total"] or 0) for r in rows)
-            saldo = sum(float(r["saldo"] or 0) for r in rows)
-
-            # Retenciones desde JSON si existe en la tabla
-            sql_ret = text(f"""
-                SELECT COALESCE(SUM((
-                    SELECT COALESCE(SUM((elem->>'value')::numeric), 0)
-                    FROM jsonb_array_elements(f.retenciones) elem
-                    WHERE jsonb_typeof(f.retenciones) = 'array'
-                )), 0) AS retenciones
-                FROM siigo_facturas f
-                WHERE {where_clause}
-            """)
-            ret_row = db.session.execute(sql_ret, params).mappings().first()
-            retenciones = float((ret_row or {}).get("retenciones") or 0)
-
-            # Serie mensual
-            sql_series = text(f"""
-                SELECT
-                    TO_CHAR(date_trunc('month', f.fecha), 'YYYY-MM') AS mes,
-                    COALESCE(SUM(f.total), 0) AS total_facturado
-                FROM siigo_facturas f
-                WHERE {where_clause}
-                GROUP BY 1
-                ORDER BY 1
-            """)
-            series = [dict(r) for r in db.session.execute(sql_series, params).mappings().all()]
+            data = _obtener_busqueda_inteligente_facturas_data(idcliente=idcliente, perfilid=perfilid)
 
             return jsonify({
-                "rows": rows,
-                "count": len(rows),
-                "kpis": {
-                    "subtotal": subtotal,
-                    "iva": iva,
-                    "retenciones": retenciones,
-                    "total_facturado": total,
-                    "saldo": saldo,
-                },
-                "series": series,
+                "ok": True,
+                "rows": data["rows"],
+                "count": data["count"],
+                "kpis": data["kpis"],
+                "series": data["series"],
+                "filters": data["filters"],
             })
 
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 403
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"ok": False, "error": str(e)}), 500
 
 
-    # Endpoint para exportar a excella busqueda de las facturas para un reporte a presentar
+    # ----------------------------------------------------------
+    # ENDPOINT: EXPORTAR BÚSQUEDA INTELIGENTE A EXCEL
+    # ----------------------------------------------------------
     @app.route("/reportes/busqueda-inteligente-facturas/export.xlsx", methods=["GET"])
     @jwt_required()
     def export_busqueda_inteligente_facturas_excel():
         from io import BytesIO
         from flask import send_file
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill
+        from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
 
-        # ideal: reutilizar la misma función que arma rows/kpis/series
-        # para no duplicar lógica
+        try:
+            claims = get_jwt()
+            perfilid = claims.get("perfilid")
+            idcliente = claims.get("idcliente")
 
-        data = ...  # rows, kpis, filtros
-        rows = data["rows"]
-        kpis = data["kpis"]
+            data = _obtener_busqueda_inteligente_facturas_data(idcliente=idcliente, perfilid=perfilid)
+            rows = data["rows"]
+            kpis = data["kpis"]
+            filtros = data["filters"]
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Resultados"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Resultados"
 
-        headers = [
-            "Fecha", "Factura", "Cliente", "Centro de costo",
-            "Estado factura", "Estado pago", "Subtotal",
-            "IVA", "Total", "Saldo", "Observaciones", "URL"
-        ]
-        ws.append(headers)
+            headers = [
+                "Fecha",
+                "Factura",
+                "Cliente",
+                "Centro de costo",
+                "Código centro costo",
+                "Estado factura",
+                "Estado pago",
+                "Descripción",
+                "Observaciones",
+                "Subtotal",
+                "IVA",
+                "ReteICA",
+                "ReteIVA",
+                "Autorretención",
+                "Total retenciones",
+                "Total",
+                "Saldo",
+                "URL",
+            ]
+            ws.append(headers)
 
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="1E3A8A")
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1E3A8A")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        for r in rows:
-            ws.append([
-                r.get("fecha"),
-                r.get("idfactura"),
-                r.get("cliente_nombre"),
-                r.get("centro_costo_nombre"),
-                r.get("estado"),
-                r.get("estado_pago_real"),
-                float(r.get("subtotal") or 0),
-                float(r.get("impuestos") or 0),
-                float(r.get("total") or 0),
-                float(r.get("saldo") or 0),
-                r.get("observaciones"),
-                r.get("public_url"),
-            ])
+            for r in rows:
+                ws.append([
+                    r.get("fecha"),
+                    r.get("idfactura"),
+                    r.get("cliente_nombre"),
+                    r.get("centro_costo_nombre"),
+                    r.get("centro_costo_codigo"),
+                    r.get("estado"),
+                    r.get("estado_pago_real") or r.get("estado_pago"),
+                    r.get("descripcion"),
+                    r.get("observaciones"),
+                    float(r.get("subtotal") or 0),
+                    float(r.get("impuestos") or 0),
+                    float(r.get("reteica") or 0),
+                    float(r.get("reteiva") or 0),
+                    float(r.get("autorretencion") or 0),
+                    float(r.get("total_retenciones") or 0),
+                    float(r.get("total") or 0),
+                    float(r.get("saldo") or 0),
+                    r.get("public_url"),
+                ])
 
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
 
-        for col in ["G", "H", "I", "J"]:
-            for cell in ws[col]:
-                if cell.row > 1:
-                    cell.number_format = '$ #,##0.00'
+            # Formato moneda
+            money_cols = ["J", "K", "L", "M", "N", "O", "P", "Q"]
+            for col in money_cols:
+                for cell in ws[col]:
+                    if cell.row > 1:
+                        cell.number_format = '$ #,##0.00'
 
-        for i, width in {
-            1: 14, 2: 18, 3: 35, 4: 24, 5: 18, 6: 18,
-            7: 16, 8: 16, 9: 16, 10: 16, 11: 40, 12: 22
-        }.items():
-            ws.column_dimensions[get_column_letter(i)].width = width
+            # Anchos
+            widths = {
+                1: 14,   # Fecha
+                2: 18,   # Factura
+                3: 35,   # Cliente
+                4: 28,   # Centro de costo
+                5: 18,   # Código CC
+                6: 18,   # Estado factura
+                7: 18,   # Estado pago
+                8: 60,   # Descripción
+                9: 45,   # Observaciones
+                10: 16,  # Subtotal
+                11: 16,  # IVA
+                12: 16,  # ReteICA
+                13: 16,  # ReteIVA
+                14: 18,  # Autorretención
+                15: 18,  # Total retenciones
+                16: 16,  # Total
+                17: 16,  # Saldo
+                18: 28,  # URL
+            }
 
-        rs = wb.create_sheet("Resumen")
-        rs["A1"] = "Resumen búsqueda inteligente"
-        rs["A1"].font = Font(bold=True, size=14)
-        rs.append([])
-        rs.append(["Facturas encontradas", len(rows)])
-        rs.append(["Subtotal", float(kpis.get("subtotal") or 0)])
-        rs.append(["IVA", float(kpis.get("iva") or 0)])
-        rs.append(["Retenciones", float(kpis.get("retenciones") or 0)])
-        rs.append(["Total facturado", float(kpis.get("total_facturado") or 0)])
-        rs.append(["Saldo", float(kpis.get("saldo") or 0)])
+            for i, width in widths.items():
+                ws.column_dimensions[get_column_letter(i)].width = width
 
-        output = BytesIO()
-        wb.save(output)
-        output.seek(0)
+            # Hoja resumen
+            rs = wb.create_sheet("Resumen")
+            rs["A1"] = "Resumen búsqueda inteligente de facturas"
+            rs["A1"].font = Font(bold=True, size=14)
 
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name="busqueda_inteligente_facturas.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            rs.append([])
+            rs.append(["Facturas encontradas", int(data["count"])])
+            rs.append(["Subtotal", float(kpis.get("subtotal") or 0)])
+            rs.append(["IVA", float(kpis.get("iva") or 0)])
+            rs.append(["ReteICA", float(kpis.get("reteica_total") or 0)])
+            rs.append(["ReteIVA", float(kpis.get("reteiva_total") or 0)])
+            rs.append(["Autorretención", float(kpis.get("autorretencion_total") or 0)])
+            rs.append(["Retenciones", float(kpis.get("retenciones") or 0)])
+            rs.append(["Total facturado", float(kpis.get("total_facturado") or 0)])
+            rs.append(["Saldo", float(kpis.get("saldo") or 0)])
+
+            rs.append([])
+            rs.append(["Filtros aplicados", ""])
+            rs.append(["Palabra clave", filtros.get("q") or ""])
+            rs.append(["Factura", filtros.get("factura") or ""])
+            rs.append(["Cliente", filtros.get("cliente") or ""])
+            rs.append(["Centro de costo", filtros.get("cost_center") or ""])
+            rs.append(["Estado pago", filtros.get("estado_pago") or ""])
+            rs.append(["Estado factura", filtros.get("estado_factura") or ""])
+            rs.append(["Desde", filtros.get("desde") or ""])
+            rs.append(["Hasta", filtros.get("hasta") or ""])
+
+            for cell in rs["A"]:
+                cell.font = Font(bold=cell.row in [1, 13])
+
+            for row in range(3, 11):
+                rs[f"B{row}"].number_format = '$ #,##0.00'
+
+            rs.column_dimensions["A"].width = 28
+            rs.column_dimensions["B"].width = 24
+
+            output = BytesIO()
+            wb.save(output)
+            output.seek(0)
+
+            return send_file(
+                output,
+                as_attachment=True,
+                download_name="busqueda_inteligente_facturas.xlsx",
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 403
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
 
  
