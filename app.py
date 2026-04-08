@@ -65,7 +65,11 @@ import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
 
-from balance import regenerar_snapshots_balance, construir_balance_general
+from balance import (
+    regenerar_snapshot_saldos_corte,
+    regenerar_snapshots_balance,
+    construir_balance_general,
+)
 
 
 HEADER_MAP = {
@@ -8623,26 +8627,25 @@ def create_app():
         fecha_hasta = date(anio, mes_fin, monthrange(anio, mes_fin)[1])
 
         try:
-            # 1) Regenerar snapshot para el corte final del período
+            # Snapshot del corte final
             regenerar_snapshot_saldos_corte(idcliente, str(fecha_hasta))
 
-            # 2) Tomar balance general reconstruido
+            # Balance al corte final
             balance = construir_balance_general(idcliente, str(fecha_hasta))
             if not balance.get("ok"):
-                return jsonify({"error": balance.get("error", "No fue posible construir el balance general")}), 400
+                return jsonify({
+                    "error": balance.get("error", "No fue posible construir el balance general")
+                }), 400
 
             bk = balance.get("kpis", {})
             meta_balance = balance.get("meta", {})
             resumen_balance = balance.get("resumen", {})
 
-            # 3) Tomar P&L del período
+            # P&L del período
             pnl = construir_pnl_auxiliares(idcliente, str(fecha_desde), str(fecha_hasta))
             pk = pnl.get("kpis", {})
             evolucion_pnl = pnl.get("evolucion", [])
 
-            # =========================
-            # Variables base
-            # =========================
             activo_corriente = float(bk.get("activo_corriente", 0) or 0)
             activo_no_corriente = float(bk.get("activo_no_corriente", 0) or 0)
             activo_total = float(bk.get("activos_totales", 0) or 0)
@@ -8656,15 +8659,9 @@ def create_app():
 
             ingresos = float(pk.get("ingresos_totales", 0) or 0)
             costos = float(pk.get("costos_venta", 0) or 0)
-            gastos = float(
-                (pk.get("gastos_operacionales", 0) or 0) +
-                (pk.get("gastos_no_operacionales", 0) or 0)
-            )
+            gastos = float((pk.get("gastos_operacionales", 0) or 0) + (pk.get("gastos_no_operacionales", 0) or 0))
             utilidad_neta = float(pk.get("utilidad_neta", 0) or 0)
 
-            # =========================
-            # Indicadores
-            # =========================
             liquidez = round(activo_corriente / pasivo_corto, 2) if pasivo_corto else None
             apalancamiento = round(pasivo_total / activo_total, 2) if activo_total else None
             rentabilidad = round(utilidad_neta / ingresos, 2) if ingresos else None
@@ -8686,7 +8683,6 @@ def create_app():
                 "porcentaje_activo_no_corriente": porcentaje_activo_no_corriente,
                 "cobertura_activo_pasivo": cobertura_activo_pasivo,
                 "endeudamiento_largo_plazo": endeudamiento_largo_plazo,
-
                 "activo_total": round(activo_total, 2),
                 "pasivo_total": round(pasivo_total, 2),
                 "patrimonio": round(patrimonio, 2),
@@ -8696,59 +8692,21 @@ def create_app():
                 "utilidad_neta": round(utilidad_neta, 2),
             }
 
-            # =========================
-            # Interpretaciones
-            # =========================
-            def interpretar_indicador_local(k, v):
-                if v is None:
-                    return "Sin datos suficientes para interpretar."
-                if k == "liquidez":
-                    if v < 1:
-                        return "La empresa no alcanza a cubrir sus obligaciones de corto plazo."
-                    if v < 2:
-                        return "La liquidez es aceptable."
-                    return "La posición de liquidez es holgada."
-                if k == "apalancamiento":
-                    if v > 0.8:
-                        return "La empresa depende fuertemente de deuda."
-                    if v > 0.6:
-                        return "El endeudamiento es moderado."
-                    return "El endeudamiento está controlado."
-                if k == "rentabilidad":
-                    if v < 0:
-                        return "La operación generó pérdidas."
-                    if v < 0.1:
-                        return "La rentabilidad es positiva pero baja."
-                    return "La rentabilidad es saludable."
-                if k == "autonomia":
-                    if v < 0.3:
-                        return "Existe alta dependencia de recursos de terceros."
-                    if v < 0.5:
-                        return "La autonomía financiera es media."
-                    return "La autonomía financiera es buena."
-                if k == "solvencia":
-                    if v < 1:
-                        return "Existe riesgo para cubrir pasivos con activos."
-                    if v < 1.5:
-                        return "La solvencia es ajustada."
-                    return "La solvencia es sólida."
-                if k == "capital_trabajo":
-                    return "Capital de trabajo positivo." if v >= 0 else "Capital de trabajo negativo."
-                return "Indicador calculado correctamente."
-
-            interpretaciones = {k: interpretar_indicador_local(k, v) for k, v in indicadores.items()}
+            interpretaciones = {
+                k: interpretar_indicador(k, v) for k, v in indicadores.items()
+            }
 
             explicaciones = {
-                "liquidez": "Activo corriente / Pasivo a corto. >1 saludable; >2 holgado.",
-                "apalancamiento": "Pasivo total / Activo total. <0.6 ideal; >0.8 alto.",
-                "rentabilidad": "Utilidad neta / Ingresos. >0 indica margen neto positivo.",
-                "capital_trabajo": "Activo corriente − Pasivo corto. >0 indica colchón operativo.",
-                "solvencia": "Activo total / Pasivo total. >1 indica cobertura de deudas.",
-                "autonomia": "Patrimonio / Activo total. >0.5 indica menor dependencia de deuda.",
-                "porcentaje_pasivo_corto": "Proporción de deuda exigible en el corto plazo.",
-                "porcentaje_activo_no_corriente": "Proporción de activos menos líquidos.",
-                "cobertura_activo_pasivo": "Cobertura de pasivos con activos.",
-                "endeudamiento_largo_plazo": "Deuda de largo plazo frente al patrimonio.",
+                "liquidez": "Activo corriente / Pasivo corriente.",
+                "apalancamiento": "Pasivo total / Activo total.",
+                "rentabilidad": "Utilidad neta / Ingresos.",
+                "capital_trabajo": "Activo corriente - Pasivo corriente.",
+                "solvencia": "Activo total / Pasivo total.",
+                "autonomia": "Patrimonio / Activo total.",
+                "porcentaje_pasivo_corto": "Pasivo corriente / Pasivo total.",
+                "porcentaje_activo_no_corriente": "Activo no corriente / Activo total.",
+                "cobertura_activo_pasivo": "Activo total / Pasivo total.",
+                "endeudamiento_largo_plazo": "Pasivo no corriente / Patrimonio.",
             }
 
             resumen_financiero = [
@@ -8756,22 +8714,19 @@ def create_app():
                 {"clase": "Activo no corriente", "valor": round(activo_no_corriente, 2), "interpretacion": "Activos de permanencia o recuperación a largo plazo."},
                 {"clase": "Activo total", "valor": round(activo_total, 2), "interpretacion": "Total de recursos controlados por la empresa."},
                 {"clase": "Pasivo corto plazo", "valor": round(pasivo_corto, 2), "interpretacion": "Obligaciones exigibles en el corto plazo."},
-                {"clase": "Pasivo largo plazo", "valor": round(pasivo_largo, 2), "interpretacion": "Obligaciones financieras y deudas a largo plazo."},
+                {"clase": "Pasivo largo plazo", "valor": round(pasivo_largo, 2), "interpretacion": "Obligaciones a largo plazo."},
                 {"clase": "Pasivo total", "valor": round(pasivo_total, 2), "interpretacion": "Total de obligaciones con terceros."},
-                {"clase": "Patrimonio", "valor": round(patrimonio, 2), "interpretacion": "Recursos propios de los socios o acumulados."},
-                {"clase": "Ingresos", "valor": round(ingresos, 2), "interpretacion": "Ventas o ingresos operacionales del período."},
-                {"clase": "Costos", "valor": round(costos, 2), "interpretacion": "Costos directos asociados a la operación."},
-                {"clase": "Gastos", "valor": round(gastos, 2), "interpretacion": "Gastos administrativos, operativos y otros del período."},
-                {"clase": "Utilidad neta", "valor": round(utilidad_neta, 2), "interpretacion": "Resultado neto del período analizado."},
+                {"clase": "Patrimonio", "valor": round(patrimonio, 2), "interpretacion": "Recursos propios."},
+                {"clase": "Ingresos", "valor": round(ingresos, 2), "interpretacion": "Ingresos del período."},
+                {"clase": "Costos", "valor": round(costos, 2), "interpretacion": "Costos del período."},
+                {"clase": "Gastos", "valor": round(gastos, 2), "interpretacion": "Gastos del período."},
+                {"clase": "Utilidad neta", "valor": round(utilidad_neta, 2), "interpretacion": "Resultado neto del período."},
             ]
 
             evolucion_mensual = []
             for item in evolucion_pnl:
                 ingresos_mes = float(item.get("ingresos_totales", 0) or 0)
                 utilidad_neta_mes = float(item.get("utilidad_neta", 0) or 0)
-
-                # Para activo/pasivo/patrimonio mensual idealmente conviene recalcular balance por mes;
-                # por ahora dejamos la evolución mensual basada en P&L para no romper consistencia principal.
                 evolucion_mensual.append({
                     "mes": item.get("label"),
                     "utilidad_neta": round(utilidad_neta_mes, 2),
@@ -8779,35 +8734,6 @@ def create_app():
                 })
 
             conclusiones = []
-            if indicadores["liquidez"] is not None:
-                if indicadores["liquidez"] < 1:
-                    conclusiones.append("⚠ Riesgo de iliquidez: el activo corriente no cubre el pasivo de corto plazo.")
-                elif indicadores["liquidez"] > 3:
-                    conclusiones.append("⚠ Exceso de liquidez: podría existir dinero ocioso o baja eficiencia en el uso del capital.")
-                else:
-                    conclusiones.append("✅ Liquidez saludable para responder a obligaciones cercanas.")
-
-            if indicadores["apalancamiento"] is not None:
-                if indicadores["apalancamiento"] > 0.8:
-                    conclusiones.append("⚠ Alto nivel de apalancamiento: una porción importante de los activos está financiada con deuda.")
-                elif indicadores["apalancamiento"] > 0.6:
-                    conclusiones.append("• El apalancamiento es moderado y conviene monitorearlo.")
-                else:
-                    conclusiones.append("✅ La estructura de endeudamiento luce controlada.")
-
-            if indicadores["rentabilidad"] is not None:
-                if indicadores["rentabilidad"] < 0:
-                    conclusiones.append("🔻 La empresa presenta pérdida neta en el período analizado.")
-                elif indicadores["rentabilidad"] < 0.1:
-                    conclusiones.append("• La empresa sí genera utilidad, pero con margen bajo.")
-                else:
-                    conclusiones.append("✅ La rentabilidad neta del período es positiva y saludable.")
-
-            if indicadores["autonomia"] is not None and indicadores["autonomia"] < 0.3:
-                conclusiones.append("⚠ La autonomía financiera es baja y existe fuerte dependencia de terceros.")
-
-            if patrimonio <= 0:
-                conclusiones.append("❗ El patrimonio es nulo o negativo, situación que requiere revisión prioritaria.")
 
             return jsonify({
                 "resumen_financiero": resumen_financiero,
@@ -8823,13 +8749,13 @@ def create_app():
                     "mes_fin": mes_fin,
                     "fecha_desde": str(fecha_desde),
                     "fecha_hasta": str(fecha_hasta),
-                    "nota": "Los indicadores de balance se toman del balance general reconstruido desde auxiliares; la rentabilidad y utilidad se toman del P&L del período."
                 },
                 "meta_balance": meta_balance,
                 "resumen_balance": resumen_balance
             }), 200
 
         except Exception as e:
+            current_app.logger.exception("Error en indicadores_financieros_auxiliares")
             db.session.rollback()
             return jsonify({
                 "error": "No fue posible calcular indicadores financieros desde auxiliares",
