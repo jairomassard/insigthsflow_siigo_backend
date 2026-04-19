@@ -1061,6 +1061,208 @@ def construir_pnl_auxiliares(idcliente, desde, hasta):
     }
 
 
+
+# =========================================================
+# HELPERS DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
+# =========================================================
+
+def _safe_float(val):
+    try:
+        return float(val or 0)
+    except Exception:
+        return 0.0
+
+
+def _round2(val):
+    return round(_safe_float(val), 2)
+
+
+def _variacion(actual, anterior):
+    actual = _safe_float(actual)
+    anterior = _safe_float(anterior)
+    diff = actual - anterior
+    pct = (diff / anterior * 100) if anterior not in (0, None) else 0
+    return {
+        "actual": _round2(actual),
+        "anterior": _round2(anterior),
+        "diff": _round2(diff),
+        "pct": _round2(pct),
+    }
+
+
+def _shift_months(dt, months):
+    """
+    Desplaza meses sin depender de dateutil.
+    months puede ser negativo.
+    """
+    year = dt.year + ((dt.month - 1 + months) // 12)
+    month = ((dt.month - 1 + months) % 12) + 1
+    day = min(dt.day, 28)  # suficiente para rangos tipo mes
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _first_day_of_month(dt):
+    return dt.replace(day=1)
+
+
+def _last_day_of_month(dt):
+    next_month = _shift_months(dt.replace(day=1), 1)
+    return next_month - timedelta(days=1)
+
+
+def _calcular_caja_actual(idcliente, hasta):
+    """
+    Aproximación ejecutiva:
+    saldo disponible de cuentas clase 11 (Caja, Bancos, equivalentes)
+    con naturaleza débito menos crédito.
+    """
+    sql = text("""
+        SELECT
+            COALESCE(SUM(debito - credito), 0) AS caja_actual
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable <= :hasta
+          AND (
+              cuenta_codigo LIKE '11%'
+          )
+    """)
+    row = db.session.execute(sql, {"idc": idcliente, "hasta": hasta}).mappings().first()
+    return _safe_float(row["caja_actual"] if row else 0)
+
+
+def _calcular_top_gastos(composicion, limite=5):
+    """
+    Toma la composicion del helper P&L y extrae top de gastos operacionales.
+    Excluye depreciación / amortización del top visible ejecutivo.
+    """
+    gastos = []
+
+    for item in composicion or []:
+        seccion = str(item.get("seccion", "")).upper()
+        cuenta = str(item.get("cuenta", ""))
+        total = _safe_float(item.get("total", 0))
+        nombre = str(item.get("nombre", "")).strip()
+
+        if seccion != "GASTOS_OPERACIONALES":
+            continue
+
+        # Excluir dep/amort del top visual
+        if cuenta.startswith(("5160", "5165", "5260", "5265")):
+            continue
+
+        gastos.append({
+            "cuenta": cuenta,
+            "nombre": nombre,
+            "valor": _round2(total),
+        })
+
+    gastos.sort(key=lambda x: x["valor"], reverse=True)
+    return gastos[:limite]
+
+
+def _construir_explicaciones_y_acciones(
+    eficiencia_actual,
+    eficiencia_anterior,
+    promedio_6m,
+    runway_meses,
+    top_gastos,
+    ventas_actual,
+    ventas_anterior,
+    ebitda_actual,
+    ebitda_anterior
+):
+    explicaciones = []
+    acciones = []
+    alertas = []
+
+    diff_ef = eficiencia_actual - eficiencia_anterior
+    diff_ventas = ventas_actual - ventas_anterior
+    diff_ebitda = ebitda_actual - ebitda_anterior
+
+    # -------- explicaciones
+    if diff_ef > 0:
+        explicaciones.append(
+            f"La eficiencia operativa mejoró {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    elif diff_ef < 0:
+        explicaciones.append(
+            f"La eficiencia operativa cayó {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    else:
+        explicaciones.append(
+            "La eficiencia operativa se mantuvo estable frente al período anterior."
+        )
+
+    if diff_ventas > 0 and diff_ebitda > 0:
+        explicaciones.append(
+            "El EBITDA y las ventas crecieron simultáneamente, señal de mejor tracción operativa."
+        )
+    elif diff_ventas > 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Las ventas crecieron, pero el EBITDA cayó; probablemente hubo presión en costos o gastos."
+        )
+    elif diff_ventas < 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Se observa contracción conjunta en ventas y EBITDA, lo que amerita revisión inmediata."
+        )
+
+    if promedio_6m > 0:
+        if eficiencia_actual > promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por encima del promedio de 6 meses."
+            )
+        elif eficiencia_actual < promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por debajo del promedio de 6 meses."
+            )
+
+    # -------- alertas
+    if runway_meses > 0 and runway_meses < 1.5:
+        alertas.append({
+            "nivel": "alta",
+            "titulo": "Caja ajustada",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    elif runway_meses >= 1.5 and runway_meses < 3:
+        alertas.append({
+            "nivel": "media",
+            "titulo": "Runway moderado",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    else:
+        alertas.append({
+            "nivel": "baja",
+            "titulo": "Caja con holgura",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+
+    if top_gastos:
+        top1 = top_gastos[0]
+        acciones.append(
+            f"Revisar la categoría '{top1['nombre']}' ({top1['cuenta']}), actualmente el gasto operacional más alto del período."
+        )
+
+    if eficiencia_actual < promedio_6m and promedio_6m > 0:
+        acciones.append(
+            "Analizar qué gastos crecieron más rápido que las ventas en el período actual."
+        )
+
+    if diff_ventas > 0 and diff_ebitda < 0:
+        acciones.append(
+            "Validar si el crecimiento comercial está generando presión excesiva en costos o gasto operativo."
+        )
+
+    if not acciones:
+        acciones.append(
+            "Mantener seguimiento mensual del EBITDA, ventas y caja para sostener la tendencia positiva."
+        )
+
+    return explicaciones[:3], acciones[:3], alertas[:3]
+
+
+
+
+
 def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -9082,6 +9284,273 @@ def create_app():
             return jsonify({"ok": False, "error": str(e)}), 500
 
 
+    # =========================================================
+    # DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
+    # =========================================================
+
+
+    @app.route("/dashboard/resumen-ejecutivo", methods=["GET"])
+    @jwt_required()
+    def dashboard_resumen_ejecutivo():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        centro_costos = request.args.get("centro_costos", type=int)
+
+        if not desde or not hasta:
+            return jsonify({"error": "Debes enviar desde y hasta"}), 400
+
+        try:
+            fecha_desde = datetime.strptime(desde, "%Y-%m-%d").date()
+            fecha_hasta = datetime.strptime(hasta, "%Y-%m-%d").date()
+        except Exception:
+            return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+
+        try:
+            # =========================================================
+            # 1. P&L ACTUAL (helper ya existente)
+            # =========================================================
+            pnl_actual = construir_pnl_auxiliares(idcliente, desde, hasta)
+            kpis_actual = pnl_actual.get("kpis", {})
+            evolucion_actual = pnl_actual.get("evolucion", [])
+            composicion_actual = pnl_actual.get("composicion", [])
+
+            # =========================================================
+            # 2. PERIODO ANTERIOR (mismo tamaño de rango)
+            # =========================================================
+            delta = fecha_hasta - fecha_desde
+            prev_hasta = fecha_desde - timedelta(days=1)
+            prev_desde = prev_hasta - delta
+
+            pnl_anterior = construir_pnl_auxiliares(
+                idcliente,
+                prev_desde.strftime("%Y-%m-%d"),
+                prev_hasta.strftime("%Y-%m-%d"),
+            )
+            kpis_anterior = pnl_anterior.get("kpis", {})
+
+            # =========================================================
+            # 3. ÚLTIMOS 6 MESES para tendencia ejecutiva
+            # =========================================================
+            hasta_6m = fecha_hasta
+            desde_6m = _first_day_of_month(_shift_months(fecha_hasta, -5))
+            pnl_6m = construir_pnl_auxiliares(
+                idcliente,
+                desde_6m.strftime("%Y-%m-%d"),
+                hasta_6m.strftime("%Y-%m-%d"),
+            )
+            evolucion_6m = pnl_6m.get("evolucion", [])
+
+            # =========================================================
+            # 4. EFICIENCIA OPERATIVA
+            # Importante:
+            # usar ingresos_operacionales, no ingresos_totales
+            # =========================================================
+            ventas_actual = _safe_float(kpis_actual.get("ingresos_operacionales", 0))
+            ventas_anterior = _safe_float(kpis_anterior.get("ingresos_operacionales", 0))
+
+            ebitda_actual = _safe_float(kpis_actual.get("ebitda", 0))
+            ebitda_anterior = _safe_float(kpis_anterior.get("ebitda", 0))
+
+            eficiencia_actual = (ebitda_actual / ventas_actual * 100) if ventas_actual else 0
+            eficiencia_anterior = (ebitda_anterior / ventas_anterior * 100) if ventas_anterior else 0
+
+            eficiencias_6m = []
+            serie_mensual = []
+
+            for row in evolucion_6m:
+                ventas_mes = _safe_float(row.get("ingresos_operacionales", 0))
+                ebitda_mes = _safe_float(row.get("ebitda", 0))
+                gastos_op_mes = _safe_float(row.get("gastos_operacionales", 0))
+                dep_mes = _safe_float(row.get("dep_amort", 0))
+                eficiencia_mes = (ebitda_mes / ventas_mes * 100) if ventas_mes else 0
+
+                eficiencias_6m.append(eficiencia_mes)
+
+                serie_mensual.append({
+                    "label": row.get("label"),
+                    "ventas": _round2(ventas_mes),
+                    "ebitda": _round2(ebitda_mes),
+                    "eficiencia_operativa": _round2(eficiencia_mes),
+                    "gastos_operacionales": _round2(gastos_op_mes),
+                    "dep_amort": _round2(dep_mes),
+                })
+
+            promedio_6m = _round2(sum(eficiencias_6m) / len(eficiencias_6m)) if eficiencias_6m else 0
+
+            # =========================================================
+            # 5. META
+            # Puedes luego llevar esto a tabla metas_financieras
+            # =========================================================
+            meta_eficiencia = 20.0
+
+            # =========================================================
+            # 6. CAJA DISPONIBLE + RUNWAY
+            # =========================================================
+            caja_actual = _calcular_caja_actual(idcliente, hasta)
+
+            # Burn operativo promedio últimos 3 meses
+            hasta_3m = fecha_hasta
+            desde_3m = _first_day_of_month(_shift_months(fecha_hasta, -2))
+            pnl_3m = construir_pnl_auxiliares(
+                idcliente,
+                desde_3m.strftime("%Y-%m-%d"),
+                hasta_3m.strftime("%Y-%m-%d"),
+            )
+            evolucion_3m = pnl_3m.get("evolucion", [])
+
+            burns = []
+            for row in evolucion_3m:
+                gastos_op = _safe_float(row.get("gastos_operacionales", 0))
+                dep_amort = _safe_float(row.get("dep_amort", 0))
+                burn_mes = max(gastos_op - dep_amort, 0)
+                if burn_mes > 0:
+                    burns.append(burn_mes)
+
+            burn_promedio_3m = _round2(sum(burns) / len(burns)) if burns else 0
+            runway_meses = _round2(caja_actual / burn_promedio_3m) if burn_promedio_3m > 0 else 0
+
+            # =========================================================
+            # 7. TOP GASTOS (desde composición helper)
+            # =========================================================
+            top_gastos = _calcular_top_gastos(composicion_actual, limite=5)
+
+            # =========================================================
+            # 8. DATA complementaria desde modelo consolidado
+            # top clientes / top proveedores
+            # =========================================================
+            params = {"idcliente": idcliente}
+            condiciones_ing = ["idcliente = :idcliente"]
+            condiciones_egr = ["idcliente = :idcliente"]
+
+            if fecha_desde:
+                condiciones_ing.append("fecha >= :desde")
+                condiciones_egr.append("fecha >= :desde")
+                params["desde"] = fecha_desde
+
+            if fecha_hasta:
+                condiciones_ing.append("fecha <= :hasta")
+                condiciones_egr.append("fecha <= :hasta")
+                params["hasta"] = fecha_hasta
+
+            if centro_costos:
+                condiciones_ing.append("cost_center = :centro_costos")
+                condiciones_egr.append("cost_center = :centro_costos")
+                params["centro_costos"] = centro_costos
+
+            where_ing = " AND ".join(condiciones_ing)
+            where_egr = " AND ".join(condiciones_egr)
+
+            sql_top_clientes = text(f"""
+                SELECT
+                    cliente_nombre AS nombre,
+                    COALESCE(SUM(total), 0) AS total
+                FROM facturas_enriquecidas
+                WHERE {where_ing}
+                GROUP BY cliente_nombre
+                ORDER BY total DESC
+                LIMIT 5
+            """)
+
+            sql_top_proveedores = text(f"""
+                SELECT
+                    COALESCE(proveedor_nombre, 'Sin proveedor') AS nombre,
+                    COALESCE(SUM(total), 0) AS total
+                FROM siigo_compras
+                WHERE {where_egr}
+                GROUP BY COALESCE(proveedor_nombre, 'Sin proveedor')
+                ORDER BY total DESC
+                LIMIT 5
+            """)
+
+            top_clientes = [
+                {"nombre": str(r["nombre"]), "total": _round2(r["total"])}
+                for r in db.session.execute(sql_top_clientes, params).mappings().all()
+            ]
+
+            top_proveedores = [
+                {"nombre": str(r["nombre"]), "total": _round2(r["total"])}
+                for r in db.session.execute(sql_top_proveedores, params).mappings().all()
+            ]
+
+            # =========================================================
+            # 9. EXPLICACIONES + ACCIONES + ALERTAS
+            # =========================================================
+            explicaciones, acciones, alertas = _construir_explicaciones_y_acciones(
+                eficiencia_actual=eficiencia_actual,
+                eficiencia_anterior=eficiencia_anterior,
+                promedio_6m=promedio_6m,
+                runway_meses=runway_meses,
+                top_gastos=top_gastos,
+                ventas_actual=ventas_actual,
+                ventas_anterior=ventas_anterior,
+                ebitda_actual=ebitda_actual,
+                ebitda_anterior=ebitda_anterior,
+            )
+
+            # =========================================================
+            # 10. RESPUESTA FINAL
+            # =========================================================
+            return jsonify({
+                "periodo": {
+                    "desde": desde,
+                    "hasta": hasta,
+                    "anterior_desde": prev_desde.strftime("%Y-%m-%d"),
+                    "anterior_hasta": prev_hasta.strftime("%Y-%m-%d"),
+                },
+                "kpis": {
+                    "ventas_netas": _variacion(
+                        kpis_actual.get("ingresos_operacionales", 0),
+                        kpis_anterior.get("ingresos_operacionales", 0)
+                    ),
+                    "ebitda": _variacion(
+                        kpis_actual.get("ebitda", 0),
+                        kpis_anterior.get("ebitda", 0)
+                    ),
+                    "utilidad_operativa": _variacion(
+                        kpis_actual.get("utilidad_operativa", 0),
+                        kpis_anterior.get("utilidad_operativa", 0)
+                    ),
+                    "eficiencia_operativa": {
+                        "actual": _round2(eficiencia_actual),
+                        "anterior": _round2(eficiencia_anterior),
+                        "diff": _round2(eficiencia_actual - eficiencia_anterior),
+                        "promedio_6m": _round2(promedio_6m),
+                        "meta": _round2(meta_eficiencia),
+                    },
+                    "caja_disponible": {
+                        "actual": _round2(caja_actual)
+                    },
+                    "cash_runway": {
+                        "actual": _round2(runway_meses),
+                        "burn_promedio_3m": _round2(burn_promedio_3m),
+                        "unidad": "meses"
+                    }
+                },
+                "series": {
+                    "mensual": serie_mensual
+                },
+                "top_gastos": top_gastos,
+                "top_clientes": top_clientes,
+                "top_proveedores": top_proveedores,
+                "explicaciones": explicaciones,
+                "acciones": acciones,
+                "alertas": alertas
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible construir el resumen ejecutivo",
+                "detalle": str(e)
+            }), 500
+
+
+
+
  
 # No tocar de qui para abajo 
  
@@ -9112,13 +9581,12 @@ def create_app():
             "/siigo/sync-accounts-payable",
             "/siigo/cross-accounts-payable",
             "/siigo/sync-all",
-            "/config/siigo-sync-status", 
-            "/ping",  # 👈 AGREGA ESTA LÍNEA PARA EL PING
+            "/config/siigo-sync-status",
+            "/ping",
         ]
         for ruta in rutas_exentas:
             if ruta in request.path:
                 return
-
 
         # ✅ Verifica JWT válido
         try:
@@ -9148,6 +9616,12 @@ def create_app():
 
         elif request.path.startswith("/admin"):
             codigo = "admin_panel"
+
+        elif request.path.startswith("/dashboard"):
+            if "resumen-ejecutivo" in request.path:
+                codigo = "ver_resumen_ejecutivo"
+            else:
+                codigo = "ver_dashboard"
 
         elif request.path.startswith("/reportes"):
             # Detectar permisos específicos
@@ -9198,7 +9672,6 @@ def create_app():
                 "error": f"Acceso denegado: falta permiso '{codigo}'",
                 "ruta": request.path
             }), 403
-
 
 
     @app.route("/config/sync", methods=["GET", "OPTIONS"])
