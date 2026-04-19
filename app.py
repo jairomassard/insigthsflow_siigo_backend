@@ -1111,6 +1111,10 @@ def _last_day_of_month(dt):
     return next_month - timedelta(days=1)
 
 
+def _first_day_of_year(dt):
+    return dt.replace(month=1, day=1)
+
+
 def _ultimo_periodo_auxiliar_con_datos(idcliente):
     sql = text("""
         SELECT MAX(fecha_contable) AS ultima_fecha
@@ -1119,6 +1123,55 @@ def _ultimo_periodo_auxiliar_con_datos(idcliente):
     """)
     row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
     return row["ultima_fecha"] if row and row["ultima_fecha"] else None
+
+
+def _resolver_corte_confiable_auxiliar(idcliente):
+    """
+    Define el corte confiable para lectura ejecutiva.
+
+    Reglas:
+    - Si la última fecha cargada cae exactamente en el último día de su mes,
+      se considera mes cerrado y ese mismo día es el corte confiable.
+    - Si la última fecha cargada es parcial dentro del mes,
+      el corte confiable será el último día del mes anterior.
+    - Si no existe data, retorna estructura vacía.
+    """
+    ultima_fecha = _ultimo_periodo_auxiliar_con_datos(idcliente)
+
+    if not ultima_fecha:
+        return {
+            "ultima_fecha_auxiliar": None,
+            "fecha_corte_confiable": None,
+            "desde_ytd": None,
+            "hasta_ytd": None,
+            "mes_actual_parcial": False,
+            "anio_corte": None,
+            "mes_corte": None,
+            "modo_periodo": "sin_datos",
+        }
+
+    ultimo_dia_del_mes = _last_day_of_month(ultima_fecha)
+
+    if ultima_fecha == ultimo_dia_del_mes:
+        fecha_corte_confiable = ultima_fecha
+        mes_actual_parcial = False
+    else:
+        fecha_corte_confiable = _last_day_of_month(_shift_months(ultima_fecha, -1))
+        mes_actual_parcial = True
+
+    desde_ytd = date(fecha_corte_confiable.year, 1, 1)
+    hasta_ytd = fecha_corte_confiable
+
+    return {
+        "ultima_fecha_auxiliar": ultima_fecha,
+        "fecha_corte_confiable": fecha_corte_confiable,
+        "desde_ytd": desde_ytd,
+        "hasta_ytd": hasta_ytd,
+        "mes_actual_parcial": mes_actual_parcial,
+        "anio_corte": fecha_corte_confiable.year,
+        "mes_corte": fecha_corte_confiable.month,
+        "modo_periodo": "ytd_cerrado",
+    }
 
 
 def _calcular_caja_actual(idcliente, hasta):
@@ -9310,22 +9363,38 @@ def create_app():
             return jsonify({"error": "Token sin cliente"}), 403
 
         try:
-            ultima_fecha_auxiliar = _ultimo_periodo_auxiliar_con_datos(idcliente)
+            corte = _resolver_corte_confiable_auxiliar(idcliente)
 
-            if not ultima_fecha_auxiliar:
+            if not corte["ultima_fecha_auxiliar"]:
                 return jsonify({
                     "ultima_fecha_auxiliar": None,
+                    "fecha_corte_confiable": None,
                     "desde_sugerido": None,
-                    "hasta_sugerido": None
+                    "hasta_sugerido": None,
+                    "mes_actual_parcial": False,
+                    "modo_periodo": "sin_datos",
+                    "mensaje_contexto": "No hay información disponible en auxiliar contable."
                 }), 200
 
-            desde_sugerido = ultima_fecha_auxiliar.replace(day=1)
-            hasta_sugerido = ultima_fecha_auxiliar
+            mensaje_contexto = None
+            if corte["mes_actual_parcial"]:
+                mensaje_contexto = (
+                    "Se detectó que el mes más reciente en auxiliares está parcial. "
+                    "El dashboard usará por defecto el año corrido cerrado hasta el último mes completo."
+                )
+            else:
+                mensaje_contexto = (
+                    "El dashboard usará por defecto el año corrido cerrado hasta el último corte mensual disponible."
+                )
 
             return jsonify({
-                "ultima_fecha_auxiliar": ultima_fecha_auxiliar.strftime("%Y-%m-%d"),
-                "desde_sugerido": desde_sugerido.strftime("%Y-%m-%d"),
-                "hasta_sugerido": hasta_sugerido.strftime("%Y-%m-%d")
+                "ultima_fecha_auxiliar": corte["ultima_fecha_auxiliar"].strftime("%Y-%m-%d"),
+                "fecha_corte_confiable": corte["fecha_corte_confiable"].strftime("%Y-%m-%d"),
+                "desde_sugerido": corte["desde_ytd"].strftime("%Y-%m-%d"),
+                "hasta_sugerido": corte["hasta_ytd"].strftime("%Y-%m-%d"),
+                "mes_actual_parcial": corte["mes_actual_parcial"],
+                "modo_periodo": corte["modo_periodo"],
+                "mensaje_contexto": mensaje_contexto
             }), 200
 
         except Exception as e:
@@ -9333,7 +9402,6 @@ def create_app():
                 "error": "No fue posible obtener metadata del dashboard",
                 "detalle": str(e)
             }), 500
-
 
     # =========================================================
     # ENDPOINT RESUMEN EJECUTIVO
@@ -9350,16 +9418,48 @@ def create_app():
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos", type=int)
 
-        if not desde or not hasta:
-            return jsonify({"error": "Debes enviar desde y hasta"}), 400
-
         try:
-            fecha_desde = datetime.strptime(desde, "%Y-%m-%d").date()
-            fecha_hasta = datetime.strptime(hasta, "%Y-%m-%d").date()
-        except Exception:
-            return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+            corte = _resolver_corte_confiable_auxiliar(idcliente)
 
-        try:
+            if not corte["ultima_fecha_auxiliar"]:
+                return jsonify({
+                    "error": "No hay auxiliar contable cargado para construir el dashboard"
+                }), 400
+
+            # Si el frontend no manda fechas, usar por defecto YTD cerrado
+            if not desde or not hasta:
+                fecha_desde = corte["desde_ytd"]
+                fecha_hasta = corte["hasta_ytd"]
+                desde = fecha_desde.strftime("%Y-%m-%d")
+                hasta = fecha_hasta.strftime("%Y-%m-%d")
+                rango_auto = True
+            else:
+                try:
+                    fecha_desde = datetime.strptime(desde, "%Y-%m-%d").date()
+                    fecha_hasta = datetime.strptime(hasta, "%Y-%m-%d").date()
+                    rango_auto = False
+                except Exception:
+                    return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+
+            # Si el usuario manda una fecha hasta superior al corte confiable,
+            # se ajusta automáticamente para no contaminar el dashboard con mes parcial.
+            fecha_hasta_ajustada = fecha_hasta
+            ajuste_por_corte = False
+
+            if fecha_hasta > corte["fecha_corte_confiable"]:
+                fecha_hasta_ajustada = corte["fecha_corte_confiable"]
+                ajuste_por_corte = True
+
+                # Si al ajustar queda fecha_desde mayor que fecha_hasta, rearmar YTD
+                if fecha_desde > fecha_hasta_ajustada:
+                    fecha_desde = corte["desde_ytd"]
+
+                desde = fecha_desde.strftime("%Y-%m-%d")
+                hasta = fecha_hasta_ajustada.strftime("%Y-%m-%d")
+            else:
+                hasta = fecha_hasta.strftime("%Y-%m-%d")
+                desde = fecha_desde.strftime("%Y-%m-%d")
+
             # =========================================================
             # 1. P&L ACTUAL (helper ya existente)
             # =========================================================
@@ -9369,19 +9469,28 @@ def create_app():
             composicion_actual = pnl_actual.get("composicion", [])
 
             hay_datos_auxiliar_actual = bool(evolucion_actual) or bool(composicion_actual)
-            ultima_fecha_auxiliar = _ultimo_periodo_auxiliar_con_datos(idcliente)
 
             mensaje_contexto = None
-            if not hay_datos_auxiliar_actual and ultima_fecha_auxiliar:
+            if not hay_datos_auxiliar_actual and corte["ultima_fecha_auxiliar"]:
                 mensaje_contexto = (
                     f"No hay información de auxiliar contable para el período seleccionado. "
-                    f"Última fecha disponible: {ultima_fecha_auxiliar.strftime('%Y-%m-%d')}."
+                    f"Última fecha disponible: {corte['ultima_fecha_auxiliar'].strftime('%Y-%m-%d')}."
+                )
+            elif ajuste_por_corte:
+                mensaje_contexto = (
+                    f"El rango solicitado excedía el corte confiable del auxiliar. "
+                    f"Se ajustó automáticamente hasta {corte['fecha_corte_confiable'].strftime('%Y-%m-%d')}."
+                )
+            elif corte["mes_actual_parcial"]:
+                mensaje_contexto = (
+                    f"El mes más reciente cargado en auxiliares está parcial. "
+                    f"El análisis ejecutivo usa corte confiable hasta {corte['fecha_corte_confiable'].strftime('%Y-%m-%d')}."
                 )
 
             # =========================================================
             # 2. PERIODO ANTERIOR (mismo tamaño de rango)
             # =========================================================
-            delta = fecha_hasta - fecha_desde
+            delta = fecha_hasta_ajustada - fecha_desde
             prev_hasta = fecha_desde - timedelta(days=1)
             prev_desde = prev_hasta - delta
 
@@ -9395,8 +9504,8 @@ def create_app():
             # =========================================================
             # 3. ÚLTIMOS 6 MESES para tendencia ejecutiva
             # =========================================================
-            hasta_6m = fecha_hasta
-            desde_6m = _first_day_of_month(_shift_months(fecha_hasta, -5))
+            hasta_6m = fecha_hasta_ajustada
+            desde_6m = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -5))
             pnl_6m = construir_pnl_auxiliares(
                 idcliente,
                 desde_6m.strftime("%Y-%m-%d"),
@@ -9450,8 +9559,8 @@ def create_app():
             # =========================================================
             caja_actual = _calcular_caja_actual(idcliente, hasta)
 
-            hasta_3m = fecha_hasta
-            desde_3m = _first_day_of_month(_shift_months(fecha_hasta, -2))
+            hasta_3m = fecha_hasta_ajustada
+            desde_3m = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -2))
             pnl_3m = construir_pnl_auxiliares(
                 idcliente,
                 desde_3m.strftime("%Y-%m-%d"),
@@ -9488,10 +9597,10 @@ def create_app():
                 condiciones_egr.append("fecha >= :desde")
                 params["desde"] = fecha_desde
 
-            if fecha_hasta:
+            if fecha_hasta_ajustada:
                 condiciones_ing.append("fecha <= :hasta")
                 condiciones_egr.append("fecha <= :hasta")
-                params["hasta"] = fecha_hasta
+                params["hasta"] = fecha_hasta_ajustada
 
             if centro_costos:
                 condiciones_ing.append("cost_center = :centro_costos")
@@ -9557,13 +9666,21 @@ def create_app():
                     "hasta": hasta,
                     "anterior_desde": prev_desde.strftime("%Y-%m-%d"),
                     "anterior_hasta": prev_hasta.strftime("%Y-%m-%d"),
+                    "rango_auto": rango_auto,
+                    "ajuste_por_corte": ajuste_por_corte,
                 },
                 "metadata": {
                     "hay_datos_auxiliar_actual": hay_datos_auxiliar_actual,
                     "ultima_fecha_auxiliar": (
-                        ultima_fecha_auxiliar.strftime("%Y-%m-%d")
-                        if ultima_fecha_auxiliar else None
+                        corte["ultima_fecha_auxiliar"].strftime("%Y-%m-%d")
+                        if corte["ultima_fecha_auxiliar"] else None
                     ),
+                    "fecha_corte_confiable": (
+                        corte["fecha_corte_confiable"].strftime("%Y-%m-%d")
+                        if corte["fecha_corte_confiable"] else None
+                    ),
+                    "mes_actual_parcial": corte["mes_actual_parcial"],
+                    "modo_periodo": corte["modo_periodo"],
                     "mensaje_contexto": mensaje_contexto
                 },
                 "kpis": {
@@ -9611,7 +9728,6 @@ def create_app():
                 "error": "No fue posible construir el resumen ejecutivo",
                 "detalle": str(e)
             }), 500
-
 
  
 # No tocar de qui para abajo 
