@@ -1259,6 +1259,14 @@ def _construir_explicaciones_y_acciones(
 
     return explicaciones[:3], acciones[:3], alertas[:3]
 
+def _ultimo_periodo_auxiliar_con_datos(idcliente):
+    sql = text("""
+        SELECT MAX(fecha_contable) AS ultima_fecha
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+    """)
+    row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
+    return row["ultima_fecha"] if row and row["ultima_fecha"] else None
 
 
 
@@ -9289,6 +9297,257 @@ def create_app():
     # =========================================================
 
 
+# =========================================================
+# HELPERS DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
+# =========================================================
+
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from flask import jsonify, request
+from flask_jwt_extended import jwt_required, get_jwt
+
+
+def _safe_float(val):
+    try:
+        return float(val or 0)
+    except Exception:
+        return 0.0
+
+
+def _round2(val):
+    return round(_safe_float(val), 2)
+
+
+def _variacion(actual, anterior):
+    actual = _safe_float(actual)
+    anterior = _safe_float(anterior)
+    diff = actual - anterior
+    pct = (diff / anterior * 100) if anterior not in (0, None) else 0
+    return {
+        "actual": _round2(actual),
+        "anterior": _round2(anterior),
+        "diff": _round2(diff),
+        "pct": _round2(pct),
+    }
+
+
+def _shift_months(dt, months):
+    """
+    Desplaza meses sin depender de dateutil.
+    months puede ser negativo.
+    """
+    year = dt.year + ((dt.month - 1 + months) // 12)
+    month = ((dt.month - 1 + months) % 12) + 1
+    day = min(dt.day, 28)
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _first_day_of_month(dt):
+    return dt.replace(day=1)
+
+
+def _last_day_of_month(dt):
+    next_month = _shift_months(dt.replace(day=1), 1)
+    return next_month - timedelta(days=1)
+
+
+def _ultimo_periodo_auxiliar_con_datos(idcliente):
+    sql = text("""
+        SELECT MAX(fecha_contable) AS ultima_fecha
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+    """)
+    row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
+    return row["ultima_fecha"] if row and row["ultima_fecha"] else None
+
+
+def _calcular_caja_actual(idcliente, hasta):
+    """
+    Aproximación ejecutiva:
+    saldo disponible de cuentas clase 11 (Caja, Bancos, equivalentes)
+    con naturaleza débito menos crédito.
+    """
+    sql = text("""
+        SELECT
+            COALESCE(SUM(debito - credito), 0) AS caja_actual
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable <= :hasta
+          AND cuenta_codigo LIKE '11%'
+    """)
+    row = db.session.execute(sql, {"idc": idcliente, "hasta": hasta}).mappings().first()
+    return _safe_float(row["caja_actual"] if row else 0)
+
+
+def _calcular_top_gastos(composicion, limite=5):
+    """
+    Toma la composicion del helper P&L y extrae top de gastos operacionales.
+    Excluye depreciación / amortización del top visible ejecutivo.
+    """
+    gastos = []
+
+    for item in composicion or []:
+        seccion = str(item.get("seccion", "")).upper()
+        cuenta = str(item.get("cuenta", ""))
+        total = _safe_float(item.get("total", 0))
+        nombre = str(item.get("nombre", "")).strip()
+
+        if seccion != "GASTOS_OPERACIONALES":
+            continue
+
+        if cuenta.startswith(("5160", "5165", "5260", "5265")):
+            continue
+
+        gastos.append({
+            "cuenta": cuenta,
+            "nombre": nombre,
+            "valor": _round2(total),
+        })
+
+    gastos.sort(key=lambda x: x["valor"], reverse=True)
+    return gastos[:limite]
+
+
+def _construir_explicaciones_y_acciones(
+    eficiencia_actual,
+    eficiencia_anterior,
+    promedio_6m,
+    runway_meses,
+    top_gastos,
+    ventas_actual,
+    ventas_anterior,
+    ebitda_actual,
+    ebitda_anterior
+):
+    explicaciones = []
+    acciones = []
+    alertas = []
+
+    diff_ef = eficiencia_actual - eficiencia_anterior
+    diff_ventas = ventas_actual - ventas_anterior
+    diff_ebitda = ebitda_actual - ebitda_anterior
+
+    # -------- explicaciones
+    if diff_ef > 0:
+        explicaciones.append(
+            f"La eficiencia operativa mejoró {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    elif diff_ef < 0:
+        explicaciones.append(
+            f"La eficiencia operativa cayó {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    else:
+        explicaciones.append(
+            "La eficiencia operativa se mantuvo estable frente al período anterior."
+        )
+
+    if diff_ventas > 0 and diff_ebitda > 0:
+        explicaciones.append(
+            "El EBITDA y las ventas crecieron simultáneamente, señal de mejor tracción operativa."
+        )
+    elif diff_ventas > 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Las ventas crecieron, pero el EBITDA cayó; probablemente hubo presión en costos o gastos."
+        )
+    elif diff_ventas < 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Se observa contracción conjunta en ventas y EBITDA, lo que amerita revisión inmediata."
+        )
+
+    if promedio_6m > 0:
+        if eficiencia_actual > promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por encima del promedio de 6 meses."
+            )
+        elif eficiencia_actual < promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por debajo del promedio de 6 meses."
+            )
+
+    # -------- alertas
+    if runway_meses > 0 and runway_meses < 1.5:
+        alertas.append({
+            "nivel": "alta",
+            "titulo": "Caja ajustada",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    elif runway_meses >= 1.5 and runway_meses < 3:
+        alertas.append({
+            "nivel": "media",
+            "titulo": "Runway moderado",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    else:
+        alertas.append({
+            "nivel": "baja",
+            "titulo": "Caja con holgura",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+
+    if top_gastos:
+        top1 = top_gastos[0]
+        acciones.append(
+            f"Revisar la categoría '{top1['nombre']}' ({top1['cuenta']}), actualmente el gasto operacional más alto del período."
+        )
+
+    if eficiencia_actual < promedio_6m and promedio_6m > 0:
+        acciones.append(
+            "Analizar qué gastos crecieron más rápido que las ventas en el período actual."
+        )
+
+    if diff_ventas > 0 and diff_ebitda < 0:
+        acciones.append(
+            "Validar si el crecimiento comercial está generando presión excesiva en costos o gasto operativo."
+        )
+
+    if not acciones:
+        acciones.append(
+            "Mantener seguimiento mensual del EBITDA, ventas y caja para sostener la tendencia positiva."
+        )
+
+    return explicaciones[:3], acciones[:3], alertas[:3]
+
+
+# =========================================================
+# ENDPOINT METADATA DASHBOARD
+# =========================================================
+@app.route("/dashboard/resumen-ejecutivo/metadata", methods=["GET"])
+@jwt_required()
+def dashboard_resumen_ejecutivo_metadata():
+    claims = get_jwt()
+    idcliente = claims.get("idcliente")
+    if not idcliente:
+        return jsonify({"error": "Token sin cliente"}), 403
+
+    try:
+        ultima_fecha_auxiliar = _ultimo_periodo_auxiliar_con_datos(idcliente)
+
+        if not ultima_fecha_auxiliar:
+            return jsonify({
+                "ultima_fecha_auxiliar": None,
+                "desde_sugerido": None,
+                "hasta_sugerido": None
+            }), 200
+
+        desde_sugerido = ultima_fecha_auxiliar.replace(day=1)
+        hasta_sugerido = ultima_fecha_auxiliar
+
+        return jsonify({
+            "ultima_fecha_auxiliar": ultima_fecha_auxiliar.strftime("%Y-%m-%d"),
+            "desde_sugerido": desde_sugerido.strftime("%Y-%m-%d"),
+            "hasta_sugerido": hasta_sugerido.strftime("%Y-%m-%d")
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "error": "No fue posible obtener metadata del dashboard",
+            "detalle": str(e)
+        }), 500
+
+
+    # =========================================================
+    # ENDPOINT RESUMEN EJECUTIVO
+    # =========================================================
     @app.route("/dashboard/resumen-ejecutivo", methods=["GET"])
     @jwt_required()
     def dashboard_resumen_ejecutivo():
@@ -9319,6 +9578,16 @@ def create_app():
             evolucion_actual = pnl_actual.get("evolucion", [])
             composicion_actual = pnl_actual.get("composicion", [])
 
+            hay_datos_auxiliar_actual = bool(evolucion_actual) or bool(composicion_actual)
+            ultima_fecha_auxiliar = _ultimo_periodo_auxiliar_con_datos(idcliente)
+
+            mensaje_contexto = None
+            if not hay_datos_auxiliar_actual and ultima_fecha_auxiliar:
+                mensaje_contexto = (
+                    f"No hay información de auxiliar contable para el período seleccionado. "
+                    f"Última fecha disponible: {ultima_fecha_auxiliar.strftime('%Y-%m-%d')}."
+                )
+
             # =========================================================
             # 2. PERIODO ANTERIOR (mismo tamaño de rango)
             # =========================================================
@@ -9347,7 +9616,6 @@ def create_app():
 
             # =========================================================
             # 4. EFICIENCIA OPERATIVA
-            # Importante:
             # usar ingresos_operacionales, no ingresos_totales
             # =========================================================
             ventas_actual = _safe_float(kpis_actual.get("ingresos_operacionales", 0))
@@ -9384,7 +9652,6 @@ def create_app():
 
             # =========================================================
             # 5. META
-            # Puedes luego llevar esto a tabla metas_financieras
             # =========================================================
             meta_eficiencia = 20.0
 
@@ -9393,7 +9660,6 @@ def create_app():
             # =========================================================
             caja_actual = _calcular_caja_actual(idcliente, hasta)
 
-            # Burn operativo promedio últimos 3 meses
             hasta_3m = fecha_hasta
             desde_3m = _first_day_of_month(_shift_months(fecha_hasta, -2))
             pnl_3m = construir_pnl_auxiliares(
@@ -9502,6 +9768,14 @@ def create_app():
                     "anterior_desde": prev_desde.strftime("%Y-%m-%d"),
                     "anterior_hasta": prev_hasta.strftime("%Y-%m-%d"),
                 },
+                "metadata": {
+                    "hay_datos_auxiliar_actual": hay_datos_auxiliar_actual,
+                    "ultima_fecha_auxiliar": (
+                        ultima_fecha_auxiliar.strftime("%Y-%m-%d")
+                        if ultima_fecha_auxiliar else None
+                    ),
+                    "mensaje_contexto": mensaje_contexto
+                },
                 "kpis": {
                     "ventas_netas": _variacion(
                         kpis_actual.get("ingresos_operacionales", 0),
@@ -9547,7 +9821,6 @@ def create_app():
                 "error": "No fue posible construir el resumen ejecutivo",
                 "detalle": str(e)
             }), 500
-
 
 
 
