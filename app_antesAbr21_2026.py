@@ -1063,321 +1063,262 @@ def construir_pnl_auxiliares(idcliente, desde, hasta):
 
 
 # =========================================================
-# HELPERS CONFIG / CAJA / RUNWAY - DASHBOARD EJECUTIVO
+# HELPERS DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
 # =========================================================
 
-def _obtener_config_dashboard(idcliente):
+
+def _safe_float(val):
+    try:
+        return float(val or 0)
+    except Exception:
+        return 0.0
+
+
+def _round2(val):
+    return round(_safe_float(val), 2)
+
+
+def _variacion(actual, anterior):
+    actual = _safe_float(actual)
+    anterior = _safe_float(anterior)
+    diff = actual - anterior
+    pct = (diff / anterior * 100) if anterior not in (0, None) else 0
+    return {
+        "actual": _round2(actual),
+        "anterior": _round2(anterior),
+        "diff": _round2(diff),
+        "pct": _round2(pct),
+    }
+
+
+def _shift_months(dt, months):
     """
-    Trae la configuración del dashboard ejecutivo para el cliente.
-    Si no existe, retorna None.
+    Desplaza meses sin depender de dateutil.
+    months puede ser negativo.
+    """
+    year = dt.year + ((dt.month - 1 + months) // 12)
+    month = ((dt.month - 1 + months) % 12) + 1
+    day = min(dt.day, 28)
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _first_day_of_month(dt):
+    return dt.replace(day=1)
+
+
+def _last_day_of_month(dt):
+    next_month = _shift_months(dt.replace(day=1), 1)
+    return next_month - timedelta(days=1)
+
+
+def _first_day_of_year(dt):
+    return dt.replace(month=1, day=1)
+
+
+def _ultimo_periodo_auxiliar_con_datos(idcliente):
+    sql = text("""
+        SELECT MAX(fecha_contable) AS ultima_fecha
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+    """)
+    row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
+    return row["ultima_fecha"] if row and row["ultima_fecha"] else None
+
+
+def _resolver_corte_confiable_auxiliar(idcliente):
+    """
+    Define el corte confiable para lectura ejecutiva.
+
+    Reglas:
+    - Si la última fecha cargada cae exactamente en el último día de su mes,
+      se considera mes cerrado y ese mismo día es el corte confiable.
+    - Si la última fecha cargada es parcial dentro del mes,
+      el corte confiable será el último día del mes anterior.
+    - Si no existe data, retorna estructura vacía.
+    """
+    ultima_fecha = _ultimo_periodo_auxiliar_con_datos(idcliente)
+
+    if not ultima_fecha:
+        return {
+            "ultima_fecha_auxiliar": None,
+            "fecha_corte_confiable": None,
+            "desde_ytd": None,
+            "hasta_ytd": None,
+            "mes_actual_parcial": False,
+            "anio_corte": None,
+            "mes_corte": None,
+            "modo_periodo": "sin_datos",
+        }
+
+    ultimo_dia_del_mes = _last_day_of_month(ultima_fecha)
+
+    if ultima_fecha == ultimo_dia_del_mes:
+        fecha_corte_confiable = ultima_fecha
+        mes_actual_parcial = False
+    else:
+        fecha_corte_confiable = _last_day_of_month(_shift_months(ultima_fecha, -1))
+        mes_actual_parcial = True
+
+    desde_ytd = date(fecha_corte_confiable.year, 1, 1)
+    hasta_ytd = fecha_corte_confiable
+
+    return {
+        "ultima_fecha_auxiliar": ultima_fecha,
+        "fecha_corte_confiable": fecha_corte_confiable,
+        "desde_ytd": desde_ytd,
+        "hasta_ytd": hasta_ytd,
+        "mes_actual_parcial": mes_actual_parcial,
+        "anio_corte": fecha_corte_confiable.year,
+        "mes_corte": fecha_corte_confiable.month,
+        "modo_periodo": "ytd_cerrado",
+    }
+
+
+def _calcular_caja_actual(idcliente, hasta):
+    """
+    Aproximación ejecutiva:
+    saldo disponible de cuentas clase 11 (Caja, Bancos, equivalentes)
+    con naturaleza débito menos crédito.
     """
     sql = text("""
         SELECT
-            idcliente,
-            activo,
-            mostrar_caja,
-            mostrar_runway,
-            modo_caja,
-            cuentas_incluidas,
-            cuentas_excluidas,
-            modo_runway,
-            meses_promedio_runway,
-            meta_eficiencia_operativa,
-            meta_ebitda,
-            meta_margen_ebitda,
-            meses_grafica,
-            top_clientes,
-            top_proveedores,
-            top_gastos,
-            indicador_estrella,
-            modo_periodo_default
-        FROM dashboard_resumen_config
+            COALESCE(SUM(debito - credito), 0) AS caja_actual
+        FROM auxiliar_contable
         WHERE idcliente = :idc
-        LIMIT 1
+          AND fecha_contable <= :hasta
+          AND cuenta_codigo LIKE '11%'
     """)
-    row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
-    return dict(row) if row else None
+    row = db.session.execute(sql, {"idc": idcliente, "hasta": hasta}).mappings().first()
+    return _safe_float(row["caja_actual"] if row else 0)
 
 
-def _normalizar_lista_cuentas_config(lista_raw):
+def _calcular_top_gastos(composicion, limite=5):
     """
-    Normaliza cuentas_incluidas / cuentas_excluidas.
-    Soporta:
-    - [{"codigo": "111005", "nombre": "Banco ..."}]
-    - ["111005", "112010"]
+    Toma la composicion del helper P&L y extrae top de gastos operacionales.
+    Excluye depreciación / amortización del top visible ejecutivo.
     """
-    cuentas = []
+    gastos = []
 
-    if not lista_raw:
-        return cuentas
+    for item in composicion or []:
+        seccion = str(item.get("seccion", "")).upper()
+        cuenta = str(item.get("cuenta", ""))
+        total = _safe_float(item.get("total", 0))
+        nombre = str(item.get("nombre", "")).strip()
 
-    if isinstance(lista_raw, list):
-        for item in lista_raw:
-            if isinstance(item, dict):
-                codigo = str(item.get("codigo", "")).strip()
-                nombre = str(item.get("nombre", "")).strip()
-                if codigo:
-                    cuentas.append({
-                        "codigo": codigo,
-                        "nombre": nombre
-                    })
-            else:
-                codigo = str(item).strip()
-                if codigo:
-                    cuentas.append({
-                        "codigo": codigo,
-                        "nombre": ""
-                    })
-    return cuentas
+        if seccion != "GASTOS_OPERACIONALES":
+            continue
 
+        if cuenta.startswith(("5160", "5165", "5260", "5265")):
+            continue
 
-def _resolver_meta_eficiencia(config):
-    """
-    Toma la meta desde configuración.
-    Si no existe configuración, usa 20.0 como fallback controlado.
-    """
-    if not config:
-        return 20.0
-    return _round2(config.get("meta_eficiencia_operativa", 20.0))
+        gastos.append({
+            "cuenta": cuenta,
+            "nombre": nombre,
+            "valor": _round2(total),
+        })
+
+    gastos.sort(key=lambda x: x["valor"], reverse=True)
+    return gastos[:limite]
 
 
-def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
-    """
-    Caja disponible segura y parametrizable.
+def _construir_explicaciones_y_acciones(
+    eficiencia_actual,
+    eficiencia_anterior,
+    promedio_6m,
+    runway_meses,
+    top_gastos,
+    ventas_actual,
+    ventas_anterior,
+    ebitda_actual,
+    ebitda_anterior
+):
+    explicaciones = []
+    acciones = []
+    alertas = []
 
-    Reglas:
-    - Si no hay config, no calcula.
-    - Si mostrar_caja = False, no calcula.
-    - Si modo_caja = sin_configurar, no calcula.
-    - Si modo_caja = inclusion, suma solo cuentas_incluidas.
-    - Si modo_caja = exclusion, suma clase 11 excluyendo cuentas_excluidas.
-    """
-    if not config:
-        return {
-            "actual": None,
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_caja": "sin_configurar",
-            "mensaje": "La caja disponible requiere parametrización para este cliente.",
-            "cuentas_usadas": []
-        }
+    diff_ef = eficiencia_actual - eficiencia_anterior
+    diff_ventas = ventas_actual - ventas_anterior
+    diff_ebitda = ebitda_actual - ebitda_anterior
 
-    mostrar_caja = bool(config.get("mostrar_caja", False))
-    modo_caja = str(config.get("modo_caja") or "sin_configurar").strip()
+    # -------- explicaciones
+    if diff_ef > 0:
+        explicaciones.append(
+            f"La eficiencia operativa mejoró {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    elif diff_ef < 0:
+        explicaciones.append(
+            f"La eficiencia operativa cayó {abs(diff_ef):.2f} puntos frente al período anterior."
+        )
+    else:
+        explicaciones.append(
+            "La eficiencia operativa se mantuvo estable frente al período anterior."
+        )
 
-    cuentas_incluidas = _normalizar_lista_cuentas_config(config.get("cuentas_incluidas"))
-    cuentas_excluidas = _normalizar_lista_cuentas_config(config.get("cuentas_excluidas"))
+    if diff_ventas > 0 and diff_ebitda > 0:
+        explicaciones.append(
+            "El EBITDA y las ventas crecieron simultáneamente, señal de mejor tracción operativa."
+        )
+    elif diff_ventas > 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Las ventas crecieron, pero el EBITDA cayó; probablemente hubo presión en costos o gastos."
+        )
+    elif diff_ventas < 0 and diff_ebitda < 0:
+        explicaciones.append(
+            "Se observa contracción conjunta en ventas y EBITDA, lo que amerita revisión inmediata."
+        )
 
-    if not mostrar_caja:
-        return {
-            "actual": None,
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_caja": modo_caja,
-            "mensaje": "La visualización de caja disponible está desactivada para este cliente.",
-            "cuentas_usadas": []
-        }
+    if promedio_6m > 0:
+        if eficiencia_actual > promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por encima del promedio de 6 meses."
+            )
+        elif eficiencia_actual < promedio_6m:
+            explicaciones.append(
+                f"El indicador actual está {abs(eficiencia_actual - promedio_6m):.2f} puntos por debajo del promedio de 6 meses."
+            )
 
-    if modo_caja == "sin_configurar":
-        return {
-            "actual": None,
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_caja": modo_caja,
-            "mensaje": "La caja disponible requiere parametrización de cuentas para este cliente.",
-            "cuentas_usadas": []
-        }
+    # -------- alertas
+    if runway_meses > 0 and runway_meses < 1.5:
+        alertas.append({
+            "nivel": "alta",
+            "titulo": "Caja ajustada",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    elif runway_meses >= 1.5 and runway_meses < 3:
+        alertas.append({
+            "nivel": "media",
+            "titulo": "Runway moderado",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
+    else:
+        alertas.append({
+            "nivel": "baja",
+            "titulo": "Caja con holgura",
+            "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
+        })
 
-    if modo_caja == "inclusion":
-        codigos = [c["codigo"] for c in cuentas_incluidas if c.get("codigo")]
-        if not codigos:
-            return {
-                "actual": None,
-                "requiere_parametrizacion": True,
-                "visible": False,
-                "modo_caja": modo_caja,
-                "mensaje": "Modo inclusión activo, pero no hay cuentas incluidas configuradas.",
-                "cuentas_usadas": []
-            }
+    if top_gastos:
+        top1 = top_gastos[0]
+        acciones.append(
+            f"Revisar la categoría '{top1['nombre']}' ({top1['cuenta']}), actualmente el gasto operacional más alto del período."
+        )
 
-        condiciones = []
-        params = {"idc": idcliente, "hasta": hasta}
+    if eficiencia_actual < promedio_6m and promedio_6m > 0:
+        acciones.append(
+            "Analizar qué gastos crecieron más rápido que las ventas en el período actual."
+        )
 
-        for idx, codigo in enumerate(codigos):
-            key = f"c{idx}"
-            condiciones.append(f"cuenta_codigo LIKE :{key}")
-            params[key] = f"{codigo}%"
+    if diff_ventas > 0 and diff_ebitda < 0:
+        acciones.append(
+            "Validar si el crecimiento comercial está generando presión excesiva en costos o gasto operativo."
+        )
 
-        where_cuentas = " OR ".join(condiciones)
+    if not acciones:
+        acciones.append(
+            "Mantener seguimiento mensual del EBITDA, ventas y caja para sostener la tendencia positiva."
+        )
 
-        sql = text(f"""
-            SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-              AND fecha_contable <= :hasta
-              AND ({where_cuentas})
-        """)
-        row = db.session.execute(sql, params).mappings().first()
-        valor = _safe_float(row["caja_actual"] if row else 0)
-
-        return {
-            "actual": _round2(valor),
-            "requiere_parametrizacion": False,
-            "visible": True,
-            "modo_caja": modo_caja,
-            "mensaje": "Caja disponible calculada con cuentas incluidas parametrizadas.",
-            "cuentas_usadas": cuentas_incluidas
-        }
-
-    if modo_caja == "exclusion":
-        codigos = [c["codigo"] for c in cuentas_excluidas if c.get("codigo")]
-        params = {"idc": idcliente, "hasta": hasta}
-
-        filtro_exclusion = ""
-        if codigos:
-            condiciones = []
-            for idx, codigo in enumerate(codigos):
-                key = f"e{idx}"
-                condiciones.append(f"cuenta_codigo NOT LIKE :{key}")
-                params[key] = f"{codigo}%"
-            filtro_exclusion = " AND " + " AND ".join(condiciones)
-
-        sql = text(f"""
-            SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-              AND fecha_contable <= :hasta
-              AND cuenta_codigo LIKE '11%'
-              {filtro_exclusion}
-        """)
-        row = db.session.execute(sql, params).mappings().first()
-        valor = _safe_float(row["caja_actual"] if row else 0)
-
-        return {
-            "actual": _round2(valor),
-            "requiere_parametrizacion": False,
-            "visible": True,
-            "modo_caja": modo_caja,
-            "mensaje": "Caja disponible calculada con clase 11 excluyendo cuentas parametrizadas.",
-            "cuentas_usadas": cuentas_excluidas
-        }
-
-    return {
-        "actual": None,
-        "requiere_parametrizacion": True,
-        "visible": False,
-        "modo_caja": modo_caja,
-        "mensaje": "El modo de caja configurado no es válido.",
-        "cuentas_usadas": []
-    }
-
-
-def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_info):
-    """
-    Cash runway seguro y parametrizable.
-
-    Reglas actuales:
-    - Si no hay config, no calcula.
-    - Si mostrar_runway = False, no calcula.
-    - Si modo_runway = sin_configurar, no calcula.
-    - Si caja no está disponible, no calcula.
-    - Soporta por ahora:
-        * egresos_promedio: usa promedio mensual de compras/gastos (siigo_compras)
-    """
-    if not config:
-        return {
-            "actual": None,
-            "burn_promedio": None,
-            "unidad": "meses",
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_runway": "sin_configurar",
-            "mensaje": "El cash runway requiere parametrización para este cliente."
-        }
-
-    mostrar_runway = bool(config.get("mostrar_runway", False))
-    modo_runway = str(config.get("modo_runway") or "sin_configurar").strip()
-    meses_promedio = int(config.get("meses_promedio_runway") or 3)
-
-    if not mostrar_runway:
-        return {
-            "actual": None,
-            "burn_promedio": None,
-            "unidad": "meses",
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_runway": modo_runway,
-            "mensaje": "La visualización de cash runway está desactivada para este cliente."
-        }
-
-    if modo_runway == "sin_configurar":
-        return {
-            "actual": None,
-            "burn_promedio": None,
-            "unidad": "meses",
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_runway": modo_runway,
-            "mensaje": "El cash runway requiere parametrización de fórmula para este cliente."
-        }
-
-    if caja_info.get("actual") in (None, 0) or caja_info.get("requiere_parametrizacion"):
-        return {
-            "actual": None,
-            "burn_promedio": None,
-            "unidad": "meses",
-            "requiere_parametrizacion": True,
-            "visible": False,
-            "modo_runway": modo_runway,
-            "mensaje": "No es posible calcular cash runway sin una caja disponible válida."
-        }
-
-    if modo_runway == "egresos_promedio":
-        desde_ref = _first_day_of_month(_shift_months(fecha_hasta, -(meses_promedio - 1)))
-
-        sql = text("""
-            SELECT
-                TO_CHAR(DATE_TRUNC('month', fecha), 'YYYY-MM') AS mes,
-                COALESCE(SUM(total), 0) AS egresos_mes
-            FROM siigo_compras
-            WHERE idcliente = :idc
-              AND fecha >= :desde
-              AND fecha <= :hasta
-            GROUP BY TO_CHAR(DATE_TRUNC('month', fecha), 'YYYY-MM')
-            ORDER BY mes
-        """)
-
-        rows = db.session.execute(sql, {
-            "idc": idcliente,
-            "desde": desde_ref,
-            "hasta": fecha_hasta
-        }).mappings().all()
-
-        egresos = [_safe_float(r["egresos_mes"]) for r in rows if _safe_float(r["egresos_mes"]) > 0]
-        burn_promedio = _round2(sum(egresos) / len(egresos)) if egresos else 0
-
-        runway = _round2(_safe_float(caja_info["actual"]) / burn_promedio) if burn_promedio > 0 else None
-
-        return {
-            "actual": runway,
-            "burn_promedio": burn_promedio if burn_promedio > 0 else None,
-            "unidad": "meses",
-            "requiere_parametrizacion": False,
-            "visible": runway is not None,
-            "modo_runway": modo_runway,
-            "mensaje": "Cash runway calculado con egresos promedio de compras/gastos."
-        }
-
-    return {
-        "actual": None,
-        "burn_promedio": None,
-        "unidad": "meses",
-        "requiere_parametrizacion": True,
-        "visible": False,
-        "modo_runway": modo_runway,
-        "mensaje": "El modo de runway configurado no está implementado todavía."
-    }
-
+    return explicaciones[:3], acciones[:3], alertas[:3]
 
 
 # ENDPOINTS DEL SISTEMA
@@ -9479,7 +9420,6 @@ def create_app():
 
         try:
             corte = _resolver_corte_confiable_auxiliar(idcliente)
-            config = _obtener_config_dashboard(idcliente)
 
             if not corte["ultima_fecha_auxiliar"]:
                 return jsonify({
@@ -9501,7 +9441,8 @@ def create_app():
                 except Exception:
                     return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
 
-            # Ajuste automático al corte confiable
+            # Si el usuario manda una fecha hasta superior al corte confiable,
+            # se ajusta automáticamente para no contaminar el dashboard con mes parcial.
             fecha_hasta_ajustada = fecha_hasta
             ajuste_por_corte = False
 
@@ -9509,6 +9450,7 @@ def create_app():
                 fecha_hasta_ajustada = corte["fecha_corte_confiable"]
                 ajuste_por_corte = True
 
+                # Si al ajustar queda fecha_desde mayor que fecha_hasta, rearmar YTD
                 if fecha_desde > fecha_hasta_ajustada:
                     fecha_desde = corte["desde_ytd"]
 
@@ -9519,7 +9461,7 @@ def create_app():
                 desde = fecha_desde.strftime("%Y-%m-%d")
 
             # =========================================================
-            # 1. P&L ACTUAL
+            # 1. P&L ACTUAL (helper ya existente)
             # =========================================================
             pnl_actual = construir_pnl_auxiliares(idcliente, desde, hasta)
             kpis_actual = pnl_actual.get("kpis", {})
@@ -9546,7 +9488,7 @@ def create_app():
                 )
 
             # =========================================================
-            # 2. PERIODO ANTERIOR
+            # 2. PERIODO ANTERIOR (mismo tamaño de rango)
             # =========================================================
             delta = fecha_hasta_ajustada - fecha_desde
             prev_hasta = fecha_desde - timedelta(days=1)
@@ -9560,23 +9502,20 @@ def create_app():
             kpis_anterior = pnl_anterior.get("kpis", {})
 
             # =========================================================
-            # 3. TENDENCIA ÚLTIMOS N MESES
+            # 3. ÚLTIMOS 6 MESES para tendencia ejecutiva
             # =========================================================
-            meses_grafica = int(config.get("meses_grafica") or 6) if config else 6
-            meses_grafica = max(3, min(meses_grafica, 24))
-
-            hasta_nm = fecha_hasta_ajustada
-            desde_nm = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -(meses_grafica - 1)))
-
-            pnl_nm = construir_pnl_auxiliares(
+            hasta_6m = fecha_hasta_ajustada
+            desde_6m = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -5))
+            pnl_6m = construir_pnl_auxiliares(
                 idcliente,
-                desde_nm.strftime("%Y-%m-%d"),
-                hasta_nm.strftime("%Y-%m-%d"),
+                desde_6m.strftime("%Y-%m-%d"),
+                hasta_6m.strftime("%Y-%m-%d"),
             )
-            evolucion_nm = pnl_nm.get("evolucion", [])
+            evolucion_6m = pnl_6m.get("evolucion", [])
 
             # =========================================================
             # 4. EFICIENCIA OPERATIVA
+            # usar ingresos_operacionales, no ingresos_totales
             # =========================================================
             ventas_actual = _safe_float(kpis_actual.get("ingresos_operacionales", 0))
             ventas_anterior = _safe_float(kpis_anterior.get("ingresos_operacionales", 0))
@@ -9587,17 +9526,17 @@ def create_app():
             eficiencia_actual = (ebitda_actual / ventas_actual * 100) if ventas_actual else 0
             eficiencia_anterior = (ebitda_anterior / ventas_anterior * 100) if ventas_anterior else 0
 
-            eficiencias_nm = []
+            eficiencias_6m = []
             serie_mensual = []
 
-            for row in evolucion_nm:
+            for row in evolucion_6m:
                 ventas_mes = _safe_float(row.get("ingresos_operacionales", 0))
                 ebitda_mes = _safe_float(row.get("ebitda", 0))
                 gastos_op_mes = _safe_float(row.get("gastos_operacionales", 0))
                 dep_mes = _safe_float(row.get("dep_amort", 0))
                 eficiencia_mes = (ebitda_mes / ventas_mes * 100) if ventas_mes else 0
 
-                eficiencias_nm.append(eficiencia_mes)
+                eficiencias_6m.append(eficiencia_mes)
 
                 serie_mensual.append({
                     "label": row.get("label"),
@@ -9608,28 +9547,46 @@ def create_app():
                     "dep_amort": _round2(dep_mes),
                 })
 
-            promedio_nm = _round2(sum(eficiencias_nm) / len(eficiencias_nm)) if eficiencias_nm else 0
-            meta_eficiencia = _resolver_meta_eficiencia(config)
+            promedio_6m = _round2(sum(eficiencias_6m) / len(eficiencias_6m)) if eficiencias_6m else 0
 
             # =========================================================
-            # 5. CAJA DISPONIBLE + RUNWAY PARAMETRIZADOS
+            # 5. META
             # =========================================================
-            caja_info = _calcular_caja_disponible_parametrizada(idcliente, hasta, config)
-            runway_info = _calcular_cash_runway_parametrizado(
-                idcliente=idcliente,
-                fecha_hasta=fecha_hasta_ajustada,
-                config=config,
-                caja_info=caja_info
+            meta_eficiencia = 20.0
+
+            # =========================================================
+            # 6. CAJA DISPONIBLE + RUNWAY
+            # =========================================================
+            caja_actual = _calcular_caja_actual(idcliente, hasta)
+
+            hasta_3m = fecha_hasta_ajustada
+            desde_3m = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -2))
+            pnl_3m = construir_pnl_auxiliares(
+                idcliente,
+                desde_3m.strftime("%Y-%m-%d"),
+                hasta_3m.strftime("%Y-%m-%d"),
             )
+            evolucion_3m = pnl_3m.get("evolucion", [])
+
+            burns = []
+            for row in evolucion_3m:
+                gastos_op = _safe_float(row.get("gastos_operacionales", 0))
+                dep_amort = _safe_float(row.get("dep_amort", 0))
+                burn_mes = max(gastos_op - dep_amort, 0)
+                if burn_mes > 0:
+                    burns.append(burn_mes)
+
+            burn_promedio_3m = _round2(sum(burns) / len(burns)) if burns else 0
+            runway_meses = _round2(caja_actual / burn_promedio_3m) if burn_promedio_3m > 0 else 0
 
             # =========================================================
-            # 6. TOP GASTOS
+            # 7. TOP GASTOS (desde composición helper)
             # =========================================================
-            top_gastos_limite = int(config.get("top_gastos") or 5) if config else 5
-            top_gastos = _calcular_top_gastos(composicion_actual, limite=top_gastos_limite)
+            top_gastos = _calcular_top_gastos(composicion_actual, limite=5)
 
             # =========================================================
-            # 7. TOP CLIENTES / PROVEEDORES
+            # 8. DATA complementaria desde modelo consolidado
+            # top clientes / top proveedores
             # =========================================================
             params = {"idcliente": idcliente}
             condiciones_ing = ["idcliente = :idcliente"]
@@ -9653,9 +9610,6 @@ def create_app():
             where_ing = " AND ".join(condiciones_ing)
             where_egr = " AND ".join(condiciones_egr)
 
-            limit_clientes = int(config.get("top_clientes") or 5) if config else 5
-            limit_proveedores = int(config.get("top_proveedores") or 5) if config else 5
-
             sql_top_clientes = text(f"""
                 SELECT
                     cliente_nombre AS nombre,
@@ -9664,7 +9618,7 @@ def create_app():
                 WHERE {where_ing}
                 GROUP BY cliente_nombre
                 ORDER BY total DESC
-                LIMIT {limit_clientes}
+                LIMIT 5
             """)
 
             sql_top_proveedores = text(f"""
@@ -9675,7 +9629,7 @@ def create_app():
                 WHERE {where_egr}
                 GROUP BY COALESCE(proveedor_nombre, 'Sin proveedor')
                 ORDER BY total DESC
-                LIMIT {limit_proveedores}
+                LIMIT 5
             """)
 
             top_clientes = [
@@ -9689,15 +9643,13 @@ def create_app():
             ]
 
             # =========================================================
-            # 8. EXPLICACIONES + ACCIONES + ALERTAS
+            # 9. EXPLICACIONES + ACCIONES + ALERTAS
             # =========================================================
-            runway_ref = _safe_float(runway_info["actual"]) if runway_info.get("actual") is not None else 0
-
             explicaciones, acciones, alertas = _construir_explicaciones_y_acciones(
                 eficiencia_actual=eficiencia_actual,
                 eficiencia_anterior=eficiencia_anterior,
-                promedio_6m=promedio_nm,
-                runway_meses=runway_ref,
+                promedio_6m=promedio_6m,
+                runway_meses=runway_meses,
                 top_gastos=top_gastos,
                 ventas_actual=ventas_actual,
                 ventas_anterior=ventas_anterior,
@@ -9705,16 +9657,8 @@ def create_app():
                 ebitda_anterior=ebitda_anterior,
             )
 
-            # Si runway no está parametrizado, no forzar alerta engañosa
-            if runway_info.get("requiere_parametrizacion"):
-                alertas = [{
-                    "nivel": "media",
-                    "titulo": "Cash runway pendiente",
-                    "descripcion": runway_info.get("mensaje") or "El indicador requiere parametrización."
-                }]
-
             # =========================================================
-            # 9. RESPUESTA FINAL
+            # 10. RESPUESTA FINAL
             # =========================================================
             return jsonify({
                 "periodo": {
@@ -9737,16 +9681,7 @@ def create_app():
                     ),
                     "mes_actual_parcial": corte["mes_actual_parcial"],
                     "modo_periodo": corte["modo_periodo"],
-                    "mensaje_contexto": mensaje_contexto,
-                    "config_dashboard": {
-                        "existe_config": bool(config),
-                        "mostrar_caja": bool(config.get("mostrar_caja")) if config else False,
-                        "mostrar_runway": bool(config.get("mostrar_runway")) if config else False,
-                        "modo_caja": config.get("modo_caja") if config else "sin_configurar",
-                        "modo_runway": config.get("modo_runway") if config else "sin_configurar",
-                        "meses_grafica": meses_grafica,
-                        "indicador_estrella": config.get("indicador_estrella") if config else "eficiencia_operativa",
-                    }
+                    "mensaje_contexto": mensaje_contexto
                 },
                 "kpis": {
                     "ventas_netas": _variacion(
@@ -9765,11 +9700,17 @@ def create_app():
                         "actual": _round2(eficiencia_actual),
                         "anterior": _round2(eficiencia_anterior),
                         "diff": _round2(eficiencia_actual - eficiencia_anterior),
-                        "promedio_6m": _round2(promedio_nm),
+                        "promedio_6m": _round2(promedio_6m),
                         "meta": _round2(meta_eficiencia),
                     },
-                    "caja_disponible": caja_info,
-                    "cash_runway": runway_info
+                    "caja_disponible": {
+                        "actual": _round2(caja_actual)
+                    },
+                    "cash_runway": {
+                        "actual": _round2(runway_meses),
+                        "burn_promedio_3m": _round2(burn_promedio_3m),
+                        "unidad": "meses"
+                    }
                 },
                 "series": {
                     "mensual": serie_mensual

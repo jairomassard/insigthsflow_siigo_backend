@@ -862,3 +862,98 @@ class AuxiliarSaldosCorte(db.Model):
     )
 
 
+
+class DashboardResumenConfig(db.Model):
+    __tablename__ = "dashboard_resumen_config"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    idcliente = db.Column(
+        db.Integer,
+        db.ForeignKey("clientes.idcliente", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    # Activación / visibilidad
+    activo = db.Column(db.Boolean, nullable=False, default=True)
+    mostrar_caja = db.Column(db.Boolean, nullable=False, default=False)
+    mostrar_runway = db.Column(db.Boolean, nullable=False, default=False)
+
+    # Caja disponible
+    modo_caja = db.Column(db.String(20), nullable=False, default="sin_configurar")
+    cuentas_incluidas = db.Column(db.JSON)
+    cuentas_excluidas = db.Column(db.JSON)
+
+    # Runway
+    modo_runway = db.Column(db.String(30), nullable=False, default="sin_configurar")
+    meses_promedio_runway = db.Column(db.Integer, nullable=False, default=3)
+
+    # Objetivos / metas
+    meta_eficiencia_operativa = db.Column(
+        db.Numeric(10, 2),
+        nullable=False,
+        default=Decimal("20.00")
+    )
+    meta_ebitda = db.Column(db.Numeric(18, 2))
+    meta_margen_ebitda = db.Column(db.Numeric(10, 2))
+
+    # Comportamiento visual / ejecutivo
+    meses_grafica = db.Column(db.Integer, nullable=False, default=6)
+    top_clientes = db.Column(db.Integer, nullable=False, default=5)
+    top_proveedores = db.Column(db.Integer, nullable=False, default=5)
+    top_gastos = db.Column(db.Integer, nullable=False, default=5)
+    indicador_estrella = db.Column(
+        db.String(50),
+        nullable=False,
+        default="eficiencia_operativa"
+    )
+
+    # Periodización
+    modo_periodo_default = db.Column(
+        db.String(30),
+        nullable=False,
+        default="ytd_cerrado"
+    )
+
+    # Auditoría
+    creado_en = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    actualizado_en = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "idcliente",
+            name="uq_dashboard_resumen_config_idcliente"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "idcliente": self.idcliente,
+            "activo": self.activo,
+            "mostrar_caja": self.mostrar_caja,
+            "mostrar_runway": self.mostrar_runway,
+            "modo_caja": self.modo_caja,
+            "cuentas_incluidas": self.cuentas_incluidas or [],
+            "cuentas_excluidas": self.cuentas_excluidas or [],
+            "modo_runway": self.modo_runway,
+            "meses_promedio_runway": self.meses_promedio_runway,
+            "meta_eficiencia_operativa": float(self.meta_eficiencia_operativa or 0),
+            "meta_ebitda": float(self.meta_ebitda or 0) if self.meta_ebitda is not None else None,
+            "meta_margen_ebitda": float(self.meta_margen_ebitda or 0) if self.meta_margen_ebitda is not None else None,
+            "meses_grafica": self.meses_grafica,
+            "top_clientes": self.top_clientes,
+            "top_proveedores": self.top_proveedores,
+            "top_gastos": self.top_gastos,
+            "indicador_estrella": self.indicador_estrella,
+            "modo_periodo_default": self.modo_periodo_default,
+            "creado_en": self.creado_en.isoformat() if self.creado_en else None,
+            "actualizado_en": self.actualizado_en.isoformat() if self.actualizado_en else None,
+        }
+
