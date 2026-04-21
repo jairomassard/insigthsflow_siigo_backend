@@ -1574,6 +1574,149 @@ def _construir_explicaciones_y_acciones(
     return explicaciones[:3], acciones[:3], alertas[:3]
 
 
+# Helpers Pagina de Cnfiguraciones varias Dashboar y otras
+
+def _serializar_dashboard_resumen_config(row):
+    if not row:
+        return {
+            "activo": True,
+            "mostrar_caja": False,
+            "mostrar_runway": False,
+            "modo_caja": "sin_configurar",
+            "cuentas_incluidas": [],
+            "cuentas_excluidas": [],
+            "modo_runway": "sin_configurar",
+            "meses_promedio_runway": 3,
+            "meta_eficiencia_operativa": 20.0,
+            "meta_ebitda": None,
+            "meta_margen_ebitda": None,
+            "meses_grafica": 6,
+            "top_clientes": 5,
+            "top_proveedores": 5,
+            "top_gastos": 5,
+            "indicador_estrella": "eficiencia_operativa",
+            "modo_periodo_default": "ytd_cerrado",
+        }
+
+    return {
+        "id": row["id"],
+        "idcliente": row["idcliente"],
+        "activo": bool(row["activo"]),
+        "mostrar_caja": bool(row["mostrar_caja"]),
+        "mostrar_runway": bool(row["mostrar_runway"]),
+        "modo_caja": row["modo_caja"] or "sin_configurar",
+        "cuentas_incluidas": row["cuentas_incluidas"] or [],
+        "cuentas_excluidas": row["cuentas_excluidas"] or [],
+        "modo_runway": row["modo_runway"] or "sin_configurar",
+        "meses_promedio_runway": int(row["meses_promedio_runway"] or 3),
+        "meta_eficiencia_operativa": float(row["meta_eficiencia_operativa"] or 20),
+        "meta_ebitda": float(row["meta_ebitda"]) if row["meta_ebitda"] is not None else None,
+        "meta_margen_ebitda": float(row["meta_margen_ebitda"]) if row["meta_margen_ebitda"] is not None else None,
+        "meses_grafica": int(row["meses_grafica"] or 6),
+        "top_clientes": int(row["top_clientes"] or 5),
+        "top_proveedores": int(row["top_proveedores"] or 5),
+        "top_gastos": int(row["top_gastos"] or 5),
+        "indicador_estrella": row["indicador_estrella"] or "eficiencia_operativa",
+        "modo_periodo_default": row["modo_periodo_default"] or "ytd_cerrado",
+    }
+
+
+def _limpiar_cuentas_config(lista_raw):
+    """
+    Espera lista tipo:
+    [
+      {"codigo": "111005", "nombre": "Banco Davivienda Ahorros Ppal"}
+    ]
+    """
+    salida = []
+
+    if not isinstance(lista_raw, list):
+        return salida
+
+    for item in lista_raw:
+        if not isinstance(item, dict):
+            continue
+
+        codigo = str(item.get("codigo", "")).strip()
+        nombre = str(item.get("nombre", "")).strip()
+
+        if not codigo:
+            continue
+
+        salida.append({
+            "codigo": codigo,
+            "nombre": nombre
+        })
+
+    return salida
+
+
+def _buscar_cuentas_auxiliar_para_config(idcliente, q=None, limite=20):
+    """
+    Busca cuentas contables existentes en auxiliar_contable para autocompletar
+    parametrizaciones del dashboard.
+
+    Retorna cuentas únicas por código con su nombre más representativo.
+    """
+    q = (q or "").strip()
+    limite = max(1, min(int(limite or 20), 50))
+
+    params = {
+        "idc": idcliente,
+        "limite": limite,
+    }
+
+    filtros = ["idcliente = :idc"]
+
+    if q:
+        filtros.append("""
+            (
+                cuenta_codigo ILIKE :q
+                OR cuenta_nombre ILIKE :q
+            )
+        """)
+        params["q"] = f"%{q}%"
+
+    where_sql = " AND ".join(filtros)
+
+    sql = text(f"""
+        SELECT
+            cuenta_codigo AS codigo,
+            MAX(cuenta_nombre) AS nombre,
+            COUNT(*) AS apariciones,
+            MAX(fecha_contable) AS ultima_fecha
+        FROM auxiliar_contable
+        WHERE {where_sql}
+          AND cuenta_codigo IS NOT NULL
+          AND TRIM(cuenta_codigo) <> ''
+        GROUP BY cuenta_codigo
+        ORDER BY
+            CASE
+                WHEN cuenta_codigo = :q_exact THEN 0
+                WHEN cuenta_codigo ILIKE :q_prefix THEN 1
+                ELSE 2
+            END,
+            cuenta_codigo ASC
+        LIMIT :limite
+    """)
+
+    params["q_exact"] = q if q else ""
+    params["q_prefix"] = f"{q}%" if q else ""
+
+    rows = db.session.execute(sql, params).mappings().all()
+
+    return [
+        {
+            "codigo": str(r["codigo"]).strip(),
+            "nombre": str(r["nombre"] or "").strip(),
+            "apariciones": int(r["apariciones"] or 0),
+            "ultima_fecha": r["ultima_fecha"].strftime("%Y-%m-%d") if r["ultima_fecha"] else None,
+        }
+        for r in rows
+    ]
+
+
+
 
 
 # ENDPOINTS DEL SISTEMA
@@ -9984,6 +10127,331 @@ def create_app():
                 "detalle": str(e)
             }), 500
 
+
+
+    # =========================================================
+    # ENDPOINT CONFIG DASHBOARD RESUMEN - GET
+    # =========================================================
+    @app.route("/dashboard/resumen-config", methods=["GET"])
+    @jwt_required()
+    def dashboard_resumen_config_get():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        try:
+            sql = text("""
+                SELECT
+                    id,
+                    idcliente,
+                    activo,
+                    mostrar_caja,
+                    mostrar_runway,
+                    modo_caja,
+                    cuentas_incluidas,
+                    cuentas_excluidas,
+                    modo_runway,
+                    meses_promedio_runway,
+                    meta_eficiencia_operativa,
+                    meta_ebitda,
+                    meta_margen_ebitda,
+                    meses_grafica,
+                    top_clientes,
+                    top_proveedores,
+                    top_gastos,
+                    indicador_estrella,
+                    modo_periodo_default
+                FROM dashboard_resumen_config
+                WHERE idcliente = :idc
+                LIMIT 1
+            """)
+
+            row = db.session.execute(sql, {"idc": idcliente}).mappings().first()
+            return jsonify(_serializar_dashboard_resumen_config(row)), 200
+
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible obtener la configuración del dashboard",
+                "detalle": str(e)
+            }), 500
+
+
+    # =========================================================
+    # ENDPOINT CONFIG DASHBOARD RESUMEN - PUT
+    # =========================================================
+    @app.route("/dashboard/resumen-config", methods=["PUT"])
+    @jwt_required()
+    def dashboard_resumen_config_put():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        data = request.get_json(silent=True) or {}
+
+        try:
+            activo = bool(data.get("activo", True))
+            mostrar_caja = bool(data.get("mostrar_caja", False))
+            mostrar_runway = bool(data.get("mostrar_runway", False))
+
+            modo_caja = str(data.get("modo_caja") or "sin_configurar").strip()
+            modo_runway = str(data.get("modo_runway") or "sin_configurar").strip()
+            indicador_estrella = str(data.get("indicador_estrella") or "eficiencia_operativa").strip()
+            modo_periodo_default = str(data.get("modo_periodo_default") or "ytd_cerrado").strip()
+
+            cuentas_incluidas = _limpiar_cuentas_config(data.get("cuentas_incluidas"))
+            cuentas_excluidas = _limpiar_cuentas_config(data.get("cuentas_excluidas"))
+
+            meses_promedio_runway = int(data.get("meses_promedio_runway") or 3)
+            meta_eficiencia_operativa = float(data.get("meta_eficiencia_operativa") or 20)
+            meta_ebitda = data.get("meta_ebitda")
+            meta_margen_ebitda = data.get("meta_margen_ebitda")
+            meses_grafica = int(data.get("meses_grafica") or 6)
+            top_clientes = int(data.get("top_clientes") or 5)
+            top_proveedores = int(data.get("top_proveedores") or 5)
+            top_gastos = int(data.get("top_gastos") or 5)
+
+            # Normalizar nullables
+            meta_ebitda = float(meta_ebitda) if meta_ebitda not in (None, "", "null") else None
+            meta_margen_ebitda = float(meta_margen_ebitda) if meta_margen_ebitda not in (None, "", "null") else None
+
+            # Validaciones controladas
+            modos_caja_validos = {"sin_configurar", "inclusion", "exclusion"}
+            modos_runway_validos = {"sin_configurar", "burn_operativo", "egresos_promedio", "personalizado"}
+            indicadores_validos = {
+                "eficiencia_operativa",
+                "ebitda",
+                "ventas_netas",
+                "utilidad_operativa",
+                "caja_disponible",
+                "cash_runway",
+            }
+            modos_periodo_validos = {"ytd_cerrado", "manual", "ultimo_mes_cerrado"}
+
+            if modo_caja not in modos_caja_validos:
+                return jsonify({"error": "modo_caja inválido"}), 400
+
+            if modo_runway not in modos_runway_validos:
+                return jsonify({"error": "modo_runway inválido"}), 400
+
+            if indicador_estrella not in indicadores_validos:
+                return jsonify({"error": "indicador_estrella inválido"}), 400
+
+            if modo_periodo_default not in modos_periodo_validos:
+                return jsonify({"error": "modo_periodo_default inválido"}), 400
+
+            if not (1 <= meses_promedio_runway <= 12):
+                return jsonify({"error": "meses_promedio_runway debe estar entre 1 y 12"}), 400
+
+            if not (3 <= meses_grafica <= 24):
+                return jsonify({"error": "meses_grafica debe estar entre 3 y 24"}), 400
+
+            if not (3 <= top_clientes <= 20):
+                return jsonify({"error": "top_clientes debe estar entre 3 y 20"}), 400
+
+            if not (3 <= top_proveedores <= 20):
+                return jsonify({"error": "top_proveedores debe estar entre 3 y 20"}), 400
+
+            if not (3 <= top_gastos <= 20):
+                return jsonify({"error": "top_gastos debe estar entre 3 y 20"}), 400
+
+            # Upsert manual
+            sql_check = text("""
+                SELECT id
+                FROM dashboard_resumen_config
+                WHERE idcliente = :idc
+                LIMIT 1
+            """)
+            existing = db.session.execute(sql_check, {"idc": idcliente}).mappings().first()
+
+            if existing:
+                sql_update = text("""
+                    UPDATE dashboard_resumen_config
+                    SET
+                        activo = :activo,
+                        mostrar_caja = :mostrar_caja,
+                        mostrar_runway = :mostrar_runway,
+                        modo_caja = :modo_caja,
+                        cuentas_incluidas = CAST(:cuentas_incluidas AS JSONB),
+                        cuentas_excluidas = CAST(:cuentas_excluidas AS JSONB),
+                        modo_runway = :modo_runway,
+                        meses_promedio_runway = :meses_promedio_runway,
+                        meta_eficiencia_operativa = :meta_eficiencia_operativa,
+                        meta_ebitda = :meta_ebitda,
+                        meta_margen_ebitda = :meta_margen_ebitda,
+                        meses_grafica = :meses_grafica,
+                        top_clientes = :top_clientes,
+                        top_proveedores = :top_proveedores,
+                        top_gastos = :top_gastos,
+                        indicador_estrella = :indicador_estrella,
+                        modo_periodo_default = :modo_periodo_default,
+                        actualizado_en = NOW()
+                    WHERE idcliente = :idc
+                """)
+
+                db.session.execute(sql_update, {
+                    "idc": idcliente,
+                    "activo": activo,
+                    "mostrar_caja": mostrar_caja,
+                    "mostrar_runway": mostrar_runway,
+                    "modo_caja": modo_caja,
+                    "cuentas_incluidas": json.dumps(cuentas_incluidas),
+                    "cuentas_excluidas": json.dumps(cuentas_excluidas),
+                    "modo_runway": modo_runway,
+                    "meses_promedio_runway": meses_promedio_runway,
+                    "meta_eficiencia_operativa": meta_eficiencia_operativa,
+                    "meta_ebitda": meta_ebitda,
+                    "meta_margen_ebitda": meta_margen_ebitda,
+                    "meses_grafica": meses_grafica,
+                    "top_clientes": top_clientes,
+                    "top_proveedores": top_proveedores,
+                    "top_gastos": top_gastos,
+                    "indicador_estrella": indicador_estrella,
+                    "modo_periodo_default": modo_periodo_default,
+                })
+            else:
+                sql_insert = text("""
+                    INSERT INTO dashboard_resumen_config (
+                        idcliente,
+                        activo,
+                        mostrar_caja,
+                        mostrar_runway,
+                        modo_caja,
+                        cuentas_incluidas,
+                        cuentas_excluidas,
+                        modo_runway,
+                        meses_promedio_runway,
+                        meta_eficiencia_operativa,
+                        meta_ebitda,
+                        meta_margen_ebitda,
+                        meses_grafica,
+                        top_clientes,
+                        top_proveedores,
+                        top_gastos,
+                        indicador_estrella,
+                        modo_periodo_default,
+                        creado_en,
+                        actualizado_en
+                    )
+                    VALUES (
+                        :idc,
+                        :activo,
+                        :mostrar_caja,
+                        :mostrar_runway,
+                        :modo_caja,
+                        CAST(:cuentas_incluidas AS JSONB),
+                        CAST(:cuentas_excluidas AS JSONB),
+                        :modo_runway,
+                        :meses_promedio_runway,
+                        :meta_eficiencia_operativa,
+                        :meta_ebitda,
+                        :meta_margen_ebitda,
+                        :meses_grafica,
+                        :top_clientes,
+                        :top_proveedores,
+                        :top_gastos,
+                        :indicador_estrella,
+                        :modo_periodo_default,
+                        NOW(),
+                        NOW()
+                    )
+                """)
+
+                db.session.execute(sql_insert, {
+                    "idc": idcliente,
+                    "activo": activo,
+                    "mostrar_caja": mostrar_caja,
+                    "mostrar_runway": mostrar_runway,
+                    "modo_caja": modo_caja,
+                    "cuentas_incluidas": json.dumps(cuentas_incluidas),
+                    "cuentas_excluidas": json.dumps(cuentas_excluidas),
+                    "modo_runway": modo_runway,
+                    "meses_promedio_runway": meses_promedio_runway,
+                    "meta_eficiencia_operativa": meta_eficiencia_operativa,
+                    "meta_ebitda": meta_ebitda,
+                    "meta_margen_ebitda": meta_margen_ebitda,
+                    "meses_grafica": meses_grafica,
+                    "top_clientes": top_clientes,
+                    "top_proveedores": top_proveedores,
+                    "top_gastos": top_gastos,
+                    "indicador_estrella": indicador_estrella,
+                    "modo_periodo_default": modo_periodo_default,
+                })
+
+            db.session.commit()
+
+            sql_get = text("""
+                SELECT
+                    id,
+                    idcliente,
+                    activo,
+                    mostrar_caja,
+                    mostrar_runway,
+                    modo_caja,
+                    cuentas_incluidas,
+                    cuentas_excluidas,
+                    modo_runway,
+                    meses_promedio_runway,
+                    meta_eficiencia_operativa,
+                    meta_ebitda,
+                    meta_margen_ebitda,
+                    meses_grafica,
+                    top_clientes,
+                    top_proveedores,
+                    top_gastos,
+                    indicador_estrella,
+                    modo_periodo_default
+                FROM dashboard_resumen_config
+                WHERE idcliente = :idc
+                LIMIT 1
+            """)
+            row = db.session.execute(sql_get, {"idc": idcliente}).mappings().first()
+
+            return jsonify(_serializar_dashboard_resumen_config(row)), 200
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No fue posible guardar la configuración del dashboard",
+                "detalle": str(e)
+            }), 500
+
+
+
+    # =========================================================
+    # ENDPOINT BUSCAR CUENTAS AUXILIAR PARA CONFIGURACIÓN
+    # =========================================================
+    @app.route("/dashboard/resumen-config/buscar-cuentas", methods=["GET"])
+    @jwt_required()
+    def dashboard_resumen_config_buscar_cuentas():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        q = request.args.get("q", "").strip()
+        limite = request.args.get("limite", default=20, type=int)
+
+        try:
+            cuentas = _buscar_cuentas_auxiliar_para_config(
+                idcliente=idcliente,
+                q=q,
+                limite=limite,
+            )
+
+            return jsonify({
+                "q": q,
+                "total": len(cuentas),
+                "items": cuentas
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible buscar cuentas contables",
+                "detalle": str(e)
+            }), 500
+
  
 # No tocar de qui para abajo 
  
@@ -10051,7 +10519,11 @@ def create_app():
             codigo = "admin_panel"
 
         elif request.path.startswith("/dashboard"):
-            if "resumen-ejecutivo" in request.path:
+            if "resumen-config/buscar-cuentas" in request.path:
+                codigo = "ver_configuraciones_varias"
+            elif "resumen-config" in request.path or "configuraciones_varias" in request.path:
+                codigo = "ver_configuraciones_varias"
+            elif "resumen-ejecutivo" in request.path:
                 codigo = "ver_resumen_ejecutivo"
             else:
                 codigo = "ver_dashboard"
