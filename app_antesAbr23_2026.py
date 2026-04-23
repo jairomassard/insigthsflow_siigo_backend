@@ -5741,10 +5741,9 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        mes = request.args.get("mes")
-        estado = request.args.get("estado")
+        mes = request.args.get("mes")  # YYYY-MM
+        estado = request.args.get("estado")  # "total" | "pagado" | "pendiente" | "parcial"
         centro_costos = request.args.get("centro_costos")
-        tipo_documento = request.args.get("tipo_documento", "todos")
 
         if not mes:
             return jsonify({"error": "Mes requerido"}), 400
@@ -5755,17 +5754,14 @@ def create_app():
         ]
         params = {"idcliente": idcliente, "mes": mes}
 
+        # Filtro contable por saldo (VERDAD)
         if estado == "pagado":
             condiciones.append("COALESCE(c.saldo,0) = 0")
         elif estado == "pendiente":
             condiciones.append("COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) >= COALESCE(c.total,0)")
         elif estado == "parcial":
             condiciones.append("COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < COALESCE(c.total,0)")
-
-        if tipo_documento == "factura":
-            condiciones.append("c.idcompra ILIKE 'FC-%'")
-        elif tipo_documento == "documento_soporte":
-            condiciones.append("c.idcompra ILIKE 'DS-%'")
+        # "total" o None => sin filtro adicional
 
         if centro_costos:
             condiciones.append("c.cost_center = :centro_costos")
@@ -5781,7 +5777,7 @@ def create_app():
                 c.factura_proveedor,
                 c.fecha,
                 c.vencimiento,
-                COALESCE(c.estado, '') AS estado_raw,
+                COALESCE(c.estado, '') AS estado_raw,  -- informativo
                 COALESCE(c.total,0) AS total,
                 COALESCE(c.saldo,0) AS saldo,
                 (COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS pagado_calc,
@@ -5797,12 +5793,6 @@ def create_app():
                     WHEN COALESCE(c.total,0) > 0 AND COALESCE(c.saldo,0) > COALESCE(c.total,0) THEN true
                     ELSE false
                 END AS anomalia_saldo_mayor_total,
-
-                CASE
-                    WHEN c.idcompra ILIKE 'FC-%' THEN 'factura'
-                    WHEN c.idcompra ILIKE 'DS-%' THEN 'documento_soporte'
-                    ELSE 'otro'
-                END AS tipo_documento,
 
                 sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
@@ -5821,7 +5811,6 @@ def create_app():
     @jwt_required()
     def detalle_proveedor():
         from sqlalchemy.sql import text
-
         claims = get_jwt()
         idcliente = claims.get("idcliente")
         if not idcliente:
@@ -5831,7 +5820,6 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos")
-        tipo_documento = request.args.get("tipo_documento", "todos")
 
         condiciones = ["c.idcliente = :idcliente", "c.proveedor_nombre = :proveedor"]
         params = {"idcliente": idcliente, "proveedor": proveedor}
@@ -5846,24 +5834,23 @@ def create_app():
             condiciones.append("c.cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
 
-        if tipo_documento == "factura":
-            condiciones.append("c.idcompra ILIKE 'FC-%'")
-        elif tipo_documento == "documento_soporte":
-            condiciones.append("c.idcompra ILIKE 'DS-%'")
-
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
             SELECT 
-                c.idcompra AS id,
-                c.proveedor_nombre,
-                c.idcompra AS factura,
-                c.factura_proveedor,
-                c.fecha,
-                c.vencimiento,
-                COALESCE(c.total, 0) AS total,
-                COALESCE(c.saldo, 0) AS saldo,
-                c.estado AS estado_raw,
+                c.idcompra                    AS id,
+                c.proveedor_nombre            AS proveedor_nombre,
+                c.factura_proveedor           AS factura,
+                c.fecha                       AS fecha,
+                c.vencimiento                 AS vencimiento,
+
+                COALESCE(c.total, 0)          AS total,
+                COALESCE(c.saldo, 0)          AS saldo,
+
+                -- Raw de Siigo (informativo)
+                c.estado                      AS estado_raw,
+
+                -- Cálculo contable
                 (COALESCE(c.total,0) - COALESCE(c.saldo,0)) AS pagado_calc,
 
                 CASE
@@ -5877,13 +5864,8 @@ def create_app():
                     ELSE false
                 END AS anomalia_saldo_mayor_total,
 
-                CASE
-                    WHEN c.idcompra ILIKE 'FC-%' THEN 'factura'
-                    WHEN c.idcompra ILIKE 'DS-%' THEN 'documento_soporte'
-                    ELSE 'otro'
-                END AS tipo_documento,
+                sc.nombre                     AS centro_costo_nombre
 
-                sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
             LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
             WHERE {where_sql}
