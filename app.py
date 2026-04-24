@@ -4341,6 +4341,7 @@ def create_app():
                     TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
                     TO_CHAR(vencimiento, 'DD/MM/YYYY') AS vencimiento,
                     (CURRENT_DATE - vencimiento) AS dias_vencidos,
+                    (CURRENT_DATE - fecha) AS dias_transcurridos,
                     total,
                     pagos_total,
                     saldo,
