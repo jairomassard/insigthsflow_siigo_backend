@@ -6311,14 +6311,17 @@ def create_app():
 
 
 
+
+
+
+
+
     # ------------------------------------------
     # Cargar Documentos soporte desde archivo Excel
     # ------------------------------------------
     @app.route("/importar/soporte-excel", methods=["POST"])
     @jwt_required()
     def importar_documentos_soporte_desde_excel():
-        from decimal import Decimal, InvalidOperation
-
         claims = get_jwt()
         idcliente = claims.get("idcliente")
         if not idcliente:
@@ -6330,9 +6333,7 @@ def create_app():
         file = request.files["archivo"]
 
         def _norm_text(v) -> str:
-            if pd.isna(v):
-                return ""
-            return str(v).replace("\xa0", " ").replace("\ufeff", "").strip()
+            return str(v or "").replace("\xa0", " ").replace("\ufeff", "").strip()
 
         def _norm_lower(v) -> str:
             return _norm_text(v).lower()
@@ -6340,111 +6341,42 @@ def create_app():
         def _norm_upper(v) -> str:
             return _norm_text(v).upper()
 
-        def _clean_number_text(v) -> str:
-            """
-            Convierte valores tipo:
-            1896.0 -> 1896
-            ' DS-1 ' -> DS-1
-            nan -> ''
-            """
-            if pd.isna(v):
-                return ""
-            s = str(v).strip()
-            if s.endswith(".0"):
-                s = s[:-2]
-            return s
-
-        def _to_decimal(v) -> Decimal:
-            """
-            Convierte valores de Excel a Decimal de forma segura.
-            Acepta números, strings, valores vacíos y NaN.
-            """
-            if v is None or pd.isna(v):
-                return Decimal("0")
-
-            if isinstance(v, Decimal):
-                return v
-
-            s = str(v).strip()
-            if not s:
-                return Decimal("0")
-
-            # Limpieza básica por si viene con símbolos
-            s = (
-                s.replace("$", "")
-                .replace(" ", "")
-                .replace("\xa0", "")
-            )
-
-            # Si viene formato colombiano: 3.873.219,74
-            if "," in s and "." in s:
-                s = s.replace(".", "").replace(",", ".")
-            elif "," in s and "." not in s:
-                s = s.replace(",", ".")
-
-            try:
-                return Decimal(s)
-            except InvalidOperation:
-                return Decimal("0")
-
         try:
             df = pd.read_excel(file, header=7)
             df.columns = df.columns.str.strip().str.replace("\xa0", " ")
         except Exception as e:
             return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
-        requeridos = [
-            "Número comprobante",
-            "Consecutivo",
-            "Nombre tercero",
-            "Centro costo",
-            "Total",
-            "Fecha elaboración",
-            "Factura proveedor",
-            "Tipo de registro",
-        ]
-
+        requeridos = ["Número comprobante", "Consecutivo", "Nombre tercero", "Centro costo", "Total", "Fecha elaboración", "Factura proveedor"]
         faltantes = [col for col in requeridos if col not in df.columns]
         if faltantes:
-            return jsonify({
-                "error": f"Faltan columnas requeridas: {', '.join(faltantes)}"
-            }), 400
+            return jsonify({"error": f"Faltan columnas requeridas: {', '.join(faltantes)}"}), 400
 
         # ---------------------------
-        # BLINDAJE / VALIDACIÓN PREVIA
+        # BLINDAJE (validación previa)
         # ---------------------------
+        # 1) Detectar columna de tipo de transacción (si existe)
         possible_tipo_cols = [
             "Tipo de Transacción",
             "Tipo de transacción",
             "Tipo transacción",
             "Tipo de Transaccion",
             "Tipo transaccion",
-            "Tipo transacción",
         ]
-
         tipo_col = next((c for c in possible_tipo_cols if c in df.columns), None)
 
-        df["__tipo_reg__"] = df["Tipo de registro"].apply(_norm_lower)
-        df["__num__"] = df["Número comprobante"].apply(
-            lambda x: _norm_upper(_clean_number_text(x).split(".")[0])
-        )
-        df["__pref__"] = df["__num__"].apply(lambda s: s.split("-")[0] if s else "")
-        df["__consecutivo__"] = df["Consecutivo"].apply(
-            lambda x: _clean_number_text(x).split(".")[0]
-        )
-        df["__idcompra__"] = df.apply(
-            lambda r: f"{r['__num__']}-{r['__consecutivo__']}"
-            if r["__num__"] and r["__consecutivo__"]
-            else "",
-            axis=1
-        )
-
-        sample = df[df["__tipo_reg__"] == "secuencia"].copy()
+        # 2) Tomar solo filas "secuencia" para analizar qué viene en el archivo
+        #    (limitamos a un subconjunto para eficiencia)
+        sample = df.head(5000).copy()
+        sample["__tipo_reg__"] = sample.get("Tipo de registro", "").apply(_norm_lower)
+        sample = sample[sample["__tipo_reg__"] == "secuencia"]
 
         if sample.empty:
-            return jsonify({
-                "error": "El archivo no contiene filas 'secuencia'. Revisa que sea el reporte correcto."
-            }), 400
+            return jsonify({"error": "El archivo no contiene filas 'secuencia'. Revisa que sea el reporte correcto."}), 400
+
+        # prefijo según Número comprobante
+        sample["__num__"] = sample["Número comprobante"].apply(lambda x: _norm_upper(str(x).split(".")[0]))
+        sample["__pref__"] = sample["__num__"].apply(lambda s: s.split("-")[0] if s else "")
 
         total_seq = len(sample)
         cnt_ds = int((sample["__pref__"] == "DS").sum())
@@ -6452,6 +6384,7 @@ def create_app():
         cnt_fv = int((sample["__pref__"] == "FV").sum())
         cnt_otro = total_seq - (cnt_ds + cnt_fc + cnt_fv)
 
+        # Si detecta FC o FV en el archivo → BLOQUEAR (no omitir)
         if cnt_fc > 0 or cnt_fv > 0:
             return jsonify({
                 "error": (
@@ -6464,14 +6397,15 @@ def create_app():
                     "DS": cnt_ds,
                     "FC": cnt_fc,
                     "FV": cnt_fv,
-                    "OTRO": cnt_otro,
-                },
+                    "OTRO": cnt_otro
+                }
             }), 400
 
+        # Si existe tipo_col, validar que sea Documento Soporte (permitimos variaciones)
         if tipo_col:
             sample["__tipo_tx__"] = sample[tipo_col].apply(_norm_lower)
+            # si alguna fila no contiene "documento soporte", se bloquea
             invalid_tx = sample[~sample["__tipo_tx__"].str.contains("documento soporte", na=False)]
-
             if not invalid_tx.empty:
                 return jsonify({
                     "error": (
@@ -6481,205 +6415,115 @@ def create_app():
                     "diagnostico": {
                         "columna_tipo_transaccion": tipo_col,
                         "filas_secuencia_analizadas": total_seq,
-                        "ejemplos_invalidos": invalid_tx[tipo_col].head(10).tolist(),
-                    },
+                        "ejemplos_invalidos": invalid_tx[tipo_col].head(10).tolist()
+                    }
                 }), 400
 
-        # Nos quedamos con todas las filas DS, no solo Secuencia.
-        # Esto es clave porque el total real del documento viene en la fila "Formas de pago".
-        df_ds = df[
-            (df["__pref__"] == "DS") &
-            (df["__idcompra__"] != "")
-        ].copy()
-
-        if df_ds.empty:
-            return jsonify({
-                "error": "No se encontraron Documentos Soporte DS válidos en el archivo."
-            }), 400
-
+        # ---------------------------
+        # Importación normal (solo DS)
+        # ---------------------------
         centros_costo = {
             c.nombre.strip().upper(): c.id
             for c in SiigoCentroCosto.query.filter_by(idcliente=idcliente).all()
         }
 
         registros_creados = 0
-        registros_actualizados = 0
-        items_creados = 0
+        compras = {}
         compras_omitidas = []
-        errores_documentos = []
 
-        documentos_procesados = 0
+        # métricas
+        omitidas_por_no_secuencia = 0
+        omitidas_por_no_ds = 0
 
-        try:
-            for idcompra, grupo in df_ds.groupby("__idcompra__"):
-                documentos_procesados += 1
+        for _, row in df.iterrows():
+            tipo_registro = _norm_lower(row.get("Tipo de registro", ""))
+            if tipo_registro != "secuencia":
+                omitidas_por_no_secuencia += 1
+                continue
 
-                filas_secuencia = grupo[grupo["__tipo_reg__"] == "secuencia"].copy()
-                filas_formas_pago = grupo[grupo["__tipo_reg__"] == "formas de pago"].copy()
-                filas_impuesto_total = grupo[grupo["__tipo_reg__"] == "impuesto total"].copy()
+            num_comprobante = _norm_upper(str(row.get("Número comprobante", "")).split(".")[0])
+            if not num_comprobante.startswith("DS-"):
+                # “doble seguridad”: aquí ya no debería pasar por el blindaje previo
+                omitidas_por_no_ds += 1
+                continue
 
-                if filas_secuencia.empty:
-                    compras_omitidas.append({
-                        "idcompra": idcompra,
-                        "motivo": "Documento sin filas Secuencia"
-                    })
+            consecutivo = _norm_text(row.get("Consecutivo", "")).split(".")[0]
+            idcompra = f"{num_comprobante}-{consecutivo}"
+
+            if idcompra not in compras:
+                existente = db.session.query(SiigoCompra).filter_by(idcliente=idcliente, idcompra=idcompra).first()
+                if existente:
+                    compras_omitidas.append(idcompra)
                     continue
 
-                # Tomamos la primera fila Secuencia como fila maestra para datos generales
-                row_base = filas_secuencia.iloc[0]
-
-                fecha_elab = pd.to_datetime(
-                    row_base.get("Fecha elaboración"),
-                    dayfirst=True,
-                    errors="coerce"
-                )
-
-                if pd.isna(fecha_elab):
-                    errores_documentos.append({
-                        "idcompra": idcompra,
-                        "error": "Fecha elaboración inválida"
-                    })
-                    continue
-
-                venc = pd.to_datetime(
-                    row_base.get("Fecha vencimiento"),
-                    dayfirst=True,
-                    errors="coerce"
-                )
-                venc_date = None if pd.isna(venc) else venc.date()
-
-                centro_costo_nombre = _norm_upper(row_base.get("Centro costo", ""))
+                centro_costo_nombre = _norm_upper(row.get("Centro costo", ""))
                 cost_center = centros_costo.get(centro_costo_nombre)
 
-                factura_proveedor = _norm_upper(row_base.get("Factura proveedor", ""))
+                fecha_elab = pd.to_datetime(row["Fecha elaboración"], dayfirst=True, errors="coerce")
+                if pd.isna(fecha_elab):
+                    # si fecha viene inválida, mejor omitir o lanzar error según tu preferencia
+                    continue
+
+                factura_proveedor = _norm_upper(row.get("Factura proveedor", ""))
                 if factura_proveedor.lower() in ("nan", "nat", ""):
                     factura_proveedor = None
 
-                # ---------------------------
-                # TOTAL REAL DEL DOCUMENTO
-                # ---------------------------
-                # 1) Valor principal: fila "Formas de pago"
-                # 2) Fallback: suma de Secuencias si el Excel no trae Formas de pago
-                total_formas_pago = sum(
-                    _to_decimal(v) for v in filas_formas_pago["Total"].tolist()
-                )
+                venc = pd.to_datetime(row.get("Fecha vencimiento"), errors="coerce", dayfirst=True)
+                venc_date = None if pd.isna(venc) else venc.date()
 
-                total_secuencias = sum(
-                    _to_decimal(v) for v in filas_secuencia["Total"].tolist()
-                )
-
-                total_impuesto_total = sum(
-                    _to_decimal(v) for v in filas_impuesto_total["Total"].tolist()
-                )
-
-                if total_formas_pago > 0:
-                    total_documento = total_formas_pago
-                    fuente_total = "formas_de_pago"
-                else:
-                    total_documento = total_secuencias
-                    fuente_total = "suma_secuencias_fallback"
-
-                compra = db.session.query(SiigoCompra).filter_by(
+                compra = SiigoCompra(
                     idcliente=idcliente,
-                    idcompra=idcompra
-                ).first()
+                    idcompra=idcompra,
+                    fecha=fecha_elab.date(),
+                    vencimiento=venc_date,
+                    proveedor_nombre=_norm_text(row.get("Nombre tercero", "")),
+                    proveedor_identificacion=_norm_text(row.get("Identificación", "")).split(".")[0],
+                    estado=None,
+                    total=float(row.get("Total", 0) or 0),
+                    saldo=0,
+                    cost_center=cost_center,
+                    creado=fecha_elab + pd.Timedelta(minutes=15),
+                    factura_proveedor=factura_proveedor
+                )
 
-                if compra:
-                    # Actualizamos el encabezado del documento.
-                    # Esto corrige documentos ya cargados con total parcial.
-                    compra.fecha = fecha_elab.date()
-                    compra.vencimiento = venc_date
-                    compra.proveedor_nombre = _norm_text(row_base.get("Nombre tercero", ""))
-                    compra.proveedor_identificacion = _clean_number_text(row_base.get("Identificación", ""))
-                    compra.total = total_documento
-                    compra.cost_center = cost_center
-                    compra.factura_proveedor = factura_proveedor
+                db.session.add(compra)
+                db.session.flush()
+                compras[idcompra] = compra.id
+                registros_creados += 1
 
-                    # Importante:
-                    # No tocamos saldo aquí, porque el saldo debe venir del cruce con cuentas por pagar.
-                    # Si aún no se ha cruzado, quedará como esté y luego se corrige al correr /siigo/cross-accounts-payable.
+            compra_id = compras[idcompra]
+            impuestos = float(row.get("Valor Impuesto Cargo", 0) or 0) + float(row.get("Valor Impuesto", 0) or 0)
 
-                    # Reconstruimos ítems para evitar duplicados y garantizar que queden todos.
-                    db.session.query(SiigoCompraItem).filter_by(
-                        idcliente=idcliente,
-                        compra_id=compra.id
-                    ).delete(synchronize_session=False)
+            item = SiigoCompraItem(
+                compra_id=compra_id,
+                idcliente=idcliente,
+                descripcion=_norm_text(row.get("Nombre", "")),
+                cantidad=float(row.get("Cantidad", 0) or 0),
+                precio=float(row.get("Total", 0) or 0),
+                impuestos=impuestos,
+                codigo="" if pd.isna(row.get("Código", "")) else _norm_text(row.get("Código", ""))
+            )
+            db.session.add(item)
 
-                    registros_actualizados += 1
-
-                else:
-                    compra = SiigoCompra(
-                        idcliente=idcliente,
-                        idcompra=idcompra,
-                        fecha=fecha_elab.date(),
-                        vencimiento=venc_date,
-                        proveedor_nombre=_norm_text(row_base.get("Nombre tercero", "")),
-                        proveedor_identificacion=_clean_number_text(row_base.get("Identificación", "")),
-                        estado=None,
-                        total=total_documento,
-                        saldo=0,
-                        cost_center=cost_center,
-                        creado=fecha_elab + pd.Timedelta(minutes=15),
-                        factura_proveedor=factura_proveedor,
-                    )
-
-                    db.session.add(compra)
-                    db.session.flush()
-                    registros_creados += 1
-
-                # ---------------------------
-                # ÍTEMS DEL DOCUMENTO
-                # ---------------------------
-                for _, item_row in filas_secuencia.iterrows():
-                    impuestos = (
-                        _to_decimal(item_row.get("Valor Impuesto Cargo", 0)) +
-                        _to_decimal(item_row.get("Valor Impuesto Cargo 2", 0))
-                    )
-
-                    item = SiigoCompraItem(
-                        compra_id=compra.id,
-                        idcliente=idcliente,
-                        descripcion=_norm_text(item_row.get("Nombre", "")),
-                        cantidad=_to_decimal(item_row.get("Cantidad", 0)),
-                        precio=_to_decimal(item_row.get("Total", 0)),
-                        impuestos=impuestos,
-                        codigo="" if pd.isna(item_row.get("Código", "")) else _norm_text(item_row.get("Código", "")),
-                    )
-
-                    db.session.add(item)
-                    items_creados += 1
-
-            db.session.commit()
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": f"Error importando Documentos Soporte: {str(e)}"
-            }), 500
+        db.session.commit()
 
         return jsonify({
-            "mensaje": (
-                f"Importación completada. "
-                f"Documentos creados: {registros_creados}. "
-                f"Documentos actualizados: {registros_actualizados}. "
-                f"Ítems creados: {items_creados}."
-            ),
+            "mensaje": f"Importación completada. Compras creadas: {registros_creados}",
             "omitidas": compras_omitidas,
-            "errores_documentos": errores_documentos,
             "debug": {
-                "documentos_procesados": documentos_procesados,
-                "filas_secuencia_analizadas": total_seq,
-                "DS": cnt_ds,
-                "FC": cnt_fc,
-                "FV": cnt_fv,
-                "OTRO": cnt_otro,
-                "tipo_col": tipo_col,
-                "nota": (
-                    "El total del documento se toma de la fila 'Formas de pago'. "
-                    "Si no existe, se usa como fallback la suma de las filas 'Secuencia'."
-                )
+                "omitidas_por_no_secuencia": omitidas_por_no_secuencia,
+                "omitidas_por_no_ds": omitidas_por_no_ds,
+                "blindaje_prev": {
+                    "filas_secuencia_analizadas": total_seq,
+                    "DS": cnt_ds,
+                    "FC": cnt_fc,
+                    "FV": cnt_fv,
+                    "OTRO": cnt_otro,
+                    "tipo_col": tipo_col
+                }
             }
         })
+
 
 
 
