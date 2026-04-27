@@ -3688,37 +3688,10 @@ def create_app():
 
 
 
-    # --- ENDPOINT: Clientes Insights (optimizado y enriquecido) ---
+    # --- ENDPOINT: Clientes Insights (enriquecido) --- 
     @app.route("/reportes/analisis_clientes", methods=["GET"])
     @jwt_required()
     def get_clientes_insights():
-        from sqlalchemy.sql import text
-        from datetime import date, datetime
-        from collections import defaultdict
-        import re
-
-        def normalizar_cliente(nombre: str) -> str:
-            nombre = (nombre or "").strip().lower()
-            nombre = nombre.replace(".", "").replace(",", "")
-            nombre = re.sub(r"\s+", " ", nombre)
-            return nombre
-
-        def money_float(valor):
-            try:
-                return float(valor or 0)
-            except Exception:
-                return 0.0
-
-        def money_fmt(valor, decimales=0):
-            valor = money_float(valor)
-            return f"$ {valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-        def validar_fecha(fecha_str):
-            try:
-                return datetime.strptime(fecha_str, "%Y-%m-%d").date()
-            except Exception:
-                return None
-
         claims = get_jwt()
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
@@ -3730,126 +3703,47 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        cliente = request.args.get("cliente")
+        desde       = request.args.get("desde")
+        hasta       = request.args.get("hasta")
+        cliente     = request.args.get("cliente")  # filtro por cliente opcional
         cost_center = request.args.get("cost_center", type=int)
-        filtro_estado = request.args.get("estado")
-        limit_facturas = request.args.get("limit_facturas", default=8, type=int)
-
-        if limit_facturas <= 0:
-            limit_facturas = 8
-        if limit_facturas > 30:
-            limit_facturas = 30
+        filtro_estado = request.args.get("estado")  # 👈 mismo que en facturas_cliente
 
         try:
             wh = ["f.idcliente = :idcliente"]
-            params = {
-                "idcliente": idcliente,
-                "limit_facturas": limit_facturas,
-            }
+            params = {"idcliente": idcliente}
 
-            if desde and validar_fecha(desde):
+            if desde:
                 wh.append("f.fecha >= :desde")
                 params["desde"] = desde
-
-            if hasta and validar_fecha(hasta):
-                wh.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+            if hasta:
+                wh.append("f.fecha <= :hasta")
                 params["hasta"] = hasta
-
             if cliente:
                 wh.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
                 params["cliente"] = cliente
-
             if cost_center:
                 wh.append("f.cost_center = :cost_center")
                 params["cost_center"] = cost_center
 
-            estado_sql = """
-                CASE
-                    WHEN ROUND(COALESCE(f.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
-                    WHEN f.vencimiento IS NOT NULL AND f.vencimiento < CURRENT_DATE THEN 'vencido'
-                    WHEN f.vencimiento IS NOT NULL AND f.vencimiento >= CURRENT_DATE AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days' THEN 'alerta'
-                    ELSE 'sano'
-                END
-            """
-
-            if filtro_estado:
-                filtro_estado = filtro_estado.lower().strip()
-                if filtro_estado in ["pagado", "vencido", "alerta", "sano"]:
-                    wh.append(f"({estado_sql}) = :estado")
-                    params["estado"] = filtro_estado
-
             where_clause = " AND ".join(wh)
 
-            # ---------------------------------------------------------------------
-            # 1. Resumen global
-            # ---------------------------------------------------------------------
-            sql_resumen = text(f"""
-                SELECT
-                    COUNT(DISTINCT f.cliente_nombre) AS clientes_facturados,
-                    COUNT(*) AS cantidad_facturas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
-                    COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer
-                FROM facturas_enriquecidas f
-                WHERE {where_clause}
-            """)
-
-            resumen_row = db.session.execute(sql_resumen, params).mappings().first() or {}
-
-            total_facturado = money_float(resumen_row.get("total_facturado"))
-            total_pagado = money_float(resumen_row.get("total_pagado"))
-            saldo_pendiente = money_float(resumen_row.get("saldo_pendiente"))
-            saldo_vencido = money_float(resumen_row.get("saldo_vencido"))
-
-            pct_pagado = (total_pagado / total_facturado * 100) if total_facturado else 0
-            pct_vencido = (saldo_vencido / saldo_pendiente * 100) if saldo_pendiente else 0
-
-            resumen = {
-                "clientes_facturados": int(resumen_row.get("clientes_facturados") or 0),
-                "cantidad_facturas": int(resumen_row.get("cantidad_facturas") or 0),
-                "total_facturado": total_facturado,
-                "total_pagado": total_pagado,
-                "saldo_pendiente": saldo_pendiente,
-                "saldo_vencido": saldo_vencido,
-                "saldo_por_vencer": money_float(resumen_row.get("saldo_por_vencer")),
-                "pct_pagado": round(pct_pagado, 2),
-                "pct_vencido": round(pct_vencido, 2),
-                "total_facturado_str": money_fmt(total_facturado),
-                "total_pagado_str": money_fmt(total_pagado),
-                "saldo_pendiente_str": money_fmt(saldo_pendiente),
-                "saldo_vencido_str": money_fmt(saldo_vencido),
-                "saldo_por_vencer_str": money_fmt(resumen_row.get("saldo_por_vencer")),
-            }
-
-            # ---------------------------------------------------------------------
-            # 2. Clientes principales
-            # ---------------------------------------------------------------------
+            # --- KPIs por cliente
             sql_clientes = text(f"""
                 SELECT
                     f.cliente_nombre AS cliente,
                     COUNT(*) AS cantidad_facturas,
-                    COUNT(DISTINCT f.cost_center) AS cantidad_centros_costo,
                     COALESCE(SUM(f.total), 0) AS total_facturado,
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer,
-                    MAX(f.fecha) AS ultima_factura
+                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
                 FROM facturas_enriquecidas f
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre
                 ORDER BY total_facturado DESC
             """)
+            clientes = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
 
-            clientes_rows = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
-
-            # ---------------------------------------------------------------------
-            # 3. Centros de costo por cliente
-            # ---------------------------------------------------------------------
+            # --- Centros de costo por cliente
             sql_cc = text(f"""
                 SELECT
                     f.cliente_nombre,
@@ -3861,74 +3755,14 @@ def create_app():
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
                 FROM facturas_enriquecidas f
                 LEFT JOIN siigo_centros_costo cc
-                    ON f.cost_center = cc.id
+                ON f.cost_center = cc.id
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
                 ORDER BY total_facturado DESC
             """)
+            centros_costo = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
 
-            centros_rows = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
-
-            centros_por_cliente = defaultdict(list)
-            for r in centros_rows:
-                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
-                total_cc = money_float(r.get("total_facturado"))
-                saldo_cc = money_float(r.get("saldo_pendiente"))
-
-                centros_por_cliente[cliente_key].append({
-                    "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
-                    "cost_center": r.get("cost_center"),
-                    "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
-                    "total_facturado": total_cc,
-                    "total_pagado": money_float(r.get("total_pagado")),
-                    "saldo_pendiente": saldo_cc,
-                    "total_facturado_str": money_fmt(total_cc),
-                    "saldo_pendiente_str": money_fmt(saldo_cc),
-                })
-
-            # ---------------------------------------------------------------------
-            # 4. Estados por cliente
-            # ---------------------------------------------------------------------
-            sql_estados = text(f"""
-                SELECT
-                    f.cliente_nombre,
-                    ({estado_sql}) AS estado_cartera,
-                    COUNT(*) AS cantidad,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
-                FROM facturas_enriquecidas f
-                WHERE {where_clause}
-                GROUP BY f.cliente_nombre, estado_cartera
-            """)
-
-            estados_rows = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
-
-            estados_por_cliente = defaultdict(lambda: {
-                "pagado": 0,
-                "sano": 0,
-                "alerta": 0,
-                "vencido": 0,
-            })
-
-            estados_saldo_por_cliente = defaultdict(lambda: {
-                "pagado": 0.0,
-                "sano": 0.0,
-                "alerta": 0.0,
-                "vencido": 0.0,
-            })
-
-            for r in estados_rows:
-                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
-                estado = r.get("estado_cartera") or "sano"
-                cantidad = int(r.get("cantidad") or 0)
-                saldo_estado = money_float(r.get("saldo_pendiente"))
-
-                estados_por_cliente[cliente_key][estado] = cantidad
-                estados_saldo_por_cliente[cliente_key][estado] = saldo_estado
-
-            # ---------------------------------------------------------------------
-            # 5. Facturas recientes por cliente
-            # ---------------------------------------------------------------------
+            # --- Facturas recientes (máx 5 por cliente)
             sql_facturas = text(f"""
                 WITH ranked AS (
                     SELECT
@@ -3940,235 +3774,68 @@ def create_app():
                         f.saldo AS pendiente,
                         f.public_url,
                         f.cliente_nombre,
-                        f.cost_center,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                        ({estado_sql}) AS estado_cartera,
-                        CASE
-                            WHEN f.vencimiento IS NULL THEN NULL
-                            ELSE (f.vencimiento - CURRENT_DATE)
-                        END AS dias_vencimiento,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY f.cliente_nombre
-                            ORDER BY f.fecha DESC, f.idfactura DESC
-                        ) AS rn
+                        ROW_NUMBER() OVER (PARTITION BY f.cliente_nombre ORDER BY f.fecha DESC) AS rn
                     FROM facturas_enriquecidas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON f.cost_center = cc.id
                     WHERE {where_clause}
                 )
-                SELECT *
-                FROM ranked
-                WHERE rn <= :limit_facturas
-                ORDER BY cliente_nombre, fecha DESC
+                SELECT * FROM ranked WHERE rn <= 5;
             """)
+            rows = [dict(r) for r in db.session.execute(sql_facturas, params).mappings().all()]
+            enriched = enriquecer_facturas(rows)
 
-            facturas_rows = [dict(r) for r in db.session.execute(sql_facturas, params).mappings().all()]
+            # aplicar filtro de estado si corresponde
+            if filtro_estado:
+                enriched = [r for r in enriched if r["estado_cartera"] == filtro_estado.lower()]
 
-            facturas_por_cliente = defaultdict(list)
-
-            for r in facturas_rows:
-                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
-                fecha = r.get("fecha")
-                vencimiento = r.get("vencimiento")
-                total = money_float(r.get("total"))
-                pagado = money_float(r.get("pagado"))
-                pendiente = money_float(r.get("pendiente"))
-                dias_vencimiento = r.get("dias_vencimiento")
-
-                if fecha:
-                    fecha_str = fecha.strftime("%d/%m/%Y") if hasattr(fecha, "strftime") else str(fecha)
-                else:
-                    fecha_str = None
-
-                if vencimiento:
-                    vencimiento_str = vencimiento.strftime("%d/%m/%Y") if hasattr(vencimiento, "strftime") else str(vencimiento)
-                else:
-                    vencimiento_str = None
-
-                facturas_por_cliente[cliente_key].append({
-                    "idfactura": r.get("idfactura"),
-                    "fecha": fecha_str,
-                    "vencimiento": vencimiento_str,
-                    "total": total,
-                    "pagado": pagado,
-                    "pendiente": pendiente,
-                    "total_str": money_fmt(total),
-                    "pagado_str": money_fmt(pagado),
-                    "pendiente_str": money_fmt(pendiente),
-                    "public_url": r.get("public_url"),
-                    "cliente_nombre": r.get("cliente_nombre"),
-                    "cliente_key": cliente_key,
-                    "cost_center": r.get("cost_center"),
-                    "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
-                    "estado_cartera": r.get("estado_cartera") or "sano",
-                    "dias_vencimiento": int(dias_vencimiento) if dias_vencimiento is not None else None,
-                })
-
-            # ---------------------------------------------------------------------
-            # 6. Armar clientes enriquecidos
-            # ---------------------------------------------------------------------
-            clientes = []
-
-            for r in clientes_rows:
-                cliente_nombre = r.get("cliente") or "Sin cliente"
-                cliente_key = normalizar_cliente(cliente_nombre)
-
-                total = money_float(r.get("total_facturado"))
-                pagado = money_float(r.get("total_pagado"))
-                pendiente = money_float(r.get("saldo_pendiente"))
-                vencido = money_float(r.get("saldo_vencido"))
-
-                pct_cliente_pagado = (pagado / total * 100) if total else 0
-                pct_cliente_pendiente = (pendiente / total * 100) if total else 0
-                pct_cliente_vencido = (vencido / pendiente * 100) if pendiente else 0
-
-                ultima_factura = r.get("ultima_factura")
-                ultima_factura_str = (
-                    ultima_factura.strftime("%d/%m/%Y")
-                    if ultima_factura and hasattr(ultima_factura, "strftime")
-                    else str(ultima_factura) if ultima_factura else None
-                )
-
-                clientes.append({
-                    "cliente": cliente_nombre,
-                    "cliente_key": cliente_key,
-                    "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
-                    "cantidad_centros_costo": int(r.get("cantidad_centros_costo") or 0),
-                    "total_facturado": total,
-                    "total_pagado": pagado,
-                    "saldo_pendiente": pendiente,
-                    "saldo_vencido": vencido,
-                    "saldo_por_vencer": money_float(r.get("saldo_por_vencer")),
-                    "total_facturado_str": money_fmt(total),
-                    "total_pagado_str": money_fmt(pagado),
-                    "saldo_pendiente_str": money_fmt(pendiente),
-                    "saldo_vencido_str": money_fmt(vencido),
-                    "saldo_por_vencer_str": money_fmt(r.get("saldo_por_vencer")),
-                    "pct_pagado": round(pct_cliente_pagado, 2),
-                    "pct_pendiente": round(pct_cliente_pendiente, 2),
-                    "pct_vencido": round(pct_cliente_vencido, 2),
-                    "ultima_factura": ultima_factura_str,
-                    "centros_costo": centros_por_cliente.get(cliente_key, []),
-                    "facturas_recientes": facturas_por_cliente.get(cliente_key, []),
-                    "estados": estados_por_cliente.get(cliente_key, {
-                        "pagado": 0,
-                        "sano": 0,
-                        "alerta": 0,
-                        "vencido": 0,
-                    }),
-                    "estados_saldo": estados_saldo_por_cliente.get(cliente_key, {
-                        "pagado": 0,
-                        "sano": 0,
-                        "alerta": 0,
-                        "vencido": 0,
-                    }),
-                })
-
-            # ---------------------------------------------------------------------
-            # 7. Catálogos para filtros
-            # ---------------------------------------------------------------------
-            wh_catalogos = ["f.idcliente = :idcliente"]
-            params_catalogos = {"idcliente": idcliente}
-
-            if desde and validar_fecha(desde):
-                wh_catalogos.append("f.fecha >= :desde")
-                params_catalogos["desde"] = desde
-
-            if hasta and validar_fecha(hasta):
-                wh_catalogos.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
-                params_catalogos["hasta"] = hasta
-
-            where_catalogos = " AND ".join(wh_catalogos)
-
-            sql_catalogo_clientes = text(f"""
-                SELECT DISTINCT
-                    f.cliente_nombre AS id,
-                    f.cliente_nombre AS nombre
+            # --- Conteo de facturas por estado (agrupado por cliente)
+            sql_estados = text(f"""
+                SELECT
+                    f.cliente_nombre,
+                    f.idfactura,
+                    f.fecha,
+                    f.vencimiento,
+                    f.total,
+                    f.saldo
                 FROM facturas_enriquecidas f
-                WHERE {where_catalogos}
-                AND TRIM(COALESCE(f.cliente_nombre, '')) <> ''
-                ORDER BY nombre
+                WHERE {where_clause}
             """)
+            rows_estado = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
+            # Normalizar campo para enriquecer correctamente
+            for r in rows_estado:
+                r["pendiente"] = r.get("saldo", 0)
 
-            catalogo_clientes = [
-                dict(r) for r in db.session.execute(sql_catalogo_clientes, params_catalogos).mappings().all()
-            ]
+            enriched_estados = enriquecer_facturas(rows_estado)
 
-            sql_catalogo_cc = text(f"""
-                SELECT DISTINCT
-                    f.cost_center AS id,
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
-                FROM facturas_enriquecidas f
-                LEFT JOIN siigo_centros_costo cc
-                    ON f.cost_center = cc.id
-                WHERE {where_catalogos}
-                AND f.cost_center IS NOT NULL
-                ORDER BY nombre
-            """)
+            facturas_por_estado = {}
+            for r in enriched_estados:
+                cliente = r["cliente_nombre"]
+                estado = r["estado_cartera"]
 
-            catalogo_centros_costo = [
-                dict(r) for r in db.session.execute(sql_catalogo_cc, params_catalogos).mappings().all()
-            ]
+                if cliente not in facturas_por_estado:
+                    facturas_por_estado[cliente] = {}
 
-            # ---------------------------------------------------------------------
-            # 8. Top charts
-            # ---------------------------------------------------------------------
-            top_facturacion = sorted(
-                clientes,
-                key=lambda x: x["total_facturado"],
-                reverse=True
-            )[:10]
+                facturas_por_estado[cliente][estado] = facturas_por_estado[cliente].get(estado, 0) + 1
 
-            top_saldo = sorted(
-                clientes,
-                key=lambda x: x["saldo_pendiente"],
-                reverse=True
-            )[:10]
+            # Convertir a lista [{cliente, estado, cantidad}, ...]
+            facturas_por_estado_list = []
+            for cliente, estados in facturas_por_estado.items():
+                for estado, cantidad in estados.items():
+                    facturas_por_estado_list.append({
+                        "cliente": cliente,
+                        "estado": estado,
+                        "cantidad": cantidad
+                    })
 
             return jsonify({
-                "resumen": resumen,
                 "clientes": clientes,
-                "catalogos": {
-                    "clientes": catalogo_clientes,
-                    "centros_costo": catalogo_centros_costo,
-                    "estados": [
-                        {"id": "pagado", "nombre": "Pagado"},
-                        {"id": "sano", "nombre": "Sano"},
-                        {"id": "alerta", "nombre": "Por vencer pronto"},
-                        {"id": "vencido", "nombre": "Vencido"},
-                    ],
-                },
-                "charts": {
-                    "top_facturacion": [
-                        {
-                            "cliente": c["cliente"],
-                            "total_facturado": c["total_facturado"],
-                            "saldo_pendiente": c["saldo_pendiente"],
-                        }
-                        for c in top_facturacion
-                    ],
-                    "top_saldo": [
-                        {
-                            "cliente": c["cliente"],
-                            "saldo_pendiente": c["saldo_pendiente"],
-                            "saldo_vencido": c["saldo_vencido"],
-                        }
-                        for c in top_saldo
-                    ],
-                },
-                "params": {
-                    "idcliente": idcliente,
-                    "desde": desde,
-                    "hasta": hasta,
-                    "cliente": cliente,
-                    "cost_center": cost_center,
-                    "estado": filtro_estado,
-                    "limit_facturas": limit_facturas,
-                },
+                "centros_costo": centros_costo,
+                "facturas_recientes": enriched,
+                "facturas_por_estado": facturas_por_estado_list  # 👈 ya viene separado por cliente
             })
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
 
 
     # --- ENDPOINT: Facturas por cliente/centro de costo (paginadas) ---
