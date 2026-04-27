@@ -3688,12 +3688,12 @@ def create_app():
 
 
 
-    # --- ENDPOINT: Clientes Insights (optimizado y enriquecido) ---
+    # --- ENDPOINT: Clientes Insights (optimizado, enriquecido y alineado con Ingresos por Ventas) ---
     @app.route("/reportes/analisis_clientes", methods=["GET"])
     @jwt_required()
     def get_clientes_insights():
         from sqlalchemy.sql import text
-        from datetime import date, datetime
+        from datetime import datetime
         from collections import defaultdict
         import re
 
@@ -3769,7 +3769,9 @@ def create_app():
                 CASE
                     WHEN ROUND(COALESCE(f.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
                     WHEN f.vencimiento IS NOT NULL AND f.vencimiento < CURRENT_DATE THEN 'vencido'
-                    WHEN f.vencimiento IS NOT NULL AND f.vencimiento >= CURRENT_DATE AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days' THEN 'alerta'
+                    WHEN f.vencimiento IS NOT NULL
+                        AND f.vencimiento >= CURRENT_DATE
+                        AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days' THEN 'alerta'
                     ELSE 'sano'
                 END
             """
@@ -3789,7 +3791,13 @@ def create_app():
                 SELECT
                     COUNT(DISTINCT f.cliente_nombre) AS clientes_facturados,
                     COUNT(*) AS cantidad_facturas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+
+                    -- Conceptos alineados con reporte Ingresos por Ventas
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
+                    -- Cartera
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
                     COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
@@ -3800,29 +3808,48 @@ def create_app():
 
             resumen_row = db.session.execute(sql_resumen, params).mappings().first() or {}
 
-            total_facturado = money_float(resumen_row.get("total_facturado"))
+            ventas_netas = money_float(resumen_row.get("ventas_netas"))
+            impuestos = money_float(resumen_row.get("impuestos"))
+            total_facturado_siigo = money_float(resumen_row.get("total_facturado_siigo"))
             total_pagado = money_float(resumen_row.get("total_pagado"))
             saldo_pendiente = money_float(resumen_row.get("saldo_pendiente"))
             saldo_vencido = money_float(resumen_row.get("saldo_vencido"))
+            saldo_por_vencer = money_float(resumen_row.get("saldo_por_vencer"))
 
-            pct_pagado = (total_pagado / total_facturado * 100) if total_facturado else 0
+            pct_pagado = (total_pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
             pct_vencido = (saldo_vencido / saldo_pendiente * 100) if saldo_pendiente else 0
 
             resumen = {
                 "clientes_facturados": int(resumen_row.get("clientes_facturados") or 0),
                 "cantidad_facturas": int(resumen_row.get("cantidad_facturas") or 0),
-                "total_facturado": total_facturado,
+
+                "ventas_netas": ventas_netas,
+                "impuestos": impuestos,
+                "total_facturado_siigo": total_facturado_siigo,
+
+                # Compatibilidad con frontend anterior:
+                # total_facturado ahora representa Ventas netas para esta página.
+                "total_facturado": ventas_netas,
+
                 "total_pagado": total_pagado,
                 "saldo_pendiente": saldo_pendiente,
                 "saldo_vencido": saldo_vencido,
-                "saldo_por_vencer": money_float(resumen_row.get("saldo_por_vencer")),
+                "saldo_por_vencer": saldo_por_vencer,
+
                 "pct_pagado": round(pct_pagado, 2),
                 "pct_vencido": round(pct_vencido, 2),
-                "total_facturado_str": money_fmt(total_facturado),
+
+                "ventas_netas_str": money_fmt(ventas_netas),
+                "impuestos_str": money_fmt(impuestos),
+                "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+
+                # Compatibilidad con frontend anterior:
+                "total_facturado_str": money_fmt(ventas_netas),
+
                 "total_pagado_str": money_fmt(total_pagado),
                 "saldo_pendiente_str": money_fmt(saldo_pendiente),
                 "saldo_vencido_str": money_fmt(saldo_vencido),
-                "saldo_por_vencer_str": money_fmt(resumen_row.get("saldo_por_vencer")),
+                "saldo_por_vencer_str": money_fmt(saldo_por_vencer),
             }
 
             # ---------------------------------------------------------------------
@@ -3833,7 +3860,11 @@ def create_app():
                     f.cliente_nombre AS cliente,
                     COUNT(*) AS cantidad_facturas,
                     COUNT(DISTINCT f.cost_center) AS cantidad_centros_costo,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
                     COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
@@ -3842,7 +3873,7 @@ def create_app():
                 FROM facturas_enriquecidas f
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre
-                ORDER BY total_facturado DESC
+                ORDER BY ventas_netas DESC
             """)
 
             clientes_rows = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
@@ -3856,7 +3887,11 @@ def create_app():
                     COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                     f.cost_center,
                     COUNT(*) AS cantidad_facturas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
                 FROM facturas_enriquecidas f
@@ -3864,7 +3899,7 @@ def create_app():
                     ON f.cost_center = cc.id
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
-                ORDER BY total_facturado DESC
+                ORDER BY ventas_netas DESC
             """)
 
             centros_rows = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
@@ -3872,17 +3907,35 @@ def create_app():
             centros_por_cliente = defaultdict(list)
             for r in centros_rows:
                 cliente_key = normalizar_cliente(r.get("cliente_nombre"))
-                total_cc = money_float(r.get("total_facturado"))
+
+                ventas_netas_cc = money_float(r.get("ventas_netas"))
+                impuestos_cc = money_float(r.get("impuestos"))
+                total_siigo_cc = money_float(r.get("total_facturado_siigo"))
                 saldo_cc = money_float(r.get("saldo_pendiente"))
+                pagado_cc = money_float(r.get("total_pagado"))
 
                 centros_por_cliente[cliente_key].append({
                     "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
                     "cost_center": r.get("cost_center"),
                     "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
-                    "total_facturado": total_cc,
-                    "total_pagado": money_float(r.get("total_pagado")),
+
+                    "ventas_netas": ventas_netas_cc,
+                    "impuestos": impuestos_cc,
+                    "total_facturado_siigo": total_siigo_cc,
+
+                    # Compatibilidad:
+                    "total_facturado": ventas_netas_cc,
+
+                    "total_pagado": pagado_cc,
                     "saldo_pendiente": saldo_cc,
-                    "total_facturado_str": money_fmt(total_cc),
+
+                    "ventas_netas_str": money_fmt(ventas_netas_cc),
+                    "impuestos_str": money_fmt(impuestos_cc),
+                    "total_facturado_siigo_str": money_fmt(total_siigo_cc),
+
+                    # Compatibilidad:
+                    "total_facturado_str": money_fmt(ventas_netas_cc),
+
                     "saldo_pendiente_str": money_fmt(saldo_cc),
                 })
 
@@ -3894,7 +3947,8 @@ def create_app():
                     f.cliente_nombre,
                     ({estado_sql}) AS estado_cartera,
                     COUNT(*) AS cantidad,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
                 FROM facturas_enriquecidas f
                 WHERE {where_clause}
@@ -3935,6 +3989,11 @@ def create_app():
                         f.idfactura,
                         f.fecha,
                         f.vencimiento,
+
+                        f.subtotal AS ventas_netas,
+                        f.impuestos_total AS impuestos,
+                        f.total AS total_facturado_siigo,
+
                         f.total,
                         (f.total - f.saldo) AS pagado,
                         f.saldo AS pendiente,
@@ -3970,6 +4029,11 @@ def create_app():
                 cliente_key = normalizar_cliente(r.get("cliente_nombre"))
                 fecha = r.get("fecha")
                 vencimiento = r.get("vencimiento")
+
+                ventas_netas_f = money_float(r.get("ventas_netas"))
+                impuestos_f = money_float(r.get("impuestos"))
+                total_siigo_f = money_float(r.get("total_facturado_siigo"))
+
                 total = money_float(r.get("total"))
                 pagado = money_float(r.get("pagado"))
                 pendiente = money_float(r.get("pendiente"))
@@ -3989,10 +4053,21 @@ def create_app():
                     "idfactura": r.get("idfactura"),
                     "fecha": fecha_str,
                     "vencimiento": vencimiento_str,
+
+                    "ventas_netas": ventas_netas_f,
+                    "impuestos": impuestos_f,
+                    "total_facturado_siigo": total_siigo_f,
+
+                    "ventas_netas_str": money_fmt(ventas_netas_f),
+                    "impuestos_str": money_fmt(impuestos_f),
+                    "total_facturado_siigo_str": money_fmt(total_siigo_f),
+
+                    # Compatibilidad:
                     "total": total,
+                    "total_str": money_fmt(total),
+
                     "pagado": pagado,
                     "pendiente": pendiente,
-                    "total_str": money_fmt(total),
                     "pagado_str": money_fmt(pagado),
                     "pendiente_str": money_fmt(pendiente),
                     "public_url": r.get("public_url"),
@@ -4013,13 +4088,17 @@ def create_app():
                 cliente_nombre = r.get("cliente") or "Sin cliente"
                 cliente_key = normalizar_cliente(cliente_nombre)
 
-                total = money_float(r.get("total_facturado"))
+                ventas_netas = money_float(r.get("ventas_netas"))
+                impuestos = money_float(r.get("impuestos"))
+                total_facturado_siigo = money_float(r.get("total_facturado_siigo"))
+
                 pagado = money_float(r.get("total_pagado"))
                 pendiente = money_float(r.get("saldo_pendiente"))
                 vencido = money_float(r.get("saldo_vencido"))
+                saldo_por_vencer_cliente = money_float(r.get("saldo_por_vencer"))
 
-                pct_cliente_pagado = (pagado / total * 100) if total else 0
-                pct_cliente_pendiente = (pendiente / total * 100) if total else 0
+                pct_cliente_pagado = (pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
+                pct_cliente_pendiente = (pendiente / total_facturado_siigo * 100) if total_facturado_siigo else 0
                 pct_cliente_vencido = (vencido / pendiente * 100) if pendiente else 0
 
                 ultima_factura = r.get("ultima_factura")
@@ -4034,19 +4113,35 @@ def create_app():
                     "cliente_key": cliente_key,
                     "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
                     "cantidad_centros_costo": int(r.get("cantidad_centros_costo") or 0),
-                    "total_facturado": total,
+
+                    "ventas_netas": ventas_netas,
+                    "impuestos": impuestos,
+                    "total_facturado_siigo": total_facturado_siigo,
+
+                    # Compatibilidad con frontend anterior:
+                    "total_facturado": ventas_netas,
+
                     "total_pagado": pagado,
                     "saldo_pendiente": pendiente,
                     "saldo_vencido": vencido,
-                    "saldo_por_vencer": money_float(r.get("saldo_por_vencer")),
-                    "total_facturado_str": money_fmt(total),
+                    "saldo_por_vencer": saldo_por_vencer_cliente,
+
+                    "ventas_netas_str": money_fmt(ventas_netas),
+                    "impuestos_str": money_fmt(impuestos),
+                    "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+
+                    # Compatibilidad con frontend anterior:
+                    "total_facturado_str": money_fmt(ventas_netas),
+
                     "total_pagado_str": money_fmt(pagado),
                     "saldo_pendiente_str": money_fmt(pendiente),
                     "saldo_vencido_str": money_fmt(vencido),
-                    "saldo_por_vencer_str": money_fmt(r.get("saldo_por_vencer")),
+                    "saldo_por_vencer_str": money_fmt(saldo_por_vencer_cliente),
+
                     "pct_pagado": round(pct_cliente_pagado, 2),
                     "pct_pendiente": round(pct_cliente_pendiente, 2),
                     "pct_vencido": round(pct_cliente_vencido, 2),
+
                     "ultima_factura": ultima_factura_str,
                     "centros_costo": centros_por_cliente.get(cliente_key, []),
                     "facturas_recientes": facturas_por_cliente.get(cliente_key, []),
@@ -4115,7 +4210,7 @@ def create_app():
             # ---------------------------------------------------------------------
             top_facturacion = sorted(
                 clientes,
-                key=lambda x: x["total_facturado"],
+                key=lambda x: x["ventas_netas"],
                 reverse=True
             )[:10]
 
@@ -4142,7 +4237,9 @@ def create_app():
                     "top_facturacion": [
                         {
                             "cliente": c["cliente"],
-                            "total_facturado": c["total_facturado"],
+                            "ventas_netas": c["ventas_netas"],
+                            "total_facturado": c["ventas_netas"],
+                            "total_facturado_siigo": c["total_facturado_siigo"],
                             "saldo_pendiente": c["saldo_pendiente"],
                         }
                         for c in top_facturacion
