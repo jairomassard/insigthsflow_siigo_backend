@@ -3754,7 +3754,7 @@ def create_app():
                 params["desde"] = desde
 
             if hasta and validar_fecha(hasta):
-                wh.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params["hasta"] = hasta
 
             if cliente:
@@ -4075,7 +4075,7 @@ def create_app():
                 params_catalogos["desde"] = desde
 
             if hasta and validar_fecha(hasta):
-                wh_catalogos.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh_catalogos.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_catalogos["hasta"] = hasta
 
             where_catalogos = " AND ".join(wh_catalogos)
