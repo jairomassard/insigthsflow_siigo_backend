@@ -1963,140 +1963,66 @@ def create_app():
         return jsonify({"message": "Cliente eliminado"})
 
 
-
-
     @app.route("/clientes/<int:idcliente>/full_delete", methods=["DELETE"])
     @jwt_required()
     def delete_cliente_total(idcliente):
         """
         Elimina por completo un cliente y toda su data relacionada.
-
         Requiere doble confirmación:
-        - 1ra: modal en frontend.
-        - 2da: parámetro ?confirm=true en la URL.
-
+        - 1ra: el modal en el frontend
+        - 2da: el parámetro ?confirm=true en la URL
         Solo SuperAdmin puede ejecutar esta acción.
-
-        Importante:
-        - Borra primero tablas hijas.
-        - Luego tablas padre.
-        - Al final elimina el registro del cliente.
-        - No borra vistas directamente, como facturas_enriquecidas.
         """
-
         claims = get_jwt()
-
-        if claims.get("perfilid") != 0:
+        if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
 
+        # Confirmación requerida
         confirm = request.args.get("confirm", "false").lower()
-
         if confirm != "true":
             return jsonify({
-                "warning": (
-                    "⚠️ Falta confirmación final. "
-                    "Para eliminar definitivamente, agrega '?confirm=true' al endpoint."
-                ),
+                "warning": "⚠️ Falta confirmación final. "
+                        "Para eliminar definitivamente, agrega '?confirm=true' al endpoint.",
                 "example": f"/clientes/{idcliente}/full_delete?confirm=true"
             }), 400
 
-        cliente = Cliente.query.get(idcliente)
+        cliente = Cliente.query.get_or_404(idcliente)
 
-        if not cliente:
-            return jsonify({
-                "error": f"No existe un cliente con idcliente={idcliente}"
-            }), 404
-
-        nombre_cliente = cliente.nombre
+        modelos_relacionados = [
+            Usuario,
+            Perfil,
+            Permiso,
+            PerfilPermiso,
+            SesionActiva,
+            SiigoCredencial,
+            SiigoFactura,
+            SiigoFacturaItem,
+            SiigoVendedor,
+            SiigoCentroCosto,
+            SiigoCustomer,
+            SiigoNotaCredito,
+            SiigoPagoProveedor,
+            SiigoCompra,
+            SiigoCompraItem,
+            SiigoProveedor,
+            SiigoCuentasPorCobrar,
+            SiigoNomina,
+            SiigoProducto,
+            BalancePrueba,
+        ]
 
         resumen = {}
+        for modelo in modelos_relacionados:
+            count = modelo.query.filter_by(idcliente=idcliente).delete(synchronize_session=False)
+            resumen[modelo.__tablename__] = count
 
-        try:
-            """
-            Orden seguro basado en las FK reales confirmadas en Railway:
+        db.session.delete(cliente)
+        db.session.commit()
 
-            - perfil_permisos depende de permisos y perfiles.
-            - usuarios depende de perfiles.
-            - siigo_factura_items depende de siigo_facturas.
-            - siigo_cuentasporcobrar depende de siigo_compras.
-            - clientes se elimina al final.
-            - facturas_enriquecidas NO se elimina porque es una vista.
-            """
-
-            tablas_ordenadas = [
-                # Seguridad / usuarios / permisos
-                "sesiones_activas",
-                "perfil_permisos",
-                "usuarios",
-                "permisos",
-                "perfiles",
-
-                # Facturación / cartera / ingresos
-                "siigo_factura_items",
-                "siigo_pagos_recibidos",
-                "siigo_notas_credito",
-                "siigo_facturas",
-
-                # Compras / cuentas por pagar
-                "siigo_cuentasporcobrar",
-                "siigo_compras_items",
-                "siigo_pagos_proveedores",
-                "siigo_compras",
-
-                # Catálogos Siigo
-                "siigo_centros_costo",
-                "siigo_customers",
-                "siigo_proveedores",
-                "siigo_productos",
-                "siigo_vendedores",
-                "siigo_nomina",
-
-                # Configuración Siigo / sincronización
-                "siigo_sync_logs",
-                "siigo_sync_metrics",
-                "siigo_sync_config",
-                "siigo_credenciales",
-
-                # Información financiera / contable
-                "balance_prueba",
-                "auxiliar_saldos_corte",
-                "auxiliar_contable",
-
-                # Configuración del dashboard / módulos / notificaciones
-                "dashboard_resumen_config",
-                "modulos_disponibles",
-                "system_notifications",
-            ]
-
-            for tabla in tablas_ordenadas:
-                result = db.session.execute(
-                    text(f'DELETE FROM public."{tabla}" WHERE idcliente = :idcliente'),
-                    {"idcliente": idcliente}
-                )
-
-                resumen[tabla] = result.rowcount if result.rowcount is not None else 0
-
-            db.session.delete(cliente)
-            db.session.commit()
-
-            return jsonify({
-                "message": f"✅ Cliente '{nombre_cliente}' y toda su información fueron eliminados correctamente.",
-                "idcliente": idcliente,
-                "detalles": resumen
-            }), 200
-
-        except Exception as e:
-            db.session.rollback()
-
-            return jsonify({
-                "error": "No se pudo eliminar completamente el cliente.",
-                "detalle": str(e),
-                "idcliente": idcliente,
-                "recomendacion": (
-                    "La transacción fue reversada. Revisa si existe alguna nueva tabla relacionada "
-                    "con idcliente o alguna llave foránea adicional no contemplada."
-                )
-            }), 500
+        return jsonify({
+            "message": f"✅ Cliente '{cliente.nombre}' y toda su información fueron eliminados correctamente.",
+            "detalles": resumen
+        }), 200
 
 
 
