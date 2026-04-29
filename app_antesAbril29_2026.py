@@ -9,7 +9,6 @@ from flask_jwt_extended import (
 from flask_cors import cross_origin
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import date, datetime, timezone, timedelta
-from licenciamiento import obtener_codigos_permitidos_cliente
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
@@ -30,7 +29,6 @@ from siigo.siigo_sync_refactor import _request_with_retries, _str, siigo_auth_js
 from siigo.siigo_sync_pagos import sync_pagos_egresos_desde_siigo
 from siigo.siigo_sync_compras import sync_compras_desde_siigo
 from sqlalchemy import text, func
-from sqlalchemy.exc import IntegrityError
 from utils import _siigo_headers_bearer, _siigo_auth_json_for_client
 
 from io import BytesIO
@@ -2033,9 +2031,6 @@ def create_app():
                 "permisos",
                 "perfiles",
 
-                # Licenciamiento / paquetes contratados
-                "cliente_paquetes",
-
                 # Facturación / cartera / ingresos
                 "siigo_factura_items",
                 "siigo_pagos_recibidos",
@@ -2233,232 +2228,80 @@ def create_app():
     @jwt_required()
     def registro_inicial_cliente():
         claims = get_jwt()
-
-        if claims["perfilid"] != 0:
+        if claims["perfilid"] != 0:  # Solo SuperAdmin puede hacerlo
             return jsonify({"error": "No autorizado"}), 403
 
-        data = request.get_json() or {}
+        data = request.get_json()
 
-        cliente_data = data.get("cliente") or {}
-        usuario_data = data.get("usuario") or {}
+        # 1️⃣ Crear Cliente
+        cliente = Cliente(
+            nombre=data["cliente"]["nombre"],
+            nit=data["cliente"].get("nit"),
+            email=data["cliente"].get("email"),
+            activo=True
+        )
+        db.session.add(cliente)
+        db.session.flush()  # Para obtener idcliente antes de commit
 
-        paquetes_codigos = data.get("paquetes") or []
-        idpaquetes = data.get("idpaquetes") or []
+        # 2️⃣ Crear Perfil Administrador
+        perfil_admin = Perfil(
+            idcliente=cliente.idcliente,
+            nombre="Administrador",
+            descripcion="Perfil administrador del cliente"
+        )
+        db.session.add(perfil_admin)
+        db.session.flush()
 
-        if not cliente_data.get("nombre"):
-            return jsonify({"error": "Falta nombre del cliente"}), 400
-
-        if not usuario_data.get("nombre") or not usuario_data.get("email") or not usuario_data.get("password"):
-            return jsonify({
-                "error": "Faltan datos del usuario administrador: nombre, email o password"
-            }), 400
-
-        if not paquetes_codigos and not idpaquetes:
-            return jsonify({
-                "error": "Debe indicar al menos un paquete contratado en 'paquetes' o 'idpaquetes'"
-            }), 400
-
-        try:
-            # =====================================================
-            # 1. Resolver paquetes contratados
-            # =====================================================
-            q_paquetes = PaqueteInsightflow.query.filter_by(activo=True)
-
-            if paquetes_codigos:
-                paquetes_codigos = [
-                    str(c).strip().lower()
-                    for c in paquetes_codigos
-                    if str(c).strip()
-                ]
-
-                paquetes = (
-                    q_paquetes
-                    .filter(PaqueteInsightflow.codigo.in_(paquetes_codigos))
-                    .all()
-                )
-            else:
-                paquetes = (
-                    q_paquetes
-                    .filter(PaqueteInsightflow.idpaquete.in_(idpaquetes))
-                    .all()
-                )
-
-            if not paquetes:
-                return jsonify({
-                    "error": "No se encontraron paquetes activos con los datos enviados."
-                }), 400
-
-            # =====================================================
-            # 2. Crear Cliente
-            # =====================================================
-            cliente = Cliente(
-                nombre=cliente_data["nombre"],
-                nit=cliente_data.get("nit"),
-                email=cliente_data.get("email"),
-                activo=bool(cliente_data.get("activo", True)),
-                pais=cliente_data.get("pais"),
-                ciudad=cliente_data.get("ciudad"),
-                direccion=cliente_data.get("direccion"),
-                telefono1=cliente_data.get("telefono1"),
-                logo_url=cliente_data.get("logo_url"),
-                limite_usuarios=(
-                    int(cliente_data["limite_usuarios"])
-                    if cliente_data.get("limite_usuarios") not in (None, "")
-                    else None
-                ),
-                limite_sesiones=(
-                    int(cliente_data["limite_sesiones"])
-                    if cliente_data.get("limite_sesiones") not in (None, "")
-                    else None
-                ),
-                timezone=cliente_data.get("timezone", "America/Bogota")
-            )
-
-            db.session.add(cliente)
-            db.session.flush()
-
-            # =====================================================
-            # 3. Asociar paquetes al cliente
-            # =====================================================
-            for paquete in paquetes:
-                db.session.add(ClientePaquete(
-                    idcliente=cliente.idcliente,
-                    idpaquete=paquete.idpaquete,
-                    activo=True,
-                    fecha_inicio=date.today(),
-                    fecha_fin=None
-                ))
-
-            db.session.flush()
-
-            # =====================================================
-            # 4. Obtener códigos permitidos por paquetes contratados
-            # =====================================================
-            codigos_permitidos = obtener_codigos_permitidos_cliente(cliente.idcliente)
-
-            if not codigos_permitidos:
-                db.session.rollback()
-                return jsonify({
-                    "error": "Los paquetes seleccionados no tienen permisos activos configurados."
-                }), 400
-
-            # =====================================================
-            # 5. Crear Perfil Administrador
-            # =====================================================
-            perfil_admin = Perfil(
+        # 3️⃣ Clonar permisos base del cliente 1
+        permisos_base = Permiso.query.filter_by(idcliente=1).all()
+        for p in permisos_base:
+            nuevo = Permiso(
                 idcliente=cliente.idcliente,
-                nombre="Administrador",
-                descripcion="Perfil administrador del cliente"
+                nombre=p.nombre,
+                codigo=p.codigo,
+                descripcion=p.descripcion,
+                activo=p.activo
             )
+            db.session.add(nuevo)
+        db.session.flush()
 
-            db.session.add(perfil_admin)
-            db.session.flush()
-
-            # =====================================================
-            # 6. Clonar solo permisos incluidos en el paquete
-            # =====================================================
-            permisos_base = (
-                Permiso.query
-                .filter(
-                    Permiso.idcliente == 1,
-                    Permiso.codigo.in_(codigos_permitidos),
-                    Permiso.activo.is_(True)
-                )
-                .all()
-            )
-
-            permisos_creados = []
-
-            for p in permisos_base:
-                nuevo = Permiso(
-                    idcliente=cliente.idcliente,
-                    nombre=p.nombre,
-                    codigo=p.codigo,
-                    descripcion=p.descripcion,
-                    activo=p.activo
-                )
-
-                db.session.add(nuevo)
-                db.session.flush()
-
-                permisos_creados.append(nuevo)
-
-            if not permisos_creados:
-                db.session.rollback()
-                return jsonify({
-                    "error": "No se encontraron permisos base en cliente 1 para los códigos del paquete."
-                }), 400
-
-            # =====================================================
-            # 7. Asignar todos los permisos contratados al perfil administrador
-            # =====================================================
-            for permiso in permisos_creados:
-                db.session.add(PerfilPermiso(
-                    idcliente=cliente.idcliente,
-                    idperfil=perfil_admin.idperfil,
-                    idpermiso=permiso.idpermiso,
-                    permitido=True
-                ))
-
-            # =====================================================
-            # 8. Crear Usuario Administrador
-            # =====================================================
-            password_hash = generate_password_hash(
-                usuario_data["password"],
-                method="pbkdf2:sha256",
-                salt_length=16
-            )
-
-            usuario_admin = Usuario(
+        # 4️⃣ Asignar todos los permisos al perfil administrador del nuevo cliente
+        for nuevo_permiso in Permiso.query.filter_by(idcliente=cliente.idcliente).all():
+            rel = PerfilPermiso(
                 idcliente=cliente.idcliente,
                 idperfil=perfil_admin.idperfil,
-                nombre=usuario_data["nombre"],
-                apellido=usuario_data.get("apellido"),
-                email=usuario_data["email"],
-                password_hash=password_hash,
-                activo=True
+                idpermiso=nuevo_permiso.idpermiso,
+                permitido=True
             )
+            db.session.add(rel)
 
-            db.session.add(usuario_admin)
-            db.session.commit()
+        # 5️⃣ Crear Usuario Administrador
+        password_hash = generate_password_hash(
+            data["usuario"]["password"], method="pbkdf2:sha256", salt_length=16
+        )
+        usuario_admin = Usuario(
+            idcliente=cliente.idcliente,
+            idperfil=perfil_admin.idperfil,
+            nombre=data["usuario"]["nombre"],
+            email=data["usuario"]["email"],
+            password_hash=password_hash,
+            activo=True
+        )
+        db.session.add(usuario_admin)
+        db.session.commit()
 
-            return jsonify({
-                "message": "Cliente registrado correctamente con paquete contratado.",
-                "cliente": cliente.as_dict(),
-                "paquetes": [
-                    {
-                        "idpaquete": p.idpaquete,
-                        "codigo": p.codigo,
-                        "nombre": p.nombre
-                    }
-                    for p in paquetes
-                ],
-                "perfil_admin": {
-                    "idperfil": perfil_admin.idperfil,
-                    "nombre": perfil_admin.nombre
-                },
-                "usuario_admin": {
-                    "idusuario": usuario_admin.idusuario,
-                    "email": usuario_admin.email,
-                    "nombre": usuario_admin.nombre,
-                    "apellido": usuario_admin.apellido
-                },
-                "permisos_asignados": len(permisos_creados)
-            }), 201
-
-        except IntegrityError as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo registrar el cliente por conflicto de datos únicos.",
-                "detalle": str(e)
-            }), 409
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo registrar el cliente.",
-                "detalle": str(e)
-            }), 500
+        return jsonify({
+            "cliente": cliente.as_dict(),
+            "perfil_admin": {
+                "idperfil": perfil_admin.idperfil,
+                "nombre": perfil_admin.nombre
+            },
+            "usuario_admin": {
+                "idusuario": usuario_admin.idusuario,
+                "email": usuario_admin.email,
+                "nombre": usuario_admin.nombre
+            }
+        }), 201
 
 
     # ==========================

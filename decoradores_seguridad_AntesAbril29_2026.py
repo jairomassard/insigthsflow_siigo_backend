@@ -1,9 +1,7 @@
 from functools import wraps
 from flask import jsonify
 from flask_jwt_extended import get_jwt
-from models import Perfil, Permiso, PerfilPermiso
-from licenciamiento import cliente_tiene_permiso_en_paquete
-
+from models import db, Perfil, Permiso, PerfilPermiso
 
 # ------------------------------------------------------------
 # 🔐 1. Helper: detectar si el usuario es superadmin
@@ -22,13 +20,7 @@ def _perfil_tiene_permiso(idperfil: int, idcliente: int, codigo_permiso: str) ->
     """
     Verifica si un perfil dado tiene permitido acceder al permiso con ese código.
     """
-
-    permiso = Permiso.query.filter_by(
-        codigo=codigo_permiso,
-        idcliente=idcliente,
-        activo=True
-    ).first()
-
+    permiso = Permiso.query.filter_by(codigo=codigo_permiso, idcliente=idcliente).first()
     if not permiso:
         return False
 
@@ -46,17 +38,9 @@ def _perfil_tiene_permiso(idperfil: int, idcliente: int, codigo_permiso: str) ->
 # ------------------------------------------------------------
 def permiso_requerido(codigo_permiso: str):
     """
-    Decorador que protege rutas Flask verificando dos capas:
-
-    1. Licenciamiento:
-       El cliente debe tener ese permiso incluido en su paquete contratado.
-
-    2. Perfil:
-       El perfil del usuario debe tener ese permiso asignado.
-
-    Uso:
-        @jwt_required()
-        @permiso_requerido("ver_reporte_cxc")
+    Decorador que protege rutas Flask verificando si el usuario actual
+    tiene asignado el permiso indicado. Compatible con tu modelo multi-tenant.
+    Uso: @jwt_required() + @permiso_requerido("codigo_permiso")
     """
 
     def decorator(fn):
@@ -72,28 +56,17 @@ def permiso_requerido(codigo_permiso: str):
             idcliente = claims.get("idcliente")
 
             if not idperfil or not idcliente:
-                return jsonify({
-                    "error": "Token inválido: falta idperfil o idcliente"
-                }), 403
+                return jsonify({"error": "Token inválido: falta idperfil o idcliente"}), 403
 
-            # 2️⃣ Validar paquete contratado
-            if not cliente_tiene_permiso_en_paquete(idcliente, codigo_permiso):
-                return jsonify({
-                    "error": f"Acceso denegado: el paquete contratado no incluye '{codigo_permiso}'",
-                    "permiso": codigo_permiso,
-                    "motivo": "permiso_no_incluido_en_paquete"
-                }), 403
-
-            # 3️⃣ Validar permiso del perfil
+            # 2️⃣ Verificar si el perfil tiene el permiso
             if not _perfil_tiene_permiso(idperfil, idcliente, codigo_permiso):
                 return jsonify({
-                    "error": f"Acceso denegado: falta permiso '{codigo_permiso}' en el perfil",
-                    "permiso": codigo_permiso,
-                    "motivo": "permiso_no_asignado_al_perfil"
+                    "error": f"Acceso denegado: falta permiso '{codigo_permiso}'",
+                    "permiso": codigo_permiso
                 }), 403
 
+            # ✅ Permiso concedido
             return fn(*args, **kwargs)
 
         return wrapper
-
     return decorator
