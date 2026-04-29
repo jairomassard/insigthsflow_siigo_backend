@@ -9,7 +9,7 @@ from flask_jwt_extended import (
 from flask_cors import cross_origin
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import date, datetime, timezone, timedelta
-from licenciamiento import obtener_codigos_permitidos_cliente
+from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_permiso_en_paquete
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
@@ -2464,6 +2464,33 @@ def create_app():
     # ==========================
     # Cliente Admin CRUD Perfiles
     # ==========================
+
+    @app.route("/perfiles", methods=["GET"])
+    @jwt_required()
+    def cliente_listar_perfiles():
+        claims = get_jwt()
+
+        if claims["perfilid"] == 0:
+            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
+
+        idcliente = claims.get("idcliente")
+
+        if not idcliente:
+            return jsonify({"error": "Token inválido: falta idcliente"}), 403
+
+        perfiles = (
+            Perfil.query
+            .filter_by(idcliente=idcliente)
+            .order_by(Perfil.nombre.asc())
+            .all()
+        )
+
+        return jsonify([p.as_dict() for p in perfiles]), 200
+
+
+
+
+
     @app.route("/perfiles", methods=["POST"])
     @jwt_required()
     def cliente_crear_perfil():
@@ -11392,14 +11419,15 @@ def create_app():
 
     @app.before_request
     def verificar_permisos_global():
-        # 🔓 Excepciones (rutas públicas o de login)
+        # 🔓 Preflight CORS
         if request.method == "OPTIONS":
-            return jsonify({"status": "ok"}), 200  # ← ✅ soluciona preflight correctamente
+            return jsonify({"status": "ok"}), 200
 
+        # 🔓 Rutas públicas
         if request.path.startswith("/auth") or request.path == "/":
             return
 
-        # ⚠️ Excluir rutas internas que se llaman desde /siigo/sync-all
+        # ⚠️ Rutas internas / técnicas exentas
         rutas_exentas = [
             "/siigo/sync-catalogos",
             "/siigo/sync-customers",
@@ -11414,11 +11442,12 @@ def create_app():
             "/config/siigo-sync-status",
             "/ping",
         ]
+
         for ruta in rutas_exentas:
             if ruta in request.path:
                 return
 
-        # ✅ Verifica JWT válido
+        # ✅ Verificar JWT válido
         try:
             verify_jwt_in_request(optional=False)
         except Exception as e:
@@ -11426,27 +11455,91 @@ def create_app():
 
         claims = get_jwt()
 
+        # 👑 SuperAdmin entra sin restricciones
         if _is_superadmin(claims):
-            return  # 👑 SuperAdmin entra sin restricciones
+            return
 
         idperfil = claims.get("perfilid")
         idcliente = claims.get("idcliente")
 
-        # 🧠 Debug temporal
-        print(f"[PERMISOS] Ruta: {request.path}, Método: {request.method}, Perfil: {idperfil}, Cliente: {idcliente}")
+        if not idperfil or not idcliente:
+            return jsonify({
+                "error": "Token inválido: falta perfil o cliente",
+                "ruta": request.path
+            }), 403
 
-        # 🔹 Reglas automáticas por prefijo de ruta
+        print(
+            f"[PERMISOS] Ruta: {request.path}, "
+            f"Método: {request.method}, "
+            f"Perfil: {idperfil}, Cliente: {idcliente}"
+        )
+
         codigo = None
 
+        # ======================================================
+        # Clientes
+        # ======================================================
         if request.path.startswith("/clientes"):
             codigo = "ver_clientes"
 
-        elif request.path.startswith("/siigo"):
-            codigo = "ver_siigo"
-
+        # ======================================================
+        # Administración global SuperAdmin
+        # Nunca debe ser usada por usuarios cliente.
+        # ======================================================
         elif request.path.startswith("/admin"):
             codigo = "admin_panel"
 
+        # ======================================================
+        # Perfiles de cliente
+        # ======================================================
+        elif request.path.startswith("/perfiles"):
+            if request.method == "GET":
+                codigo = "ver_perfiles"
+            else:
+                codigo = "editar_perfiles"
+
+        # ======================================================
+        # Usuarios de cliente
+        # ======================================================
+        elif request.path.startswith("/usuarios"):
+            if request.method == "GET":
+                codigo = "ver_usuarios"
+            else:
+                codigo = "editar_usuarios"
+
+        # ======================================================
+        # Permisos / mis permisos / permisos por perfil
+        # Estos endpoints tienen validación propia en permisos_routes.py
+        # y son necesarios para construir menú/sidebar.
+        # ======================================================
+        elif request.path.startswith("/api/mis_permisos"):
+            return
+
+        elif request.path.startswith("/api/perfiles"):
+            return
+
+        elif request.path.startswith("/api/usuarios"):
+            return
+
+        elif request.path.startswith("/api/permisos"):
+            return
+
+        # ======================================================
+        # Notificaciones
+        # De momento se permite si el usuario tiene dashboard.
+        # ======================================================
+        elif request.path.startswith("/api/notificaciones"):
+            codigo = "ver_dashboard"
+
+        # ======================================================
+        # Siigo
+        # ======================================================
+        elif request.path.startswith("/siigo"):
+            codigo = "ver_siigo"
+
+        # ======================================================
+        # Dashboard / configuración
+        # ======================================================
         elif request.path.startswith("/dashboard"):
             if "resumen-config/buscar-cuentas" in request.path:
                 codigo = "ver_configuraciones_varias"
@@ -11457,8 +11550,10 @@ def create_app():
             else:
                 codigo = "ver_dashboard"
 
+        # ======================================================
+        # Reportes
+        # ======================================================
         elif request.path.startswith("/reportes"):
-            # Detectar permisos específicos
             if "facturas-buscador" in request.path or "buscador-facturas" in request.path:
                 codigo = "ver_reporte_buscador_facturas"
             elif "compras-gastos" in request.path:
@@ -11496,15 +11591,26 @@ def create_app():
             else:
                 codigo = "ver_reportes"
 
-        # Si no hay permiso requerido, no aplica control
+        # Si no hay permiso requerido, no aplica control global
         if not codigo:
             return
 
-        # 🔒 Verifica el permiso en BD
+        # 🔒 1. Verificar que el paquete contratado incluya el permiso
+        if not cliente_tiene_permiso_en_paquete(idcliente, codigo):
+            return jsonify({
+                "error": f"Acceso denegado: el paquete contratado no incluye el permiso '{codigo}'",
+                "permiso": codigo,
+                "ruta": request.path,
+                "motivo": "permiso_no_incluido_en_paquete"
+            }), 403
+
+        # 🔒 2. Verificar que el perfil del usuario tenga el permiso asignado
         if not _perfil_tiene_permiso(idperfil, idcliente, codigo):
             return jsonify({
                 "error": f"Acceso denegado: falta permiso '{codigo}'",
-                "ruta": request.path
+                "permiso": codigo,
+                "ruta": request.path,
+                "motivo": "permiso_no_asignado_al_perfil"
             }), 403
 
 
