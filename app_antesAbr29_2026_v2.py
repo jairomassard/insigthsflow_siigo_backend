@@ -11554,220 +11554,43 @@ def create_app():
         # Reportes
         # ======================================================
         elif request.path.startswith("/reportes"):
-            # Normaliza rutas:
-            # /reportes/facturas_enriquecidas -> /reportes/facturas-enriquecidas
-            # /reportes/analisis_variacion_v1 -> /reportes/analisis-variacion-v1
-            path_norm = request.path.lower().replace("_", "-")
-
-            # ------------------------------------------
-            # Buscador Inteligente de Facturas
-            # Ejemplo:
-            # /reportes/busqueda-inteligente-facturas
-            # /reportes/financiero/buscador-facturas
-            # ------------------------------------------
-            if (
-                "busqueda-inteligente-facturas" in path_norm
-                or "buscador-facturas" in path_norm
-                or "facturas-buscador" in path_norm
-                or "busqueda-facturas" in path_norm
-                or "facturas-inteligente" in path_norm
-            ):
+            if "facturas-buscador" in request.path or "buscador-facturas" in request.path:
                 codigo = "ver_reporte_buscador_facturas"
-
-            # ------------------------------------------
-            # Cuentas por Cobrar / Cartera / Aging
-            # Ejemplo:
-            # /reportes/cuentas-por-cobrar
-            # /reportes/financiero/cxc
-            # ------------------------------------------
-            elif (
-                "cuentas-por-cobrar" in path_norm
-                or "cuentasporcobrar" in path_norm
-                or "cxc" in path_norm
-                or "cartera" in path_norm
-                or "aging" in path_norm
-            ):
-                codigo = "ver_reporte_cxc"
-
-            # ------------------------------------------
-            # Ventas por Vendedor
-            # Ejemplo:
-            # /reportes/vendedores
-            # ------------------------------------------
-            elif (
-                "vendedores" in path_norm
-                or "vendedor" in path_norm
-                or "ventas-vendedor" in path_norm
-                or "sales-by-vendor" in path_norm
-            ):
-                codigo = "ver_reporte_vendedores"
-
-            # ------------------------------------------
-            # Ventas por Producto
-            # Ejemplo:
-            # /reportes/productos
-            # ------------------------------------------
-            elif (
-                "productos" in path_norm
-                or "producto" in path_norm
-                or "ventas-producto" in path_norm
-                or "sales-by-product" in path_norm
-            ):
-                codigo = "ver_reporte_productos"
-
-            # ------------------------------------------
-            # Ingresos por Ventas y endpoints auxiliares de ventas
-            # Ejemplos usados por la página de ventas:
-            # /reportes/facturas-enriquecidas
-            # /reportes/facturas-por-cliente
-            # /reportes/facturas-por-estado
-            # /reportes/facturas-detalle-mes
-            # /reportes/financiero/ventas
-            # ------------------------------------------
-            elif (
-                "ventas" in path_norm
-                or "ingresos" in path_norm
-                or "facturas-enriquecidas" in path_norm
-                or "facturas-por-cliente" in path_norm
-                or "facturas-por-estado" in path_norm
-                or "facturas-detalle-mes" in path_norm
-                or "facturacion-ventas" in path_norm
-                or "sales" in path_norm
-            ):
-                codigo = "ver_reporte_ventas"
-
-            # ------------------------------------------
-            # Facturación Clientes
-            # Se deja después de ventas para que facturas-por-cliente
-            # siga perteneciendo al reporte de ventas.
-            # ------------------------------------------
-            elif (
-                "facturas-cliente" in path_norm
-                or "facturas-clientes" in path_norm
-                or "facturacion-clientes" in path_norm
-                or "analisis-clientes" in path_norm
-                or "reporte-clientes" in path_norm
-            ):
-                codigo = "ver_reporte_clientes"
-
-            # ------------------------------------------
-            # Compras / Gastos / Egresos
-            # ------------------------------------------
-            elif (
-                "compras-gastos" in path_norm
-                or "compras-y-gastos" in path_norm
-                or "compras-gastos" in path_norm
-                or "egresos" in path_norm
-                or "gastos" in path_norm
-            ):
+            elif "compras-gastos" in request.path:
                 codigo = "ver_reporte_compras_gastos"
-
-            # ------------------------------------------
-            # Nómina
-            # ------------------------------------------
-            elif "nomina" in path_norm or "nómina" in path_norm:
-                codigo = "ver_reporte_nomina"
-
-            # ------------------------------------------
-            # Compras a Proveedores
-            # ------------------------------------------
-            elif (
-                "proveedores" in path_norm
-                or "proveedor" in path_norm
-                or "compras-proveedores" in path_norm
-            ):
-                codigo = "ver_reporte_proveedores"
-
-            # ------------------------------------------
-            # Financiero Consolidado
-            # ------------------------------------------
-            elif "consolidado" in path_norm:
-                codigo = "ver_reporte_consolidado"
-
-            # ------------------------------------------
-            # Cruce de IVAs
-            # ------------------------------------------
-            elif (
-                "cruce-iva" in path_norm
-                or "cruce-ivas" in path_norm
-                or "cruceiva" in path_norm
-            ):
-                codigo = "ver_reporte_cruceivas"
-
-            # ------------------------------------------
-            # Retenciones
-            # ------------------------------------------
-            elif "retenciones" in path_norm or "retencion" in path_norm:
-                codigo = "ver_reporte_retenciones"
-
-            # ------------------------------------------
-            # Estado de Resultados / P&L
-            # ------------------------------------------
-            elif (
-                "pnl-v1" in path_norm
-                or "pnl" in path_norm
-                or "estado-resultados" in path_norm
-                or "estado-de-resultados" in path_norm
-                or "estadoresultados" in path_norm
-            ):
-                codigo = "ver_reporte_estado_resultados"
-
-            # ------------------------------------------
-            # Análisis de Variación
-            # ------------------------------------------
-            elif (
-                "analisis-variacion" in path_norm
-                or "analisis-variacion-v1" in path_norm
-                or "variacion" in path_norm
-            ):
-                codigo = "ver_reporte_analisis_variacion"
-
-            # ------------------------------------------
-            # Indicadores financieros auxiliares
-            # ------------------------------------------
-            elif (
-                "auxiliares/indicadores-financieros" in path_norm
-                or "indicadores-financieros-auxiliares" in path_norm
-                or "indicadores-auxiliares" in path_norm
-            ):
+            elif "auxiliares/indicadores-financieros" in request.path or "indicadores-financieros-auxiliares" in request.path:
                 codigo = "ver_reporte_indicadores_auxiliares"
-
-            # ------------------------------------------
-            # Indicadores financieros antiguos
-            # ------------------------------------------
-            elif "indicadores" in path_norm:
+            elif "indicadores" in request.path:
                 codigo = "ver_reporte_indicadores"
-
-            # ------------------------------------------
-            # Balance General
-            # ------------------------------------------
-            elif (
-                "balance-general" in path_norm
-                or "balancegeneral" in path_norm
-            ):
+            elif "ventas" in request.path:
+                codigo = "ver_reporte_ventas"
+            elif "balance_general" in request.path or "balance-general" in request.path:
                 codigo = "ver_reporte_balance_general"
-
-            # ------------------------------------------
-            # Balance antiguo / balance prueba
-            # ------------------------------------------
-            elif "balance" in path_norm:
+            elif "balance" in request.path:
                 codigo = "ver_reporte_balance"
-
-            # ------------------------------------------
-            # Ruta no mapeada
-            # No usamos ver_reportes para evitar permisos demasiado amplios.
-            # ------------------------------------------
+            elif "consolidado" in request.path:
+                codigo = "ver_reporte_consolidado"
+            elif "clientes" in request.path:
+                codigo = "ver_reporte_clientes"
+            elif "proveedores" in request.path:
+                codigo = "ver_reporte_proveedores"
+            elif "productos" in request.path:
+                codigo = "ver_reporte_productos"
+            elif "nomina" in request.path:
+                codigo = "ver_reporte_nomina"
+            elif "cxc" in request.path or "cartera" in request.path:
+                codigo = "ver_reporte_cxc"
+            elif "cruce_iva" in request.path:
+                codigo = "ver_reporte_cruceivas"
+            elif "retenciones" in request.path:
+                codigo = "ver_reporte_retenciones"
+            elif "analisis_variacion_v1" in request.path or "analisis-variacion" in request.path:
+                codigo = "ver_reporte_analisis_variacion"
+            elif "pnl_v1" in request.path or "estado-resultados" in request.path or "estado_resultados" in request.path:
+                codigo = "ver_reporte_estado_resultados"
             else:
-                return jsonify({
-                    "error": "Ruta de reporte no mapeada en control de permisos.",
-                    "ruta": request.path,
-                    "motivo": "reporte_sin_mapeo",
-                    "recomendacion": (
-                        "Agrega esta ruta al mapeo de permisos en before_request "
-                        "para asociarla con un permiso específico."
-                    )
-                }), 403
-            
+                codigo = "ver_reportes"
+
         # Si no hay permiso requerido, no aplica control global
         if not codigo:
             return
