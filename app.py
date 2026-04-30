@@ -11560,6 +11560,53 @@ def create_app():
             path_norm = request.path.lower().replace("_", "-")
 
             # ------------------------------------------
+            # Cargue de Auxiliar Contable
+            # Usado por páginas del módulo financiero:
+            # Cruce de IVA, Retenciones, P&L, Variación,
+            # Balance General e Indicadores Auxiliares.
+            # ------------------------------------------
+            if (
+                "cargar-auxiliar" in path_norm
+                or "cargar-auxiliares" in path_norm
+                or "upload-auxiliar" in path_norm
+                or "importar-auxiliar" in path_norm
+            ):
+                permisos_financieros_auxiliar = [
+                    "ver_reporte_cruceivas",
+                    "ver_reporte_retenciones",
+                    "ver_reporte_estado_resultados",
+                    "ver_reporte_analisis_variacion",
+                    "ver_reporte_balance_general",
+                    "ver_reporte_indicadores_auxiliares",
+                ]
+
+                tiene_permiso_paquete = any(
+                    cliente_tiene_permiso_en_paquete(idcliente, permiso)
+                    for permiso in permisos_financieros_auxiliar
+                )
+
+                tiene_permiso_perfil = any(
+                    _perfil_tiene_permiso(idperfil, idcliente, permiso)
+                    for permiso in permisos_financieros_auxiliar
+                )
+
+                if not tiene_permiso_paquete:
+                    return jsonify({
+                        "error": "Acceso denegado: el paquete contratado no incluye cargue de auxiliar contable.",
+                        "ruta": request.path,
+                        "motivo": "cargue_auxiliar_no_incluido_en_paquete"
+                    }), 403
+
+                if not tiene_permiso_perfil:
+                    return jsonify({
+                        "error": "Acceso denegado: el perfil no tiene permisos financieros para cargar auxiliar contable.",
+                        "ruta": request.path,
+                        "motivo": "cargue_auxiliar_no_asignado_al_perfil"
+                    }), 403
+
+                return
+
+            # ------------------------------------------
             # Buscador Inteligente de Facturas
             # Ejemplo:
             # /reportes/busqueda-inteligente-facturas
@@ -11573,6 +11620,7 @@ def create_app():
                 or "facturas-inteligente" in path_norm
             ):
                 codigo = "ver_reporte_buscador_facturas"
+                
 
             # ------------------------------------------
             # Cuentas por Cobrar / Cartera / Aging
