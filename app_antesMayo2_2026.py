@@ -1718,117 +1718,7 @@ def _buscar_cuentas_auxiliar_para_config(idcliente, q=None, limite=20):
     ]
 
 
-#Helpers de control de Usuarios:
-def _bool_from_payload(value, default=False):
-    """
-    Convierte valores enviados desde frontend a boolean real.
-    Evita que strings como 'false' terminen evaluando como True.
-    """
-    if value is None:
-        return default
 
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes", "si", "sí")
-
-    return bool(value)
-
-
-def _validar_cupo_usuarios_cliente(idcliente, excluir_idusuario=None):
-    """
-    Valida si un cliente todavía tiene cupo para tener usuarios activos.
-
-    - Cuenta solo usuarios activos.
-    - Si excluir_idusuario viene, no cuenta ese usuario.
-      Esto sirve para edición/reactivación/cambio de cliente.
-    - Si limite_usuarios es NULL o <= 0, se interpreta como sin límite configurado
-      para no romper clientes antiguos.
-    """
-
-    cliente = Cliente.query.get(idcliente)
-
-    if not cliente:
-        return False, {
-            "error": "Cliente no encontrado",
-            "detalle": f"No existe un cliente con idcliente={idcliente}."
-        }, 404
-
-    if not cliente.activo:
-        return False, {
-            "error": "Cliente inactivo",
-            "detalle": "No se pueden crear o activar usuarios para un cliente inactivo.",
-            "idcliente": cliente.idcliente,
-            "cliente": cliente.nombre
-        }, 400
-
-    limite = cliente.limite_usuarios
-
-    # Compatibilidad con clientes antiguos sin límite configurado.
-    # Si quieres hacerlo estricto, cambia esta condición para bloquear cuando sea None.
-    if limite is None or limite <= 0:
-        return True, {
-            "idcliente": cliente.idcliente,
-            "cliente": cliente.nombre,
-            "limite_usuarios": limite,
-            "usuarios_activos": None,
-            "cupos_disponibles": None,
-            "sin_limite_configurado": True
-        }, 200
-
-    query = Usuario.query.filter(
-        Usuario.idcliente == idcliente,
-        Usuario.activo.is_(True)
-    )
-
-    if excluir_idusuario:
-        query = query.filter(Usuario.idusuario != excluir_idusuario)
-
-    usuarios_activos = query.count()
-    cupos_disponibles = max(limite - usuarios_activos, 0)
-
-    if usuarios_activos >= limite:
-        return False, {
-            "error": "Límite de usuarios alcanzado",
-            "detalle": (
-                f"El cliente tiene contratado un máximo de {limite} usuarios activos. "
-                f"Actualmente ya tiene {usuarios_activos} usuarios activos."
-            ),
-            "idcliente": cliente.idcliente,
-            "cliente": cliente.nombre,
-            "limite_usuarios": limite,
-            "usuarios_activos": usuarios_activos,
-            "cupos_disponibles": 0
-        }, 409
-
-    return True, {
-        "idcliente": cliente.idcliente,
-        "cliente": cliente.nombre,
-        "limite_usuarios": limite,
-        "usuarios_activos": usuarios_activos,
-        "cupos_disponibles": cupos_disponibles
-    }, 200
-
-
-def _validar_perfil_cliente(idperfil, idcliente):
-    """
-    Valida que el perfil exista y pertenezca al cliente indicado.
-    """
-    perfil = Perfil.query.filter_by(
-        idperfil=idperfil,
-        idcliente=idcliente
-    ).first()
-
-    if not perfil:
-        return None, {
-            "error": "Perfil no válido",
-            "detalle": "El perfil enviado no existe o no pertenece al cliente seleccionado.",
-            "idperfil": idperfil,
-            "idcliente": idcliente
-        }, 400
-
-    return perfil, None, None
 
 
 # ENDPOINTS DEL SISTEMA
@@ -2273,227 +2163,66 @@ def create_app():
         return jsonify({"message": "Perfil eliminado"})
 
 
-
     # ==========================
     # Superadmin CRUD Usuarios
     # ==========================
-
     @app.route("/admin/usuarios", methods=["GET"])
     @jwt_required()
     def admin_get_usuarios():
         claims = get_jwt()
-
-        if claims["perfilid"] != 0:
+        if claims["perfilid"] != 0:  
             return jsonify({"error": "No autorizado"}), 403
-
         usuarios = Usuario.query.all()
         return jsonify([u.as_dict() for u in usuarios])
-
 
     @app.route("/admin/usuarios", methods=["POST"])
     @jwt_required()
     def admin_crear_usuario():
         claims = get_jwt()
-
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
 
         data = request.get_json() or {}
-
-        required = ["idcliente", "idperfil", "nombre", "email", "password"]
-        faltantes = [field for field in required if not data.get(field)]
-
-        if faltantes:
-            return jsonify({
-                "error": "Faltan campos obligatorios",
-                "faltantes": faltantes
-            }), 400
-
-        try:
-            idcliente = int(data["idcliente"])
-            idperfil = int(data["idperfil"])
-        except Exception:
-            return jsonify({
-                "error": "Datos inválidos",
-                "detalle": "idcliente e idperfil deben ser valores numéricos."
-            }), 400
-
-        # Validar que el perfil pertenezca al cliente seleccionado
-        perfil, error_perfil, status_perfil = _validar_perfil_cliente(idperfil, idcliente)
-        if error_perfil:
-            return jsonify(error_perfil), status_perfil
-
-        # Validar límite de usuarios activos
-        ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(idcliente)
-        if not ok_cupo:
-            return jsonify(info_cupo), status_cupo
-
-        try:
-            user = Usuario(
-                idcliente=idcliente,
-                idperfil=perfil.idperfil,
-                nombre=str(data["nombre"]).strip(),
-                apellido=(str(data.get("apellido")).strip() if data.get("apellido") else None),
-                email=str(data["email"]).strip().lower(),
-                password_hash=generate_password_hash(
-                    data["password"],
-                    method="pbkdf2:sha256",
-                    salt_length=16
-                ),
-                activo=True
-            )
-
-            db.session.add(user)
-            db.session.commit()
-
-            response = user.as_dict()
-            response["control_usuarios"] = {
-                **info_cupo,
-                "usuarios_activos_despues": (
-                    None
-                    if info_cupo.get("usuarios_activos") is None
-                    else info_cupo["usuarios_activos"] + 1
-                ),
-                "cupos_disponibles_despues": (
-                    None
-                    if info_cupo.get("cupos_disponibles") is None
-                    else max(info_cupo["cupos_disponibles"] - 1, 0)
-                )
-            }
-
-            return jsonify(response), 201
-
-        except IntegrityError as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo crear el usuario por conflicto de datos únicos.",
-                "detalle": "Probablemente ya existe un usuario con ese email.",
-                "debug": str(e)
-            }), 409
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo crear el usuario.",
-                "detalle": str(e)
-            }), 500
+        user = Usuario(
+            idcliente=data["idcliente"],
+            idperfil=data["idperfil"],
+            nombre=data["nombre"],
+            apellido=data.get("apellido"),  # NUEVO
+            email=data["email"],
+            password_hash=generate_password_hash(data["password"], method="pbkdf2:sha256"),
+            activo=True
+        )
+        db.session.add(user)
+        db.session.commit()
+        return jsonify(user.as_dict()), 201
 
 
     @app.route("/admin/usuarios/<int:idusuario>", methods=["PUT"])
     @jwt_required()
     def admin_update_usuario(idusuario):
         claims = get_jwt()
-
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
-
         user = Usuario.query.get_or_404(idusuario)
         data = request.get_json() or {}
-
-        nuevo_idcliente = user.idcliente
-        nuevo_idperfil = user.idperfil
-        nuevo_activo = user.activo
-
-        if "idcliente" in data and data["idcliente"] not in (None, ""):
-            try:
-                nuevo_idcliente = int(data["idcliente"])
-            except Exception:
-                return jsonify({
-                    "error": "idcliente inválido",
-                    "detalle": "idcliente debe ser numérico."
-                }), 400
-
-        if "idperfil" in data and data["idperfil"] not in (None, ""):
-            try:
-                nuevo_idperfil = int(data["idperfil"])
-            except Exception:
-                return jsonify({
-                    "error": "idperfil inválido",
-                    "detalle": "idperfil debe ser numérico."
-                }), 400
-
-        if "activo" in data:
-            nuevo_activo = _bool_from_payload(data.get("activo"), default=user.activo)
-
-        # Si el usuario queda activo, validar cupo del cliente destino.
-        # Esto cubre:
-        # - Reactivar usuario.
-        # - Mover usuario a otro cliente.
-        # - Mantener activo en el mismo cliente, excluyéndose a sí mismo.
-        if nuevo_activo:
-            ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(
-                nuevo_idcliente,
-                excluir_idusuario=user.idusuario
-            )
-
-            if not ok_cupo:
-                return jsonify(info_cupo), status_cupo
-
-        # Validar que el perfil pertenezca al cliente destino
-        if nuevo_idperfil:
-            perfil, error_perfil, status_perfil = _validar_perfil_cliente(
-                nuevo_idperfil,
-                nuevo_idcliente
-            )
-
-            if error_perfil:
-                return jsonify(error_perfil), status_perfil
-
-        try:
-            if "nombre" in data:
-                user.nombre = str(data["nombre"]).strip()
-
-            if "apellido" in data:
-                user.apellido = str(data["apellido"]).strip() if data["apellido"] else None
-
-            if "email" in data:
-                user.email = str(data["email"]).strip().lower()
-
-            user.idcliente = nuevo_idcliente
-            user.idperfil = nuevo_idperfil
-            user.activo = nuevo_activo
-
-            if "password" in data and data["password"]:
-                user.password_hash = generate_password_hash(
-                    data["password"],
-                    method="pbkdf2:sha256",
-                    salt_length=16
-                )
-
-            db.session.commit()
-            return jsonify(user.as_dict())
-
-        except IntegrityError as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo actualizar el usuario por conflicto de datos únicos.",
-                "detalle": "Probablemente ya existe otro usuario con ese email.",
-                "debug": str(e)
-            }), 409
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo actualizar el usuario.",
-                "detalle": str(e)
-            }), 500
-
+        for field in ["nombre","apellido","email","idcliente","idperfil","activo"]:
+            if field in data:
+                setattr(user, field, data[field])
+        if "password" in data and data["password"]:
+            user.password_hash = generate_password_hash(data["password"], method="pbkdf2:sha256")
+        db.session.commit()
+        return jsonify(user.as_dict())
 
     @app.route("/admin/usuarios/<int:idusuario>", methods=["DELETE"])
     @jwt_required()
     def admin_delete_usuario(idusuario):
         claims = get_jwt()
-
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
-
         user = Usuario.query.get_or_404(idusuario)
-
         db.session.delete(user)
         db.session.commit()
-
         return jsonify({"message": "Usuario eliminado"})
-
 
 
     # ==========================
@@ -2529,56 +2258,6 @@ def create_app():
                 "error": "Debe indicar al menos un paquete contratado en 'paquetes' o 'idpaquetes'"
             }), 400
 
-        # =====================================================
-        # Validación contractual: límite mínimo de usuarios
-        # =====================================================
-        limite_usuarios_raw = cliente_data.get("limite_usuarios")
-
-        if limite_usuarios_raw not in (None, ""):
-            try:
-                limite_usuarios_int = int(limite_usuarios_raw)
-            except Exception:
-                return jsonify({
-                    "error": "Límite de usuarios inválido",
-                    "detalle": "limite_usuarios debe ser un valor numérico."
-                }), 400
-
-            if limite_usuarios_int < 1:
-                return jsonify({
-                    "error": "Límite de usuarios inválido",
-                    "detalle": (
-                        "El cliente debe tener al menos 1 usuario permitido, "
-                        "porque el registro inicial crea un usuario administrador."
-                    )
-                }), 400
-        else:
-            # Si no llega límite, por seguridad dejamos mínimo 1,
-            # porque este endpoint crea el usuario administrador inicial.
-            limite_usuarios_int = 1
-
-        # =====================================================
-        # Validación contractual: límite de sesiones
-        # =====================================================
-        limite_sesiones_raw = cliente_data.get("limite_sesiones")
-
-        if limite_sesiones_raw not in (None, ""):
-            try:
-                limite_sesiones_int = int(limite_sesiones_raw)
-            except Exception:
-                return jsonify({
-                    "error": "Límite de sesiones inválido",
-                    "detalle": "limite_sesiones debe ser un valor numérico."
-                }), 400
-
-            if limite_sesiones_int < 1:
-                return jsonify({
-                    "error": "Límite de sesiones inválido",
-                    "detalle": "El cliente debe tener al menos 1 sesión concurrente permitida."
-                }), 400
-        else:
-            # Si no llega límite, por seguridad dejamos mínimo 1.
-            limite_sesiones_int = 1
-
         try:
             # =====================================================
             # 1. Resolver paquetes contratados
@@ -2613,18 +2292,26 @@ def create_app():
             # 2. Crear Cliente
             # =====================================================
             cliente = Cliente(
-                nombre=str(cliente_data["nombre"]).strip(),
-                nit=str(cliente_data.get("nit")).strip() if cliente_data.get("nit") else None,
-                email=str(cliente_data.get("email")).strip().lower() if cliente_data.get("email") else None,
+                nombre=cliente_data["nombre"],
+                nit=cliente_data.get("nit"),
+                email=cliente_data.get("email"),
                 activo=bool(cliente_data.get("activo", True)),
-                pais=str(cliente_data.get("pais")).strip() if cliente_data.get("pais") else None,
-                ciudad=str(cliente_data.get("ciudad")).strip() if cliente_data.get("ciudad") else None,
-                direccion=str(cliente_data.get("direccion")).strip() if cliente_data.get("direccion") else None,
-                telefono1=str(cliente_data.get("telefono1")).strip() if cliente_data.get("telefono1") else None,
-                logo_url=str(cliente_data.get("logo_url")).strip() if cliente_data.get("logo_url") else None,
-                limite_usuarios=limite_usuarios_int,
-                limite_sesiones=limite_sesiones_int,
-                timezone=cliente_data.get("timezone") or "America/Bogota"
+                pais=cliente_data.get("pais"),
+                ciudad=cliente_data.get("ciudad"),
+                direccion=cliente_data.get("direccion"),
+                telefono1=cliente_data.get("telefono1"),
+                logo_url=cliente_data.get("logo_url"),
+                limite_usuarios=(
+                    int(cliente_data["limite_usuarios"])
+                    if cliente_data.get("limite_usuarios") not in (None, "")
+                    else None
+                ),
+                limite_sesiones=(
+                    int(cliente_data["limite_sesiones"])
+                    if cliente_data.get("limite_sesiones") not in (None, "")
+                    else None
+                ),
+                timezone=cliente_data.get("timezone", "America/Bogota")
             )
 
             db.session.add(cliente)
@@ -2725,9 +2412,9 @@ def create_app():
             usuario_admin = Usuario(
                 idcliente=cliente.idcliente,
                 idperfil=perfil_admin.idperfil,
-                nombre=str(usuario_data["nombre"]).strip(),
-                apellido=str(usuario_data.get("apellido")).strip() if usuario_data.get("apellido") else None,
-                email=str(usuario_data["email"]).strip().lower(),
+                nombre=usuario_data["nombre"],
+                apellido=usuario_data.get("apellido"),
+                email=usuario_data["email"],
                 password_hash=password_hash,
                 activo=True
             )
@@ -2756,14 +2443,6 @@ def create_app():
                     "nombre": usuario_admin.nombre,
                     "apellido": usuario_admin.apellido
                 },
-                "control_usuarios": {
-                    "limite_usuarios": cliente.limite_usuarios,
-                    "usuarios_activos": 1,
-                    "cupos_disponibles": max(cliente.limite_usuarios - 1, 0)
-                },
-                "control_sesiones": {
-                    "limite_sesiones": cliente.limite_sesiones
-                },
                 "permisos_asignados": len(permisos_creados)
             }), 201
 
@@ -2771,8 +2450,7 @@ def create_app():
             db.session.rollback()
             return jsonify({
                 "error": "No se pudo registrar el cliente por conflicto de datos únicos.",
-                "detalle": "Probablemente ya existe un usuario con ese email o existe un conflicto de datos únicos.",
-                "debug": str(e)
+                "detalle": str(e)
             }), 409
 
         except Exception as e:
@@ -2781,8 +2459,6 @@ def create_app():
                 "error": "No se pudo registrar el cliente.",
                 "detalle": str(e)
             }), 500
-
-
 
 
     # ==========================
@@ -2876,236 +2552,89 @@ def create_app():
         idcliente = claims.get("idcliente")
         perfilid = claims.get("perfilid")
 
-        # Solo admins de cliente pueden crear usuarios.
-        # El SuperAdmin debe usar /admin/usuarios.
+        # 🔐 Solo admins de cliente pueden crear usuarios
         if perfilid == 0:
-            return jsonify({
-                "error": "SuperAdmin no puede crear usuarios de clientes desde este endpoint"
-            }), 403
+            return jsonify({"error": "SuperAdmin no puede crear usuarios de clientes"}), 403
 
-        data = request.get_json() or {}
+        data = request.get_json()
+        perfil = Perfil.query.filter_by(idperfil=data["idperfil"], idcliente=idcliente).first()
+        if not perfil:
+            return jsonify({"error": "Perfil no válido para este cliente"}), 400
 
-        required = ["idperfil", "nombre", "email", "password"]
-        faltantes = [field for field in required if not data.get(field)]
-
-        if faltantes:
-            return jsonify({
-                "error": "Faltan campos obligatorios",
-                "faltantes": faltantes
-            }), 400
-
-        # Validar límite de usuarios activos del cliente autenticado
-        ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(idcliente)
-        if not ok_cupo:
-            return jsonify(info_cupo), status_cupo
-
-        try:
-            idperfil_nuevo = int(data["idperfil"])
-        except Exception:
-            return jsonify({
-                "error": "Perfil inválido",
-                "detalle": "idperfil debe ser numérico."
-            }), 400
-
-        # Validar que el perfil pertenezca al mismo cliente del JWT
-        perfil, error_perfil, status_perfil = _validar_perfil_cliente(
-            idperfil_nuevo,
-            idcliente
+        password_hash = generate_password_hash(
+            data["password"], method="pbkdf2:sha256", salt_length=16
         )
+        usuario = Usuario(
+            idcliente=idcliente,
+            idperfil=perfil.idperfil,
+            nombre=data["nombre"],
+            apellido=data.get("apellido"),
+            email=data["email"],
+            password_hash=password_hash,
+            activo=True
+        )
+        db.session.add(usuario)
+        db.session.commit()
 
-        if error_perfil:
-            return jsonify(error_perfil), status_perfil
+        return jsonify({
+            "idusuario": usuario.idusuario,
+            "nombre": usuario.nombre,
+            "email": usuario.email,
+            "perfil": perfil.nombre
+        }), 201
 
-        try:
-            password_hash = generate_password_hash(
-                data["password"],
-                method="pbkdf2:sha256",
-                salt_length=16
-            )
-
-            usuario = Usuario(
-                idcliente=idcliente,
-                idperfil=perfil.idperfil,
-                nombre=str(data["nombre"]).strip(),
-                apellido=(str(data.get("apellido")).strip() if data.get("apellido") else None),
-                email=str(data["email"]).strip().lower(),
-                password_hash=password_hash,
-                activo=True
-            )
-
-            db.session.add(usuario)
-            db.session.commit()
-
-            return jsonify({
-                "idusuario": usuario.idusuario,
-                "idcliente": usuario.idcliente,
-                "idperfil": usuario.idperfil,
-                "nombre": usuario.nombre,
-                "apellido": usuario.apellido,
-                "email": usuario.email,
-                "activo": usuario.activo,
-                "perfil": perfil.nombre,
-                "control_usuarios": {
-                    **info_cupo,
-                    "usuarios_activos_despues": (
-                        None
-                        if info_cupo.get("usuarios_activos") is None
-                        else info_cupo["usuarios_activos"] + 1
-                    ),
-                    "cupos_disponibles_despues": (
-                        None
-                        if info_cupo.get("cupos_disponibles") is None
-                        else max(info_cupo["cupos_disponibles"] - 1, 0)
-                    )
-                }
-            }), 201
-
-        except IntegrityError as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo crear el usuario por conflicto de datos únicos.",
-                "detalle": "Probablemente ya existe un usuario con ese email.",
-                "debug": str(e)
-            }), 409
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo crear el usuario.",
-                "detalle": str(e)
-            }), 500
 
 
     @app.route("/usuarios/<int:idusuario>", methods=["PUT"])
     @jwt_required()
     def cliente_update_usuario(idusuario):
         claims = get_jwt()
-
-        if claims["perfilid"] == 0:
-            return jsonify({
-                "error": "SuperAdmin no debe usar este endpoint"
-            }), 403
-
-        idcliente = claims.get("idcliente")
+        if claims["perfilid"] == 0:  
+            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
 
         usuario = Usuario.query.get_or_404(idusuario)
-
-        if usuario.idcliente != idcliente:
+        if usuario.idcliente != claims["idcliente"]:
             return jsonify({"error": "No autorizado"}), 403
 
-        data = request.get_json() or {}
+        data = request.get_json()
+        usuario.nombre = data.get("nombre", usuario.nombre)
+        usuario.apellido = data.get("apellido", usuario.apellido)
+        usuario.email = data.get("email", usuario.email)
 
-        try:
-            if "nombre" in data:
-                usuario.nombre = str(data["nombre"]).strip()
-
-            if "apellido" in data:
-                usuario.apellido = str(data["apellido"]).strip() if data["apellido"] else None
-
-            if "email" in data:
-                usuario.email = str(data["email"]).strip().lower()
-
-            # Opcional: si tu frontend cliente permite cambiar perfil,
-            # esta parte ya queda lista y segura.
-            if "idperfil" in data and data["idperfil"] not in (None, ""):
-                try:
-                    nuevo_idperfil = int(data["idperfil"])
-                except Exception:
-                    return jsonify({
-                        "error": "Perfil inválido",
-                        "detalle": "idperfil debe ser numérico."
-                    }), 400
-
-                perfil, error_perfil, status_perfil = _validar_perfil_cliente(
-                    nuevo_idperfil,
-                    idcliente
-                )
-
-                if error_perfil:
-                    return jsonify(error_perfil), status_perfil
-
-                usuario.idperfil = perfil.idperfil
-
-            # Opcional: si más adelante permites activar/inactivar desde esta página,
-            # validamos cupo cuando se intente activar.
-            if "activo" in data:
-                nuevo_activo = _bool_from_payload(data.get("activo"), default=usuario.activo)
-
-                if nuevo_activo and not usuario.activo:
-                    ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(
-                        idcliente,
-                        excluir_idusuario=usuario.idusuario
-                    )
-
-                    if not ok_cupo:
-                        return jsonify(info_cupo), status_cupo
-
-                usuario.activo = nuevo_activo
-
-            if "password" in data and data["password"]:
-                usuario.password_hash = generate_password_hash(
-                    data["password"],
-                    method="pbkdf2:sha256",
-                    salt_length=16
-                )
-
-            db.session.commit()
-            return jsonify(usuario.as_dict())
-
-        except IntegrityError as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo actualizar el usuario por conflicto de datos únicos.",
-                "detalle": "Probablemente ya existe otro usuario con ese email.",
-                "debug": str(e)
-            }), 409
-
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No se pudo actualizar el usuario.",
-                "detalle": str(e)
-            }), 500
+        if "password" in data and data["password"]:
+            usuario.password_hash = generate_password_hash(
+                data["password"], method="pbkdf2:sha256", salt_length=16
+            )
+        db.session.commit()
+        return jsonify(usuario.as_dict())
 
 
     @app.route("/usuarios/<int:idusuario>", methods=["DELETE"])
     @jwt_required()
     def cliente_delete_usuario(idusuario):
         claims = get_jwt()
-
-        if claims["perfilid"] == 0:
-            return jsonify({
-                "error": "SuperAdmin no debe usar este endpoint"
-            }), 403
+        if claims["perfilid"] == 0:  
+            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
 
         usuario = Usuario.query.get_or_404(idusuario)
-
         if usuario.idcliente != claims["idcliente"]:
             return jsonify({"error": "No autorizado"}), 403
 
         db.session.delete(usuario)
         db.session.commit()
-
         return jsonify({"message": "Usuario eliminado"})
 
 
+    # Consulta de usuarios por cliente Admin
     @app.route("/usuarios", methods=["GET"])
     @jwt_required()
     def cliente_listar_usuarios():
         claims = get_jwt()
-
         if claims["perfilid"] == 0:
-            return jsonify({
-                "error": "SuperAdmin no debe usar este endpoint"
-            }), 403
-
+            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
         idcliente = claims.get("idcliente")
-
         usuarios = Usuario.query.filter_by(idcliente=idcliente).all()
-
         return jsonify([u.as_dict() for u in usuarios])
-
-
 
 
     # para que el frontend consulte el rol y el cliente del token
