@@ -74,7 +74,7 @@ from balance import (
 )
 
 from siigo.siigo_sync_documentos_soporte_staging import sync_documentos_soporte_staging_desde_siigo
-
+from siigo.siigo_insert_documentos_soporte_desde_staging import insertar_documentos_soporte_desde_staging
 
 
 HEADER_MAP = {
@@ -12129,7 +12129,49 @@ def create_app():
             }), 500
 
 
+    @app.route("/siigo/insert-documentos-soporte-desde-staging", methods=["POST"])
+    def siigo_insert_documentos_soporte_desde_staging():
+        """
+        Inserta en siigo_compras únicamente DS nuevos desde staging.
 
+        No actualiza documentos existentes.
+        No inserta Failed, Draft, Rejected, Sent.
+        No usa balance API como saldo definitivo.
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        payload = request.get_json(silent=True) or {}
+
+        fecha_desde = (
+            request.args.get("fecha_desde")
+            or payload.get("fecha_desde")
+        )
+
+        dry_run = (
+            request.args.get("dry_run", "").lower() in ("1", "true", "yes")
+            or bool(payload.get("dry_run"))
+        )
+
+        max_registros = request.args.get("max_registros", default=None, type=int)
+
+        try:
+            resultado = insertar_documentos_soporte_desde_staging(
+                idcliente=idcliente,
+                fecha_desde=fecha_desde,
+                dry_run=dry_run,
+                max_registros=max_registros,
+            )
+
+            return jsonify(resultado), 200
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "Error insertando documentos soporte desde staging",
+                "detalle": str(e),
+            }), 500
 
 
 
