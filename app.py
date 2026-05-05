@@ -5419,11 +5419,20 @@ def create_app():
                     "text": r.text
                 }), 500
 
+            results = []
+
+            if isinstance(data, dict):
+                if isinstance(data.get("results"), list):
+                    results = data.get("results")
+                elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("results"), list):
+                    results = data["data"].get("results")
+
             return jsonify({
                 "modo": "solo_lectura",
                 "mensaje": "Consulta realizada sin guardar información en InsightFlow.",
                 "status_code": r.status_code,
                 "url": url,
+                "cantidad_results": len(results),
                 "data": data
             }), r.status_code
 
