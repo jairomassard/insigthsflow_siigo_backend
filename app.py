@@ -5364,6 +5364,206 @@ def create_app():
         return jsonify(resp), 200
 
 
+    #----ENDPOINT DEBUG consulta documentos soporte
+    @app.route("/siigo/debug-documentos-soporte", methods=["GET"])
+    def siigo_debug_documentos_soporte():
+        """
+        Endpoint temporal SOLO LECTURA.
+        Consulta documentos soporte desde Siigo API y devuelve el JSON crudo.
+
+        No guarda.
+        No actualiza.
+        No borra.
+        No toca siigo_compras.
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        cfg = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+        if not cfg:
+            return jsonify({"error": "Credenciales Siigo no configuradas"}), 400
+
+        auth_data = _siigo_auth_json_for_client(cfg)
+        if not isinstance(auth_data, dict):
+            return jsonify({
+                "error": "Respuesta inesperada del auth de Siigo",
+                "detalle": str(auth_data)
+            }), 400
+
+        token = auth_data.get("access_token")
+        if not token:
+            return jsonify({
+                "error": "No se obtuvo access_token",
+                "detalle": auth_data
+            }), 400
+
+        headers = _siigo_headers_bearer(token)
+        base_url = cfg.base_url.rstrip("/")
+
+        page_size = request.args.get("page_size", default=5, type=int)
+        page = request.args.get("page", default=1, type=int)
+
+        url = f"{base_url}/v1/purchase-support-documents?page_size={page_size}&page={page}"
+
+        try:
+            r = requests.get(url, headers=headers, timeout=90)
+
+            try:
+                data = r.json()
+            except ValueError:
+                return jsonify({
+                    "error": "Siigo respondió algo que no es JSON",
+                    "status_code": r.status_code,
+                    "url": url,
+                    "text": r.text
+                }), 500
+
+            return jsonify({
+                "modo": "solo_lectura",
+                "mensaje": "Consulta realizada sin guardar información en InsightFlow.",
+                "status_code": r.status_code,
+                "url": url,
+                "data": data
+            }), r.status_code
+
+        except Exception as e:
+            return jsonify({
+                "error": "Error consultando documentos soporte en Siigo",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/siigo/debug-documentos-soporte/<string:documento_id>", methods=["GET"])
+    def siigo_debug_documento_soporte_detalle(documento_id):
+        """
+        Endpoint temporal SOLO LECTURA.
+        Consulta un documento soporte específico por ID Siigo.
+
+        No guarda.
+        No actualiza.
+        No borra.
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        cfg = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+        if not cfg:
+            return jsonify({"error": "Credenciales Siigo no configuradas"}), 400
+
+        auth_data = _siigo_auth_json_for_client(cfg)
+        if not isinstance(auth_data, dict):
+            return jsonify({
+                "error": "Respuesta inesperada del auth de Siigo",
+                "detalle": str(auth_data)
+            }), 400
+
+        token = auth_data.get("access_token")
+        if not token:
+            return jsonify({
+                "error": "No se obtuvo access_token",
+                "detalle": auth_data
+            }), 400
+
+        headers = _siigo_headers_bearer(token)
+        base_url = cfg.base_url.rstrip("/")
+
+        url = f"{base_url}/v1/purchase-support-documents/{documento_id}"
+
+        try:
+            r = requests.get(url, headers=headers, timeout=90)
+
+            try:
+                data = r.json()
+            except ValueError:
+                return jsonify({
+                    "error": "Siigo respondió algo que no es JSON",
+                    "status_code": r.status_code,
+                    "url": url,
+                    "text": r.text
+                }), 500
+
+            return jsonify({
+                "modo": "solo_lectura",
+                "mensaje": "Consulta de detalle realizada sin guardar información en InsightFlow.",
+                "status_code": r.status_code,
+                "url": url,
+                "data": data
+            }), r.status_code
+
+        except Exception as e:
+            return jsonify({
+                "error": "Error consultando detalle del documento soporte en Siigo",
+                "detalle": str(e)
+            }), 500
+
+
+
+    @app.route("/siigo/debug-document-types-ds", methods=["GET"])
+    def siigo_debug_document_types_ds():
+        """
+        Endpoint temporal SOLO LECTURA.
+        Consulta tipos de comprobante Documento Soporte en Siigo.
+
+        No guarda nada.
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        cfg = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+        if not cfg:
+            return jsonify({"error": "Credenciales Siigo no configuradas"}), 400
+
+        auth_data = _siigo_auth_json_for_client(cfg)
+        if not isinstance(auth_data, dict):
+            return jsonify({
+                "error": "Respuesta inesperada del auth de Siigo",
+                "detalle": str(auth_data)
+            }), 400
+
+        token = auth_data.get("access_token")
+        if not token:
+            return jsonify({
+                "error": "No se obtuvo access_token",
+                "detalle": auth_data
+            }), 400
+
+        headers = _siigo_headers_bearer(token)
+        base_url = cfg.base_url.rstrip("/")
+
+        url = f"{base_url}/v1/document-types?type=DS"
+
+        try:
+            r = requests.get(url, headers=headers, timeout=90)
+
+            try:
+                data = r.json()
+            except ValueError:
+                return jsonify({
+                    "error": "Siigo respondió algo que no es JSON",
+                    "status_code": r.status_code,
+                    "url": url,
+                    "text": r.text
+                }), 500
+
+            return jsonify({
+                "modo": "solo_lectura",
+                "mensaje": "Consulta de tipos DS realizada sin guardar información.",
+                "status_code": r.status_code,
+                "url": url,
+                "data": data
+            }), r.status_code
+
+        except Exception as e:
+            return jsonify({
+                "error": "Error consultando tipos DS en Siigo",
+                "detalle": str(e)
+            }), 500
+
+
+
 
     # --- ENDPOINT: Reporte de Cuentas por Cobrar (Aging Report) ---
     @app.route("/reportes/cuentas-por-cobrar", methods=["GET"])

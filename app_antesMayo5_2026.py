@@ -9,9 +9,10 @@ from flask_jwt_extended import (
 from flask_cors import cross_origin
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import date, datetime, timezone, timedelta
+from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_permiso_en_paquete
  
 from config import Config
-from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification
+from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
 from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
@@ -29,6 +30,7 @@ from siigo.siigo_sync_refactor import _request_with_retries, _str, siigo_auth_js
 from siigo.siigo_sync_pagos import sync_pagos_egresos_desde_siigo
 from siigo.siigo_sync_compras import sync_compras_desde_siigo
 from sqlalchemy import text, func
+from sqlalchemy.exc import IntegrityError
 from utils import _siigo_headers_bearer, _siigo_auth_json_for_client
 
 from io import BytesIO
@@ -1716,7 +1718,117 @@ def _buscar_cuentas_auxiliar_para_config(idcliente, q=None, limite=20):
     ]
 
 
+#Helpers de control de Usuarios:
+def _bool_from_payload(value, default=False):
+    """
+    Convierte valores enviados desde frontend a boolean real.
+    Evita que strings como 'false' terminen evaluando como True.
+    """
+    if value is None:
+        return default
 
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "si", "sí")
+
+    return bool(value)
+
+
+def _validar_cupo_usuarios_cliente(idcliente, excluir_idusuario=None):
+    """
+    Valida si un cliente todavía tiene cupo para tener usuarios activos.
+
+    - Cuenta solo usuarios activos.
+    - Si excluir_idusuario viene, no cuenta ese usuario.
+      Esto sirve para edición/reactivación/cambio de cliente.
+    - Si limite_usuarios es NULL o <= 0, se interpreta como sin límite configurado
+      para no romper clientes antiguos.
+    """
+
+    cliente = Cliente.query.get(idcliente)
+
+    if not cliente:
+        return False, {
+            "error": "Cliente no encontrado",
+            "detalle": f"No existe un cliente con idcliente={idcliente}."
+        }, 404
+
+    if not cliente.activo:
+        return False, {
+            "error": "Cliente inactivo",
+            "detalle": "No se pueden crear o activar usuarios para un cliente inactivo.",
+            "idcliente": cliente.idcliente,
+            "cliente": cliente.nombre
+        }, 400
+
+    limite = cliente.limite_usuarios
+
+    # Compatibilidad con clientes antiguos sin límite configurado.
+    # Si quieres hacerlo estricto, cambia esta condición para bloquear cuando sea None.
+    if limite is None or limite <= 0:
+        return True, {
+            "idcliente": cliente.idcliente,
+            "cliente": cliente.nombre,
+            "limite_usuarios": limite,
+            "usuarios_activos": None,
+            "cupos_disponibles": None,
+            "sin_limite_configurado": True
+        }, 200
+
+    query = Usuario.query.filter(
+        Usuario.idcliente == idcliente,
+        Usuario.activo.is_(True)
+    )
+
+    if excluir_idusuario:
+        query = query.filter(Usuario.idusuario != excluir_idusuario)
+
+    usuarios_activos = query.count()
+    cupos_disponibles = max(limite - usuarios_activos, 0)
+
+    if usuarios_activos >= limite:
+        return False, {
+            "error": "Límite de usuarios alcanzado",
+            "detalle": (
+                f"El cliente tiene contratado un máximo de {limite} usuarios activos. "
+                f"Actualmente ya tiene {usuarios_activos} usuarios activos."
+            ),
+            "idcliente": cliente.idcliente,
+            "cliente": cliente.nombre,
+            "limite_usuarios": limite,
+            "usuarios_activos": usuarios_activos,
+            "cupos_disponibles": 0
+        }, 409
+
+    return True, {
+        "idcliente": cliente.idcliente,
+        "cliente": cliente.nombre,
+        "limite_usuarios": limite,
+        "usuarios_activos": usuarios_activos,
+        "cupos_disponibles": cupos_disponibles
+    }, 200
+
+
+def _validar_perfil_cliente(idperfil, idcliente):
+    """
+    Valida que el perfil exista y pertenezca al cliente indicado.
+    """
+    perfil = Perfil.query.filter_by(
+        idperfil=idperfil,
+        idcliente=idcliente
+    ).first()
+
+    if not perfil:
+        return None, {
+            "error": "Perfil no válido",
+            "detalle": "El perfil enviado no existe o no pertenece al cliente seleccionado.",
+            "idperfil": idperfil,
+            "idcliente": idcliente
+        }, 400
+
+    return perfil, None, None
 
 
 # ENDPOINTS DEL SISTEMA
@@ -1963,66 +2075,143 @@ def create_app():
         return jsonify({"message": "Cliente eliminado"})
 
 
+
+
     @app.route("/clientes/<int:idcliente>/full_delete", methods=["DELETE"])
     @jwt_required()
     def delete_cliente_total(idcliente):
         """
         Elimina por completo un cliente y toda su data relacionada.
+
         Requiere doble confirmación:
-        - 1ra: el modal en el frontend
-        - 2da: el parámetro ?confirm=true en la URL
+        - 1ra: modal en frontend.
+        - 2da: parámetro ?confirm=true en la URL.
+
         Solo SuperAdmin puede ejecutar esta acción.
+
+        Importante:
+        - Borra primero tablas hijas.
+        - Luego tablas padre.
+        - Al final elimina el registro del cliente.
+        - No borra vistas directamente, como facturas_enriquecidas.
         """
+
         claims = get_jwt()
-        if claims["perfilid"] != 0:
+
+        if claims.get("perfilid") != 0:
             return jsonify({"error": "No autorizado"}), 403
 
-        # Confirmación requerida
         confirm = request.args.get("confirm", "false").lower()
+
         if confirm != "true":
             return jsonify({
-                "warning": "⚠️ Falta confirmación final. "
-                        "Para eliminar definitivamente, agrega '?confirm=true' al endpoint.",
+                "warning": (
+                    "⚠️ Falta confirmación final. "
+                    "Para eliminar definitivamente, agrega '?confirm=true' al endpoint."
+                ),
                 "example": f"/clientes/{idcliente}/full_delete?confirm=true"
             }), 400
 
-        cliente = Cliente.query.get_or_404(idcliente)
+        cliente = Cliente.query.get(idcliente)
 
-        modelos_relacionados = [
-            Usuario,
-            Perfil,
-            Permiso,
-            PerfilPermiso,
-            SesionActiva,
-            SiigoCredencial,
-            SiigoFactura,
-            SiigoFacturaItem,
-            SiigoVendedor,
-            SiigoCentroCosto,
-            SiigoCustomer,
-            SiigoNotaCredito,
-            SiigoPagoProveedor,
-            SiigoCompra,
-            SiigoCompraItem,
-            SiigoProveedor,
-            SiigoCuentasPorCobrar,
-            SiigoNomina,
-            SiigoProducto,
-            BalancePrueba,
-        ]
+        if not cliente:
+            return jsonify({
+                "error": f"No existe un cliente con idcliente={idcliente}"
+            }), 404
+
+        nombre_cliente = cliente.nombre
 
         resumen = {}
-        for modelo in modelos_relacionados:
-            count = modelo.query.filter_by(idcliente=idcliente).delete(synchronize_session=False)
-            resumen[modelo.__tablename__] = count
 
-        db.session.delete(cliente)
-        db.session.commit()
+        try:
+            """
+            Orden seguro basado en las FK reales confirmadas en Railway:
 
-        return jsonify({
-            "message": f"✅ Cliente '{cliente.nombre}' y toda su información fueron eliminados correctamente.",
-            "detalles": resumen
-        }), 200
+            - perfil_permisos depende de permisos y perfiles.
+            - usuarios depende de perfiles.
+            - siigo_factura_items depende de siigo_facturas.
+            - siigo_cuentasporcobrar depende de siigo_compras.
+            - clientes se elimina al final.
+            - facturas_enriquecidas NO se elimina porque es una vista.
+            """
+
+            tablas_ordenadas = [
+                # Seguridad / usuarios / permisos
+                "sesiones_activas",
+                "perfil_permisos",
+                "usuarios",
+                "permisos",
+                "perfiles",
+
+                # Licenciamiento / paquetes contratados
+                "cliente_paquetes",
+
+                # Facturación / cartera / ingresos
+                "siigo_factura_items",
+                "siigo_pagos_recibidos",
+                "siigo_notas_credito",
+                "siigo_facturas",
+
+                # Compras / cuentas por pagar
+                "siigo_cuentasporcobrar",
+                "siigo_compras_items",
+                "siigo_pagos_proveedores",
+                "siigo_compras",
+
+                # Catálogos Siigo
+                "siigo_centros_costo",
+                "siigo_customers",
+                "siigo_proveedores",
+                "siigo_productos",
+                "siigo_vendedores",
+                "siigo_nomina",
+
+                # Configuración Siigo / sincronización
+                "siigo_sync_logs",
+                "siigo_sync_metrics",
+                "siigo_sync_config",
+                "siigo_credenciales",
+
+                # Información financiera / contable
+                "balance_prueba",
+                "auxiliar_saldos_corte",
+                "auxiliar_contable",
+
+                # Configuración del dashboard / módulos / notificaciones
+                "dashboard_resumen_config",
+                "modulos_disponibles",
+                "system_notifications",
+            ]
+
+            for tabla in tablas_ordenadas:
+                result = db.session.execute(
+                    text(f'DELETE FROM public."{tabla}" WHERE idcliente = :idcliente'),
+                    {"idcliente": idcliente}
+                )
+
+                resumen[tabla] = result.rowcount if result.rowcount is not None else 0
+
+            db.session.delete(cliente)
+            db.session.commit()
+
+            return jsonify({
+                "message": f"✅ Cliente '{nombre_cliente}' y toda su información fueron eliminados correctamente.",
+                "idcliente": idcliente,
+                "detalles": resumen
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+
+            return jsonify({
+                "error": "No se pudo eliminar completamente el cliente.",
+                "detalle": str(e),
+                "idcliente": idcliente,
+                "recomendacion": (
+                    "La transacción fue reversada. Revisa si existe alguna nueva tabla relacionada "
+                    "con idcliente o alguna llave foránea adicional no contemplada."
+                )
+            }), 500
 
 
 
@@ -2084,66 +2273,227 @@ def create_app():
         return jsonify({"message": "Perfil eliminado"})
 
 
+
     # ==========================
     # Superadmin CRUD Usuarios
     # ==========================
+
     @app.route("/admin/usuarios", methods=["GET"])
     @jwt_required()
     def admin_get_usuarios():
         claims = get_jwt()
-        if claims["perfilid"] != 0:  
+
+        if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
+
         usuarios = Usuario.query.all()
         return jsonify([u.as_dict() for u in usuarios])
+
 
     @app.route("/admin/usuarios", methods=["POST"])
     @jwt_required()
     def admin_crear_usuario():
         claims = get_jwt()
+
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
 
         data = request.get_json() or {}
-        user = Usuario(
-            idcliente=data["idcliente"],
-            idperfil=data["idperfil"],
-            nombre=data["nombre"],
-            apellido=data.get("apellido"),  # NUEVO
-            email=data["email"],
-            password_hash=generate_password_hash(data["password"], method="pbkdf2:sha256"),
-            activo=True
-        )
-        db.session.add(user)
-        db.session.commit()
-        return jsonify(user.as_dict()), 201
+
+        required = ["idcliente", "idperfil", "nombre", "email", "password"]
+        faltantes = [field for field in required if not data.get(field)]
+
+        if faltantes:
+            return jsonify({
+                "error": "Faltan campos obligatorios",
+                "faltantes": faltantes
+            }), 400
+
+        try:
+            idcliente = int(data["idcliente"])
+            idperfil = int(data["idperfil"])
+        except Exception:
+            return jsonify({
+                "error": "Datos inválidos",
+                "detalle": "idcliente e idperfil deben ser valores numéricos."
+            }), 400
+
+        # Validar que el perfil pertenezca al cliente seleccionado
+        perfil, error_perfil, status_perfil = _validar_perfil_cliente(idperfil, idcliente)
+        if error_perfil:
+            return jsonify(error_perfil), status_perfil
+
+        # Validar límite de usuarios activos
+        ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(idcliente)
+        if not ok_cupo:
+            return jsonify(info_cupo), status_cupo
+
+        try:
+            user = Usuario(
+                idcliente=idcliente,
+                idperfil=perfil.idperfil,
+                nombre=str(data["nombre"]).strip(),
+                apellido=(str(data.get("apellido")).strip() if data.get("apellido") else None),
+                email=str(data["email"]).strip().lower(),
+                password_hash=generate_password_hash(
+                    data["password"],
+                    method="pbkdf2:sha256",
+                    salt_length=16
+                ),
+                activo=True
+            )
+
+            db.session.add(user)
+            db.session.commit()
+
+            response = user.as_dict()
+            response["control_usuarios"] = {
+                **info_cupo,
+                "usuarios_activos_despues": (
+                    None
+                    if info_cupo.get("usuarios_activos") is None
+                    else info_cupo["usuarios_activos"] + 1
+                ),
+                "cupos_disponibles_despues": (
+                    None
+                    if info_cupo.get("cupos_disponibles") is None
+                    else max(info_cupo["cupos_disponibles"] - 1, 0)
+                )
+            }
+
+            return jsonify(response), 201
+
+        except IntegrityError as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo crear el usuario por conflicto de datos únicos.",
+                "detalle": "Probablemente ya existe un usuario con ese email.",
+                "debug": str(e)
+            }), 409
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo crear el usuario.",
+                "detalle": str(e)
+            }), 500
 
 
     @app.route("/admin/usuarios/<int:idusuario>", methods=["PUT"])
     @jwt_required()
     def admin_update_usuario(idusuario):
         claims = get_jwt()
+
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
+
         user = Usuario.query.get_or_404(idusuario)
         data = request.get_json() or {}
-        for field in ["nombre","apellido","email","idcliente","idperfil","activo"]:
-            if field in data:
-                setattr(user, field, data[field])
-        if "password" in data and data["password"]:
-            user.password_hash = generate_password_hash(data["password"], method="pbkdf2:sha256")
-        db.session.commit()
-        return jsonify(user.as_dict())
+
+        nuevo_idcliente = user.idcliente
+        nuevo_idperfil = user.idperfil
+        nuevo_activo = user.activo
+
+        if "idcliente" in data and data["idcliente"] not in (None, ""):
+            try:
+                nuevo_idcliente = int(data["idcliente"])
+            except Exception:
+                return jsonify({
+                    "error": "idcliente inválido",
+                    "detalle": "idcliente debe ser numérico."
+                }), 400
+
+        if "idperfil" in data and data["idperfil"] not in (None, ""):
+            try:
+                nuevo_idperfil = int(data["idperfil"])
+            except Exception:
+                return jsonify({
+                    "error": "idperfil inválido",
+                    "detalle": "idperfil debe ser numérico."
+                }), 400
+
+        if "activo" in data:
+            nuevo_activo = _bool_from_payload(data.get("activo"), default=user.activo)
+
+        # Si el usuario queda activo, validar cupo del cliente destino.
+        # Esto cubre:
+        # - Reactivar usuario.
+        # - Mover usuario a otro cliente.
+        # - Mantener activo en el mismo cliente, excluyéndose a sí mismo.
+        if nuevo_activo:
+            ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(
+                nuevo_idcliente,
+                excluir_idusuario=user.idusuario
+            )
+
+            if not ok_cupo:
+                return jsonify(info_cupo), status_cupo
+
+        # Validar que el perfil pertenezca al cliente destino
+        if nuevo_idperfil:
+            perfil, error_perfil, status_perfil = _validar_perfil_cliente(
+                nuevo_idperfil,
+                nuevo_idcliente
+            )
+
+            if error_perfil:
+                return jsonify(error_perfil), status_perfil
+
+        try:
+            if "nombre" in data:
+                user.nombre = str(data["nombre"]).strip()
+
+            if "apellido" in data:
+                user.apellido = str(data["apellido"]).strip() if data["apellido"] else None
+
+            if "email" in data:
+                user.email = str(data["email"]).strip().lower()
+
+            user.idcliente = nuevo_idcliente
+            user.idperfil = nuevo_idperfil
+            user.activo = nuevo_activo
+
+            if "password" in data and data["password"]:
+                user.password_hash = generate_password_hash(
+                    data["password"],
+                    method="pbkdf2:sha256",
+                    salt_length=16
+                )
+
+            db.session.commit()
+            return jsonify(user.as_dict())
+
+        except IntegrityError as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo actualizar el usuario por conflicto de datos únicos.",
+                "detalle": "Probablemente ya existe otro usuario con ese email.",
+                "debug": str(e)
+            }), 409
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo actualizar el usuario.",
+                "detalle": str(e)
+            }), 500
+
 
     @app.route("/admin/usuarios/<int:idusuario>", methods=["DELETE"])
     @jwt_required()
     def admin_delete_usuario(idusuario):
         claims = get_jwt()
+
         if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
+
         user = Usuario.query.get_or_404(idusuario)
+
         db.session.delete(user)
         db.session.commit()
+
         return jsonify({"message": "Usuario eliminado"})
+
 
 
     # ==========================
@@ -2154,85 +2504,317 @@ def create_app():
     @jwt_required()
     def registro_inicial_cliente():
         claims = get_jwt()
-        if claims["perfilid"] != 0:  # Solo SuperAdmin puede hacerlo
+
+        if claims["perfilid"] != 0:
             return jsonify({"error": "No autorizado"}), 403
 
-        data = request.get_json()
+        data = request.get_json() or {}
 
-        # 1️⃣ Crear Cliente
-        cliente = Cliente(
-            nombre=data["cliente"]["nombre"],
-            nit=data["cliente"].get("nit"),
-            email=data["cliente"].get("email"),
-            activo=True
-        )
-        db.session.add(cliente)
-        db.session.flush()  # Para obtener idcliente antes de commit
+        cliente_data = data.get("cliente") or {}
+        usuario_data = data.get("usuario") or {}
 
-        # 2️⃣ Crear Perfil Administrador
-        perfil_admin = Perfil(
-            idcliente=cliente.idcliente,
-            nombre="Administrador",
-            descripcion="Perfil administrador del cliente"
-        )
-        db.session.add(perfil_admin)
-        db.session.flush()
+        paquetes_codigos = data.get("paquetes") or []
+        idpaquetes = data.get("idpaquetes") or []
 
-        # 3️⃣ Clonar permisos base del cliente 1
-        permisos_base = Permiso.query.filter_by(idcliente=1).all()
-        for p in permisos_base:
-            nuevo = Permiso(
-                idcliente=cliente.idcliente,
-                nombre=p.nombre,
-                codigo=p.codigo,
-                descripcion=p.descripcion,
-                activo=p.activo
+        if not cliente_data.get("nombre"):
+            return jsonify({"error": "Falta nombre del cliente"}), 400
+
+        if not usuario_data.get("nombre") or not usuario_data.get("email") or not usuario_data.get("password"):
+            return jsonify({
+                "error": "Faltan datos del usuario administrador: nombre, email o password"
+            }), 400
+
+        if not paquetes_codigos and not idpaquetes:
+            return jsonify({
+                "error": "Debe indicar al menos un paquete contratado en 'paquetes' o 'idpaquetes'"
+            }), 400
+
+        # =====================================================
+        # Validación contractual: límite mínimo de usuarios
+        # =====================================================
+        limite_usuarios_raw = cliente_data.get("limite_usuarios")
+
+        if limite_usuarios_raw not in (None, ""):
+            try:
+                limite_usuarios_int = int(limite_usuarios_raw)
+            except Exception:
+                return jsonify({
+                    "error": "Límite de usuarios inválido",
+                    "detalle": "limite_usuarios debe ser un valor numérico."
+                }), 400
+
+            if limite_usuarios_int < 1:
+                return jsonify({
+                    "error": "Límite de usuarios inválido",
+                    "detalle": (
+                        "El cliente debe tener al menos 1 usuario permitido, "
+                        "porque el registro inicial crea un usuario administrador."
+                    )
+                }), 400
+        else:
+            # Si no llega límite, por seguridad dejamos mínimo 1,
+            # porque este endpoint crea el usuario administrador inicial.
+            limite_usuarios_int = 1
+
+        # =====================================================
+        # Validación contractual: límite de sesiones
+        # =====================================================
+        limite_sesiones_raw = cliente_data.get("limite_sesiones")
+
+        if limite_sesiones_raw not in (None, ""):
+            try:
+                limite_sesiones_int = int(limite_sesiones_raw)
+            except Exception:
+                return jsonify({
+                    "error": "Límite de sesiones inválido",
+                    "detalle": "limite_sesiones debe ser un valor numérico."
+                }), 400
+
+            if limite_sesiones_int < 1:
+                return jsonify({
+                    "error": "Límite de sesiones inválido",
+                    "detalle": "El cliente debe tener al menos 1 sesión concurrente permitida."
+                }), 400
+        else:
+            # Si no llega límite, por seguridad dejamos mínimo 1.
+            limite_sesiones_int = 1
+
+        try:
+            # =====================================================
+            # 1. Resolver paquetes contratados
+            # =====================================================
+            q_paquetes = PaqueteInsightflow.query.filter_by(activo=True)
+
+            if paquetes_codigos:
+                paquetes_codigos = [
+                    str(c).strip().lower()
+                    for c in paquetes_codigos
+                    if str(c).strip()
+                ]
+
+                paquetes = (
+                    q_paquetes
+                    .filter(PaqueteInsightflow.codigo.in_(paquetes_codigos))
+                    .all()
+                )
+            else:
+                paquetes = (
+                    q_paquetes
+                    .filter(PaqueteInsightflow.idpaquete.in_(idpaquetes))
+                    .all()
+                )
+
+            if not paquetes:
+                return jsonify({
+                    "error": "No se encontraron paquetes activos con los datos enviados."
+                }), 400
+
+            # =====================================================
+            # 2. Crear Cliente
+            # =====================================================
+            cliente = Cliente(
+                nombre=str(cliente_data["nombre"]).strip(),
+                nit=str(cliente_data.get("nit")).strip() if cliente_data.get("nit") else None,
+                email=str(cliente_data.get("email")).strip().lower() if cliente_data.get("email") else None,
+                activo=bool(cliente_data.get("activo", True)),
+                pais=str(cliente_data.get("pais")).strip() if cliente_data.get("pais") else None,
+                ciudad=str(cliente_data.get("ciudad")).strip() if cliente_data.get("ciudad") else None,
+                direccion=str(cliente_data.get("direccion")).strip() if cliente_data.get("direccion") else None,
+                telefono1=str(cliente_data.get("telefono1")).strip() if cliente_data.get("telefono1") else None,
+                logo_url=str(cliente_data.get("logo_url")).strip() if cliente_data.get("logo_url") else None,
+                limite_usuarios=limite_usuarios_int,
+                limite_sesiones=limite_sesiones_int,
+                timezone=cliente_data.get("timezone") or "America/Bogota"
             )
-            db.session.add(nuevo)
-        db.session.flush()
 
-        # 4️⃣ Asignar todos los permisos al perfil administrador del nuevo cliente
-        for nuevo_permiso in Permiso.query.filter_by(idcliente=cliente.idcliente).all():
-            rel = PerfilPermiso(
+            db.session.add(cliente)
+            db.session.flush()
+
+            # =====================================================
+            # 3. Asociar paquetes al cliente
+            # =====================================================
+            for paquete in paquetes:
+                db.session.add(ClientePaquete(
+                    idcliente=cliente.idcliente,
+                    idpaquete=paquete.idpaquete,
+                    activo=True,
+                    fecha_inicio=date.today(),
+                    fecha_fin=None
+                ))
+
+            db.session.flush()
+
+            # =====================================================
+            # 4. Obtener códigos permitidos por paquetes contratados
+            # =====================================================
+            codigos_permitidos = obtener_codigos_permitidos_cliente(cliente.idcliente)
+
+            if not codigos_permitidos:
+                db.session.rollback()
+                return jsonify({
+                    "error": "Los paquetes seleccionados no tienen permisos activos configurados."
+                }), 400
+
+            # =====================================================
+            # 5. Crear Perfil Administrador
+            # =====================================================
+            perfil_admin = Perfil(
+                idcliente=cliente.idcliente,
+                nombre="Administrador",
+                descripcion="Perfil administrador del cliente"
+            )
+
+            db.session.add(perfil_admin)
+            db.session.flush()
+
+            # =====================================================
+            # 6. Clonar solo permisos incluidos en el paquete
+            # =====================================================
+            permisos_base = (
+                Permiso.query
+                .filter(
+                    Permiso.idcliente == 1,
+                    Permiso.codigo.in_(codigos_permitidos),
+                    Permiso.activo.is_(True)
+                )
+                .all()
+            )
+
+            permisos_creados = []
+
+            for p in permisos_base:
+                nuevo = Permiso(
+                    idcliente=cliente.idcliente,
+                    nombre=p.nombre,
+                    codigo=p.codigo,
+                    descripcion=p.descripcion,
+                    activo=p.activo
+                )
+
+                db.session.add(nuevo)
+                db.session.flush()
+
+                permisos_creados.append(nuevo)
+
+            if not permisos_creados:
+                db.session.rollback()
+                return jsonify({
+                    "error": "No se encontraron permisos base en cliente 1 para los códigos del paquete."
+                }), 400
+
+            # =====================================================
+            # 7. Asignar todos los permisos contratados al perfil administrador
+            # =====================================================
+            for permiso in permisos_creados:
+                db.session.add(PerfilPermiso(
+                    idcliente=cliente.idcliente,
+                    idperfil=perfil_admin.idperfil,
+                    idpermiso=permiso.idpermiso,
+                    permitido=True
+                ))
+
+            # =====================================================
+            # 8. Crear Usuario Administrador
+            # =====================================================
+            password_hash = generate_password_hash(
+                usuario_data["password"],
+                method="pbkdf2:sha256",
+                salt_length=16
+            )
+
+            usuario_admin = Usuario(
                 idcliente=cliente.idcliente,
                 idperfil=perfil_admin.idperfil,
-                idpermiso=nuevo_permiso.idpermiso,
-                permitido=True
+                nombre=str(usuario_data["nombre"]).strip(),
+                apellido=str(usuario_data.get("apellido")).strip() if usuario_data.get("apellido") else None,
+                email=str(usuario_data["email"]).strip().lower(),
+                password_hash=password_hash,
+                activo=True
             )
-            db.session.add(rel)
 
-        # 5️⃣ Crear Usuario Administrador
-        password_hash = generate_password_hash(
-            data["usuario"]["password"], method="pbkdf2:sha256", salt_length=16
-        )
-        usuario_admin = Usuario(
-            idcliente=cliente.idcliente,
-            idperfil=perfil_admin.idperfil,
-            nombre=data["usuario"]["nombre"],
-            email=data["usuario"]["email"],
-            password_hash=password_hash,
-            activo=True
-        )
-        db.session.add(usuario_admin)
-        db.session.commit()
+            db.session.add(usuario_admin)
+            db.session.commit()
 
-        return jsonify({
-            "cliente": cliente.as_dict(),
-            "perfil_admin": {
-                "idperfil": perfil_admin.idperfil,
-                "nombre": perfil_admin.nombre
-            },
-            "usuario_admin": {
-                "idusuario": usuario_admin.idusuario,
-                "email": usuario_admin.email,
-                "nombre": usuario_admin.nombre
-            }
-        }), 201
+            return jsonify({
+                "message": "Cliente registrado correctamente con paquete contratado.",
+                "cliente": cliente.as_dict(),
+                "paquetes": [
+                    {
+                        "idpaquete": p.idpaquete,
+                        "codigo": p.codigo,
+                        "nombre": p.nombre
+                    }
+                    for p in paquetes
+                ],
+                "perfil_admin": {
+                    "idperfil": perfil_admin.idperfil,
+                    "nombre": perfil_admin.nombre
+                },
+                "usuario_admin": {
+                    "idusuario": usuario_admin.idusuario,
+                    "email": usuario_admin.email,
+                    "nombre": usuario_admin.nombre,
+                    "apellido": usuario_admin.apellido
+                },
+                "control_usuarios": {
+                    "limite_usuarios": cliente.limite_usuarios,
+                    "usuarios_activos": 1,
+                    "cupos_disponibles": max(cliente.limite_usuarios - 1, 0)
+                },
+                "control_sesiones": {
+                    "limite_sesiones": cliente.limite_sesiones
+                },
+                "permisos_asignados": len(permisos_creados)
+            }), 201
+
+        except IntegrityError as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo registrar el cliente por conflicto de datos únicos.",
+                "detalle": "Probablemente ya existe un usuario con ese email o existe un conflicto de datos únicos.",
+                "debug": str(e)
+            }), 409
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo registrar el cliente.",
+                "detalle": str(e)
+            }), 500
+
+
 
 
     # ==========================
     # Cliente Admin CRUD Perfiles
     # ==========================
+
+    @app.route("/perfiles", methods=["GET"])
+    @jwt_required()
+    def cliente_listar_perfiles():
+        claims = get_jwt()
+
+        if claims["perfilid"] == 0:
+            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
+
+        idcliente = claims.get("idcliente")
+
+        if not idcliente:
+            return jsonify({"error": "Token inválido: falta idcliente"}), 403
+
+        perfiles = (
+            Perfil.query
+            .filter_by(idcliente=idcliente)
+            .order_by(Perfil.nombre.asc())
+            .all()
+        )
+
+        return jsonify([p.as_dict() for p in perfiles]), 200
+
+
+
+
+
     @app.route("/perfiles", methods=["POST"])
     @jwt_required()
     def cliente_crear_perfil():
@@ -2294,89 +2876,236 @@ def create_app():
         idcliente = claims.get("idcliente")
         perfilid = claims.get("perfilid")
 
-        # 🔐 Solo admins de cliente pueden crear usuarios
+        # Solo admins de cliente pueden crear usuarios.
+        # El SuperAdmin debe usar /admin/usuarios.
         if perfilid == 0:
-            return jsonify({"error": "SuperAdmin no puede crear usuarios de clientes"}), 403
+            return jsonify({
+                "error": "SuperAdmin no puede crear usuarios de clientes desde este endpoint"
+            }), 403
 
-        data = request.get_json()
-        perfil = Perfil.query.filter_by(idperfil=data["idperfil"], idcliente=idcliente).first()
-        if not perfil:
-            return jsonify({"error": "Perfil no válido para este cliente"}), 400
+        data = request.get_json() or {}
 
-        password_hash = generate_password_hash(
-            data["password"], method="pbkdf2:sha256", salt_length=16
+        required = ["idperfil", "nombre", "email", "password"]
+        faltantes = [field for field in required if not data.get(field)]
+
+        if faltantes:
+            return jsonify({
+                "error": "Faltan campos obligatorios",
+                "faltantes": faltantes
+            }), 400
+
+        # Validar límite de usuarios activos del cliente autenticado
+        ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(idcliente)
+        if not ok_cupo:
+            return jsonify(info_cupo), status_cupo
+
+        try:
+            idperfil_nuevo = int(data["idperfil"])
+        except Exception:
+            return jsonify({
+                "error": "Perfil inválido",
+                "detalle": "idperfil debe ser numérico."
+            }), 400
+
+        # Validar que el perfil pertenezca al mismo cliente del JWT
+        perfil, error_perfil, status_perfil = _validar_perfil_cliente(
+            idperfil_nuevo,
+            idcliente
         )
-        usuario = Usuario(
-            idcliente=idcliente,
-            idperfil=perfil.idperfil,
-            nombre=data["nombre"],
-            apellido=data.get("apellido"),
-            email=data["email"],
-            password_hash=password_hash,
-            activo=True
-        )
-        db.session.add(usuario)
-        db.session.commit()
 
-        return jsonify({
-            "idusuario": usuario.idusuario,
-            "nombre": usuario.nombre,
-            "email": usuario.email,
-            "perfil": perfil.nombre
-        }), 201
+        if error_perfil:
+            return jsonify(error_perfil), status_perfil
 
+        try:
+            password_hash = generate_password_hash(
+                data["password"],
+                method="pbkdf2:sha256",
+                salt_length=16
+            )
+
+            usuario = Usuario(
+                idcliente=idcliente,
+                idperfil=perfil.idperfil,
+                nombre=str(data["nombre"]).strip(),
+                apellido=(str(data.get("apellido")).strip() if data.get("apellido") else None),
+                email=str(data["email"]).strip().lower(),
+                password_hash=password_hash,
+                activo=True
+            )
+
+            db.session.add(usuario)
+            db.session.commit()
+
+            return jsonify({
+                "idusuario": usuario.idusuario,
+                "idcliente": usuario.idcliente,
+                "idperfil": usuario.idperfil,
+                "nombre": usuario.nombre,
+                "apellido": usuario.apellido,
+                "email": usuario.email,
+                "activo": usuario.activo,
+                "perfil": perfil.nombre,
+                "control_usuarios": {
+                    **info_cupo,
+                    "usuarios_activos_despues": (
+                        None
+                        if info_cupo.get("usuarios_activos") is None
+                        else info_cupo["usuarios_activos"] + 1
+                    ),
+                    "cupos_disponibles_despues": (
+                        None
+                        if info_cupo.get("cupos_disponibles") is None
+                        else max(info_cupo["cupos_disponibles"] - 1, 0)
+                    )
+                }
+            }), 201
+
+        except IntegrityError as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo crear el usuario por conflicto de datos únicos.",
+                "detalle": "Probablemente ya existe un usuario con ese email.",
+                "debug": str(e)
+            }), 409
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo crear el usuario.",
+                "detalle": str(e)
+            }), 500
 
 
     @app.route("/usuarios/<int:idusuario>", methods=["PUT"])
     @jwt_required()
     def cliente_update_usuario(idusuario):
         claims = get_jwt()
-        if claims["perfilid"] == 0:  
-            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
+
+        if claims["perfilid"] == 0:
+            return jsonify({
+                "error": "SuperAdmin no debe usar este endpoint"
+            }), 403
+
+        idcliente = claims.get("idcliente")
 
         usuario = Usuario.query.get_or_404(idusuario)
-        if usuario.idcliente != claims["idcliente"]:
+
+        if usuario.idcliente != idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        data = request.get_json()
-        usuario.nombre = data.get("nombre", usuario.nombre)
-        usuario.apellido = data.get("apellido", usuario.apellido)
-        usuario.email = data.get("email", usuario.email)
+        data = request.get_json() or {}
 
-        if "password" in data and data["password"]:
-            usuario.password_hash = generate_password_hash(
-                data["password"], method="pbkdf2:sha256", salt_length=16
-            )
-        db.session.commit()
-        return jsonify(usuario.as_dict())
+        try:
+            if "nombre" in data:
+                usuario.nombre = str(data["nombre"]).strip()
+
+            if "apellido" in data:
+                usuario.apellido = str(data["apellido"]).strip() if data["apellido"] else None
+
+            if "email" in data:
+                usuario.email = str(data["email"]).strip().lower()
+
+            # Opcional: si tu frontend cliente permite cambiar perfil,
+            # esta parte ya queda lista y segura.
+            if "idperfil" in data and data["idperfil"] not in (None, ""):
+                try:
+                    nuevo_idperfil = int(data["idperfil"])
+                except Exception:
+                    return jsonify({
+                        "error": "Perfil inválido",
+                        "detalle": "idperfil debe ser numérico."
+                    }), 400
+
+                perfil, error_perfil, status_perfil = _validar_perfil_cliente(
+                    nuevo_idperfil,
+                    idcliente
+                )
+
+                if error_perfil:
+                    return jsonify(error_perfil), status_perfil
+
+                usuario.idperfil = perfil.idperfil
+
+            # Opcional: si más adelante permites activar/inactivar desde esta página,
+            # validamos cupo cuando se intente activar.
+            if "activo" in data:
+                nuevo_activo = _bool_from_payload(data.get("activo"), default=usuario.activo)
+
+                if nuevo_activo and not usuario.activo:
+                    ok_cupo, info_cupo, status_cupo = _validar_cupo_usuarios_cliente(
+                        idcliente,
+                        excluir_idusuario=usuario.idusuario
+                    )
+
+                    if not ok_cupo:
+                        return jsonify(info_cupo), status_cupo
+
+                usuario.activo = nuevo_activo
+
+            if "password" in data and data["password"]:
+                usuario.password_hash = generate_password_hash(
+                    data["password"],
+                    method="pbkdf2:sha256",
+                    salt_length=16
+                )
+
+            db.session.commit()
+            return jsonify(usuario.as_dict())
+
+        except IntegrityError as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo actualizar el usuario por conflicto de datos únicos.",
+                "detalle": "Probablemente ya existe otro usuario con ese email.",
+                "debug": str(e)
+            }), 409
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo actualizar el usuario.",
+                "detalle": str(e)
+            }), 500
 
 
     @app.route("/usuarios/<int:idusuario>", methods=["DELETE"])
     @jwt_required()
     def cliente_delete_usuario(idusuario):
         claims = get_jwt()
-        if claims["perfilid"] == 0:  
-            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
+
+        if claims["perfilid"] == 0:
+            return jsonify({
+                "error": "SuperAdmin no debe usar este endpoint"
+            }), 403
 
         usuario = Usuario.query.get_or_404(idusuario)
+
         if usuario.idcliente != claims["idcliente"]:
             return jsonify({"error": "No autorizado"}), 403
 
         db.session.delete(usuario)
         db.session.commit()
+
         return jsonify({"message": "Usuario eliminado"})
 
 
-    # Consulta de usuarios por cliente Admin
     @app.route("/usuarios", methods=["GET"])
     @jwt_required()
     def cliente_listar_usuarios():
         claims = get_jwt()
+
         if claims["perfilid"] == 0:
-            return jsonify({"error": "SuperAdmin no debe usar este endpoint"}), 403
+            return jsonify({
+                "error": "SuperAdmin no debe usar este endpoint"
+            }), 403
+
         idcliente = claims.get("idcliente")
+
         usuarios = Usuario.query.filter_by(idcliente=idcliente).all()
+
         return jsonify([u.as_dict() for u in usuarios])
+
+
 
 
     # para que el frontend consulte el rol y el cliente del token
@@ -3688,10 +4417,37 @@ def create_app():
 
 
 
-    # --- ENDPOINT: Clientes Insights (enriquecido) --- 
+    # --- ENDPOINT: Clientes Insights (optimizado, enriquecido y alineado con Ingresos por Ventas) ---
     @app.route("/reportes/analisis_clientes", methods=["GET"])
     @jwt_required()
     def get_clientes_insights():
+        from sqlalchemy.sql import text
+        from datetime import datetime
+        from collections import defaultdict
+        import re
+
+        def normalizar_cliente(nombre: str) -> str:
+            nombre = (nombre or "").strip().lower()
+            nombre = nombre.replace(".", "").replace(",", "")
+            nombre = re.sub(r"\s+", " ", nombre)
+            return nombre
+
+        def money_float(valor):
+            try:
+                return float(valor or 0)
+            except Exception:
+                return 0.0
+
+        def money_fmt(valor, decimales=0):
+            valor = money_float(valor)
+            return f"$ {valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        def validar_fecha(fecha_str):
+            try:
+                return datetime.strptime(fecha_str, "%Y-%m-%d").date()
+            except Exception:
+                return None
+
         claims = get_jwt()
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
@@ -3703,139 +4459,542 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        desde       = request.args.get("desde")
-        hasta       = request.args.get("hasta")
-        cliente     = request.args.get("cliente")  # filtro por cliente opcional
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        cliente = request.args.get("cliente")
         cost_center = request.args.get("cost_center", type=int)
-        filtro_estado = request.args.get("estado")  # 👈 mismo que en facturas_cliente
+        filtro_estado = request.args.get("estado")
+        limit_facturas = request.args.get("limit_facturas", default=8, type=int)
+
+        if limit_facturas <= 0:
+            limit_facturas = 8
+        if limit_facturas > 30:
+            limit_facturas = 30
 
         try:
             wh = ["f.idcliente = :idcliente"]
-            params = {"idcliente": idcliente}
+            params = {
+                "idcliente": idcliente,
+                "limit_facturas": limit_facturas,
+            }
 
-            if desde:
+            if desde and validar_fecha(desde):
                 wh.append("f.fecha >= :desde")
                 params["desde"] = desde
-            if hasta:
-                wh.append("f.fecha <= :hasta")
+
+            if hasta and validar_fecha(hasta):
+                wh.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params["hasta"] = hasta
+
             if cliente:
                 wh.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
                 params["cliente"] = cliente
+
             if cost_center:
                 wh.append("f.cost_center = :cost_center")
                 params["cost_center"] = cost_center
 
+            estado_sql = """
+                CASE
+                    WHEN ROUND(COALESCE(f.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
+                    WHEN f.vencimiento IS NOT NULL AND f.vencimiento < CURRENT_DATE THEN 'vencido'
+                    WHEN f.vencimiento IS NOT NULL
+                        AND f.vencimiento >= CURRENT_DATE
+                        AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days' THEN 'alerta'
+                    ELSE 'sano'
+                END
+            """
+
+            if filtro_estado:
+                filtro_estado = filtro_estado.lower().strip()
+                if filtro_estado in ["pagado", "vencido", "alerta", "sano"]:
+                    wh.append(f"({estado_sql}) = :estado")
+                    params["estado"] = filtro_estado
+
             where_clause = " AND ".join(wh)
 
-            # --- KPIs por cliente
+            # ---------------------------------------------------------------------
+            # 1. Resumen global
+            # ---------------------------------------------------------------------
+            sql_resumen = text(f"""
+                SELECT
+                    COUNT(DISTINCT f.cliente_nombre) AS clientes_facturados,
+                    COUNT(*) AS cantidad_facturas,
+
+                    -- Conceptos alineados con reporte Ingresos por Ventas
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
+                    -- Cartera
+                    COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
+                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
+                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
+                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer
+                FROM facturas_enriquecidas f
+                WHERE {where_clause}
+            """)
+
+            resumen_row = db.session.execute(sql_resumen, params).mappings().first() or {}
+
+            ventas_netas = money_float(resumen_row.get("ventas_netas"))
+            impuestos = money_float(resumen_row.get("impuestos"))
+            total_facturado_siigo = money_float(resumen_row.get("total_facturado_siigo"))
+            total_pagado = money_float(resumen_row.get("total_pagado"))
+            saldo_pendiente = money_float(resumen_row.get("saldo_pendiente"))
+            saldo_vencido = money_float(resumen_row.get("saldo_vencido"))
+            saldo_por_vencer = money_float(resumen_row.get("saldo_por_vencer"))
+
+            pct_pagado = (total_pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
+            pct_vencido = (saldo_vencido / saldo_pendiente * 100) if saldo_pendiente else 0
+
+            resumen = {
+                "clientes_facturados": int(resumen_row.get("clientes_facturados") or 0),
+                "cantidad_facturas": int(resumen_row.get("cantidad_facturas") or 0),
+
+                "ventas_netas": ventas_netas,
+                "impuestos": impuestos,
+                "total_facturado_siigo": total_facturado_siigo,
+
+                # Compatibilidad con frontend anterior:
+                # total_facturado ahora representa Ventas netas para esta página.
+                "total_facturado": ventas_netas,
+
+                "total_pagado": total_pagado,
+                "saldo_pendiente": saldo_pendiente,
+                "saldo_vencido": saldo_vencido,
+                "saldo_por_vencer": saldo_por_vencer,
+
+                "pct_pagado": round(pct_pagado, 2),
+                "pct_vencido": round(pct_vencido, 2),
+
+                "ventas_netas_str": money_fmt(ventas_netas),
+                "impuestos_str": money_fmt(impuestos),
+                "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+
+                # Compatibilidad con frontend anterior:
+                "total_facturado_str": money_fmt(ventas_netas),
+
+                "total_pagado_str": money_fmt(total_pagado),
+                "saldo_pendiente_str": money_fmt(saldo_pendiente),
+                "saldo_vencido_str": money_fmt(saldo_vencido),
+                "saldo_por_vencer_str": money_fmt(saldo_por_vencer),
+            }
+
+            # ---------------------------------------------------------------------
+            # 2. Clientes principales
+            # ---------------------------------------------------------------------
             sql_clientes = text(f"""
                 SELECT
                     f.cliente_nombre AS cliente,
                     COUNT(*) AS cantidad_facturas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+                    COUNT(DISTINCT f.cost_center) AS cantidad_centros_costo,
+
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
+                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
+                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
+                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer,
+                    MAX(f.fecha) AS ultima_factura
                 FROM facturas_enriquecidas f
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre
-                ORDER BY total_facturado DESC
+                ORDER BY ventas_netas DESC
             """)
-            clientes = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
 
-            # --- Centros de costo por cliente
+            clientes_rows = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
+
+            # ---------------------------------------------------------------------
+            # 3. Centros de costo por cliente
+            # ---------------------------------------------------------------------
             sql_cc = text(f"""
                 SELECT
                     f.cliente_nombre,
                     COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                     f.cost_center,
                     COUNT(*) AS cantidad_facturas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado,
+
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+
                     COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
                 FROM facturas_enriquecidas f
                 LEFT JOIN siigo_centros_costo cc
-                ON f.cost_center = cc.id
+                    ON f.cost_center = cc.id
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
-                ORDER BY total_facturado DESC
+                ORDER BY ventas_netas DESC
             """)
-            centros_costo = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
 
-            # --- Facturas recientes (máx 5 por cliente)
+            centros_rows = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
+
+            centros_por_cliente = defaultdict(list)
+            for r in centros_rows:
+                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+
+                ventas_netas_cc = money_float(r.get("ventas_netas"))
+                impuestos_cc = money_float(r.get("impuestos"))
+                total_siigo_cc = money_float(r.get("total_facturado_siigo"))
+                saldo_cc = money_float(r.get("saldo_pendiente"))
+                pagado_cc = money_float(r.get("total_pagado"))
+
+                centros_por_cliente[cliente_key].append({
+                    "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
+                    "cost_center": r.get("cost_center"),
+                    "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
+
+                    "ventas_netas": ventas_netas_cc,
+                    "impuestos": impuestos_cc,
+                    "total_facturado_siigo": total_siigo_cc,
+
+                    # Compatibilidad:
+                    "total_facturado": ventas_netas_cc,
+
+                    "total_pagado": pagado_cc,
+                    "saldo_pendiente": saldo_cc,
+
+                    "ventas_netas_str": money_fmt(ventas_netas_cc),
+                    "impuestos_str": money_fmt(impuestos_cc),
+                    "total_facturado_siigo_str": money_fmt(total_siigo_cc),
+
+                    # Compatibilidad:
+                    "total_facturado_str": money_fmt(ventas_netas_cc),
+
+                    "saldo_pendiente_str": money_fmt(saldo_cc),
+                })
+
+            # ---------------------------------------------------------------------
+            # 4. Estados por cliente
+            # ---------------------------------------------------------------------
+            sql_estados = text(f"""
+                SELECT
+                    f.cliente_nombre,
+                    ({estado_sql}) AS estado_cartera,
+                    COUNT(*) AS cantidad,
+                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
+                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
+                FROM facturas_enriquecidas f
+                WHERE {where_clause}
+                GROUP BY f.cliente_nombre, estado_cartera
+            """)
+
+            estados_rows = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
+
+            estados_por_cliente = defaultdict(lambda: {
+                "pagado": 0,
+                "sano": 0,
+                "alerta": 0,
+                "vencido": 0,
+            })
+
+            estados_saldo_por_cliente = defaultdict(lambda: {
+                "pagado": 0.0,
+                "sano": 0.0,
+                "alerta": 0.0,
+                "vencido": 0.0,
+            })
+
+            for r in estados_rows:
+                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+                estado = r.get("estado_cartera") or "sano"
+                cantidad = int(r.get("cantidad") or 0)
+                saldo_estado = money_float(r.get("saldo_pendiente"))
+
+                estados_por_cliente[cliente_key][estado] = cantidad
+                estados_saldo_por_cliente[cliente_key][estado] = saldo_estado
+
+            # ---------------------------------------------------------------------
+            # 5. Facturas recientes por cliente
+            # ---------------------------------------------------------------------
             sql_facturas = text(f"""
                 WITH ranked AS (
                     SELECT
                         f.idfactura,
                         f.fecha,
                         f.vencimiento,
+
+                        f.subtotal AS ventas_netas,
+                        f.impuestos_total AS impuestos,
+                        f.total AS total_facturado_siigo,
+
                         f.total,
                         (f.total - f.saldo) AS pagado,
                         f.saldo AS pendiente,
                         f.public_url,
                         f.cliente_nombre,
-                        ROW_NUMBER() OVER (PARTITION BY f.cliente_nombre ORDER BY f.fecha DESC) AS rn
+                        f.cost_center,
+                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                        ({estado_sql}) AS estado_cartera,
+                        CASE
+                            WHEN f.vencimiento IS NULL THEN NULL
+                            ELSE (f.vencimiento - CURRENT_DATE)
+                        END AS dias_vencimiento,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY f.cliente_nombre
+                            ORDER BY f.fecha DESC, f.idfactura DESC
+                        ) AS rn
                     FROM facturas_enriquecidas f
+                    LEFT JOIN siigo_centros_costo cc
+                        ON f.cost_center = cc.id
                     WHERE {where_clause}
                 )
-                SELECT * FROM ranked WHERE rn <= 5;
+                SELECT *
+                FROM ranked
+                WHERE rn <= :limit_facturas
+                ORDER BY cliente_nombre, fecha DESC
             """)
-            rows = [dict(r) for r in db.session.execute(sql_facturas, params).mappings().all()]
-            enriched = enriquecer_facturas(rows)
 
-            # aplicar filtro de estado si corresponde
-            if filtro_estado:
-                enriched = [r for r in enriched if r["estado_cartera"] == filtro_estado.lower()]
+            facturas_rows = [dict(r) for r in db.session.execute(sql_facturas, params).mappings().all()]
 
-            # --- Conteo de facturas por estado (agrupado por cliente)
-            sql_estados = text(f"""
-                SELECT
-                    f.cliente_nombre,
-                    f.idfactura,
-                    f.fecha,
-                    f.vencimiento,
-                    f.total,
-                    f.saldo
+            facturas_por_cliente = defaultdict(list)
+
+            for r in facturas_rows:
+                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+                fecha = r.get("fecha")
+                vencimiento = r.get("vencimiento")
+
+                ventas_netas_f = money_float(r.get("ventas_netas"))
+                impuestos_f = money_float(r.get("impuestos"))
+                total_siigo_f = money_float(r.get("total_facturado_siigo"))
+
+                total = money_float(r.get("total"))
+                pagado = money_float(r.get("pagado"))
+                pendiente = money_float(r.get("pendiente"))
+                dias_vencimiento = r.get("dias_vencimiento")
+
+                if fecha:
+                    fecha_str = fecha.strftime("%d/%m/%Y") if hasattr(fecha, "strftime") else str(fecha)
+                else:
+                    fecha_str = None
+
+                if vencimiento:
+                    vencimiento_str = vencimiento.strftime("%d/%m/%Y") if hasattr(vencimiento, "strftime") else str(vencimiento)
+                else:
+                    vencimiento_str = None
+
+                facturas_por_cliente[cliente_key].append({
+                    "idfactura": r.get("idfactura"),
+                    "fecha": fecha_str,
+                    "vencimiento": vencimiento_str,
+
+                    "ventas_netas": ventas_netas_f,
+                    "impuestos": impuestos_f,
+                    "total_facturado_siigo": total_siigo_f,
+
+                    "ventas_netas_str": money_fmt(ventas_netas_f),
+                    "impuestos_str": money_fmt(impuestos_f),
+                    "total_facturado_siigo_str": money_fmt(total_siigo_f),
+
+                    # Compatibilidad:
+                    "total": total,
+                    "total_str": money_fmt(total),
+
+                    "pagado": pagado,
+                    "pendiente": pendiente,
+                    "pagado_str": money_fmt(pagado),
+                    "pendiente_str": money_fmt(pendiente),
+                    "public_url": r.get("public_url"),
+                    "cliente_nombre": r.get("cliente_nombre"),
+                    "cliente_key": cliente_key,
+                    "cost_center": r.get("cost_center"),
+                    "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
+                    "estado_cartera": r.get("estado_cartera") or "sano",
+                    "dias_vencimiento": int(dias_vencimiento) if dias_vencimiento is not None else None,
+                })
+
+            # ---------------------------------------------------------------------
+            # 6. Armar clientes enriquecidos
+            # ---------------------------------------------------------------------
+            clientes = []
+
+            for r in clientes_rows:
+                cliente_nombre = r.get("cliente") or "Sin cliente"
+                cliente_key = normalizar_cliente(cliente_nombre)
+
+                ventas_netas = money_float(r.get("ventas_netas"))
+                impuestos = money_float(r.get("impuestos"))
+                total_facturado_siigo = money_float(r.get("total_facturado_siigo"))
+
+                pagado = money_float(r.get("total_pagado"))
+                pendiente = money_float(r.get("saldo_pendiente"))
+                vencido = money_float(r.get("saldo_vencido"))
+                saldo_por_vencer_cliente = money_float(r.get("saldo_por_vencer"))
+
+                pct_cliente_pagado = (pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
+                pct_cliente_pendiente = (pendiente / total_facturado_siigo * 100) if total_facturado_siigo else 0
+                pct_cliente_vencido = (vencido / pendiente * 100) if pendiente else 0
+
+                ultima_factura = r.get("ultima_factura")
+                ultima_factura_str = (
+                    ultima_factura.strftime("%d/%m/%Y")
+                    if ultima_factura and hasattr(ultima_factura, "strftime")
+                    else str(ultima_factura) if ultima_factura else None
+                )
+
+                clientes.append({
+                    "cliente": cliente_nombre,
+                    "cliente_key": cliente_key,
+                    "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
+                    "cantidad_centros_costo": int(r.get("cantidad_centros_costo") or 0),
+
+                    "ventas_netas": ventas_netas,
+                    "impuestos": impuestos,
+                    "total_facturado_siigo": total_facturado_siigo,
+
+                    # Compatibilidad con frontend anterior:
+                    "total_facturado": ventas_netas,
+
+                    "total_pagado": pagado,
+                    "saldo_pendiente": pendiente,
+                    "saldo_vencido": vencido,
+                    "saldo_por_vencer": saldo_por_vencer_cliente,
+
+                    "ventas_netas_str": money_fmt(ventas_netas),
+                    "impuestos_str": money_fmt(impuestos),
+                    "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+
+                    # Compatibilidad con frontend anterior:
+                    "total_facturado_str": money_fmt(ventas_netas),
+
+                    "total_pagado_str": money_fmt(pagado),
+                    "saldo_pendiente_str": money_fmt(pendiente),
+                    "saldo_vencido_str": money_fmt(vencido),
+                    "saldo_por_vencer_str": money_fmt(saldo_por_vencer_cliente),
+
+                    "pct_pagado": round(pct_cliente_pagado, 2),
+                    "pct_pendiente": round(pct_cliente_pendiente, 2),
+                    "pct_vencido": round(pct_cliente_vencido, 2),
+
+                    "ultima_factura": ultima_factura_str,
+                    "centros_costo": centros_por_cliente.get(cliente_key, []),
+                    "facturas_recientes": facturas_por_cliente.get(cliente_key, []),
+                    "estados": estados_por_cliente.get(cliente_key, {
+                        "pagado": 0,
+                        "sano": 0,
+                        "alerta": 0,
+                        "vencido": 0,
+                    }),
+                    "estados_saldo": estados_saldo_por_cliente.get(cliente_key, {
+                        "pagado": 0,
+                        "sano": 0,
+                        "alerta": 0,
+                        "vencido": 0,
+                    }),
+                })
+
+            # ---------------------------------------------------------------------
+            # 7. Catálogos para filtros
+            # ---------------------------------------------------------------------
+            wh_catalogos = ["f.idcliente = :idcliente"]
+            params_catalogos = {"idcliente": idcliente}
+
+            if desde and validar_fecha(desde):
+                wh_catalogos.append("f.fecha >= :desde")
+                params_catalogos["desde"] = desde
+
+            if hasta and validar_fecha(hasta):
+                wh_catalogos.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
+                params_catalogos["hasta"] = hasta
+
+            where_catalogos = " AND ".join(wh_catalogos)
+
+            sql_catalogo_clientes = text(f"""
+                SELECT DISTINCT
+                    f.cliente_nombre AS id,
+                    f.cliente_nombre AS nombre
                 FROM facturas_enriquecidas f
-                WHERE {where_clause}
+                WHERE {where_catalogos}
+                AND TRIM(COALESCE(f.cliente_nombre, '')) <> ''
+                ORDER BY nombre
             """)
-            rows_estado = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
-            # Normalizar campo para enriquecer correctamente
-            for r in rows_estado:
-                r["pendiente"] = r.get("saldo", 0)
 
-            enriched_estados = enriquecer_facturas(rows_estado)
+            catalogo_clientes = [
+                dict(r) for r in db.session.execute(sql_catalogo_clientes, params_catalogos).mappings().all()
+            ]
 
-            facturas_por_estado = {}
-            for r in enriched_estados:
-                cliente = r["cliente_nombre"]
-                estado = r["estado_cartera"]
+            sql_catalogo_cc = text(f"""
+                SELECT DISTINCT
+                    f.cost_center AS id,
+                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                FROM facturas_enriquecidas f
+                LEFT JOIN siigo_centros_costo cc
+                    ON f.cost_center = cc.id
+                WHERE {where_catalogos}
+                AND f.cost_center IS NOT NULL
+                ORDER BY nombre
+            """)
 
-                if cliente not in facturas_por_estado:
-                    facturas_por_estado[cliente] = {}
+            catalogo_centros_costo = [
+                dict(r) for r in db.session.execute(sql_catalogo_cc, params_catalogos).mappings().all()
+            ]
 
-                facturas_por_estado[cliente][estado] = facturas_por_estado[cliente].get(estado, 0) + 1
+            # ---------------------------------------------------------------------
+            # 8. Top charts
+            # ---------------------------------------------------------------------
+            top_facturacion = sorted(
+                clientes,
+                key=lambda x: x["ventas_netas"],
+                reverse=True
+            )[:10]
 
-            # Convertir a lista [{cliente, estado, cantidad}, ...]
-            facturas_por_estado_list = []
-            for cliente, estados in facturas_por_estado.items():
-                for estado, cantidad in estados.items():
-                    facturas_por_estado_list.append({
-                        "cliente": cliente,
-                        "estado": estado,
-                        "cantidad": cantidad
-                    })
+            top_saldo = sorted(
+                clientes,
+                key=lambda x: x["saldo_pendiente"],
+                reverse=True
+            )[:10]
 
             return jsonify({
+                "resumen": resumen,
                 "clientes": clientes,
-                "centros_costo": centros_costo,
-                "facturas_recientes": enriched,
-                "facturas_por_estado": facturas_por_estado_list  # 👈 ya viene separado por cliente
+                "catalogos": {
+                    "clientes": catalogo_clientes,
+                    "centros_costo": catalogo_centros_costo,
+                    "estados": [
+                        {"id": "pagado", "nombre": "Pagado"},
+                        {"id": "sano", "nombre": "Sano"},
+                        {"id": "alerta", "nombre": "Por vencer pronto"},
+                        {"id": "vencido", "nombre": "Vencido"},
+                    ],
+                },
+                "charts": {
+                    "top_facturacion": [
+                        {
+                            "cliente": c["cliente"],
+                            "ventas_netas": c["ventas_netas"],
+                            "total_facturado": c["ventas_netas"],
+                            "total_facturado_siigo": c["total_facturado_siigo"],
+                            "saldo_pendiente": c["saldo_pendiente"],
+                        }
+                        for c in top_facturacion
+                    ],
+                    "top_saldo": [
+                        {
+                            "cliente": c["cliente"],
+                            "saldo_pendiente": c["saldo_pendiente"],
+                            "saldo_vencido": c["saldo_vencido"],
+                        }
+                        for c in top_saldo
+                    ],
+                },
+                "params": {
+                    "idcliente": idcliente,
+                    "desde": desde,
+                    "hasta": hasta,
+                    "cliente": cliente,
+                    "cost_center": cost_center,
+                    "estado": filtro_estado,
+                    "limit_facturas": limit_facturas,
+                },
             })
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-
 
 
     # --- ENDPOINT: Facturas por cliente/centro de costo (paginadas) ---
@@ -10731,14 +11890,15 @@ def create_app():
 
     @app.before_request
     def verificar_permisos_global():
-        # 🔓 Excepciones (rutas públicas o de login)
+        # 🔓 Preflight CORS
         if request.method == "OPTIONS":
-            return jsonify({"status": "ok"}), 200  # ← ✅ soluciona preflight correctamente
+            return jsonify({"status": "ok"}), 200
 
+        # 🔓 Rutas públicas
         if request.path.startswith("/auth") or request.path == "/":
             return
 
-        # ⚠️ Excluir rutas internas que se llaman desde /siigo/sync-all
+        # ⚠️ Rutas internas / técnicas exentas
         rutas_exentas = [
             "/siigo/sync-catalogos",
             "/siigo/sync-customers",
@@ -10753,11 +11913,12 @@ def create_app():
             "/config/siigo-sync-status",
             "/ping",
         ]
+
         for ruta in rutas_exentas:
             if ruta in request.path:
                 return
 
-        # ✅ Verifica JWT válido
+        # ✅ Verificar JWT válido
         try:
             verify_jwt_in_request(optional=False)
         except Exception as e:
@@ -10765,27 +11926,91 @@ def create_app():
 
         claims = get_jwt()
 
+        # 👑 SuperAdmin entra sin restricciones
         if _is_superadmin(claims):
-            return  # 👑 SuperAdmin entra sin restricciones
+            return
 
         idperfil = claims.get("perfilid")
         idcliente = claims.get("idcliente")
 
-        # 🧠 Debug temporal
-        print(f"[PERMISOS] Ruta: {request.path}, Método: {request.method}, Perfil: {idperfil}, Cliente: {idcliente}")
+        if not idperfil or not idcliente:
+            return jsonify({
+                "error": "Token inválido: falta perfil o cliente",
+                "ruta": request.path
+            }), 403
 
-        # 🔹 Reglas automáticas por prefijo de ruta
+        print(
+            f"[PERMISOS] Ruta: {request.path}, "
+            f"Método: {request.method}, "
+            f"Perfil: {idperfil}, Cliente: {idcliente}"
+        )
+
         codigo = None
 
+        # ======================================================
+        # Clientes
+        # ======================================================
         if request.path.startswith("/clientes"):
             codigo = "ver_clientes"
 
-        elif request.path.startswith("/siigo"):
-            codigo = "ver_siigo"
-
+        # ======================================================
+        # Administración global SuperAdmin
+        # Nunca debe ser usada por usuarios cliente.
+        # ======================================================
         elif request.path.startswith("/admin"):
             codigo = "admin_panel"
 
+        # ======================================================
+        # Perfiles de cliente
+        # ======================================================
+        elif request.path.startswith("/perfiles"):
+            if request.method == "GET":
+                codigo = "ver_perfiles"
+            else:
+                codigo = "editar_perfiles"
+
+        # ======================================================
+        # Usuarios de cliente
+        # ======================================================
+        elif request.path.startswith("/usuarios"):
+            if request.method == "GET":
+                codigo = "ver_usuarios"
+            else:
+                codigo = "editar_usuarios"
+
+        # ======================================================
+        # Permisos / mis permisos / permisos por perfil
+        # Estos endpoints tienen validación propia en permisos_routes.py
+        # y son necesarios para construir menú/sidebar.
+        # ======================================================
+        elif request.path.startswith("/api/mis_permisos"):
+            return
+
+        elif request.path.startswith("/api/perfiles"):
+            return
+
+        elif request.path.startswith("/api/usuarios"):
+            return
+
+        elif request.path.startswith("/api/permisos"):
+            return
+
+        # ======================================================
+        # Notificaciones
+        # De momento se permite si el usuario tiene dashboard.
+        # ======================================================
+        elif request.path.startswith("/api/notificaciones"):
+            codigo = "ver_dashboard"
+
+        # ======================================================
+        # Siigo
+        # ======================================================
+        elif request.path.startswith("/siigo"):
+            codigo = "ver_siigo"
+
+        # ======================================================
+        # Dashboard / configuración
+        # ======================================================
         elif request.path.startswith("/dashboard"):
             if "resumen-config/buscar-cuentas" in request.path:
                 codigo = "ver_configuraciones_varias"
@@ -10796,54 +12021,292 @@ def create_app():
             else:
                 codigo = "ver_dashboard"
 
+        # ======================================================
+        # Reportes
+        # ======================================================
         elif request.path.startswith("/reportes"):
-            # Detectar permisos específicos
-            if "facturas-buscador" in request.path or "buscador-facturas" in request.path:
-                codigo = "ver_reporte_buscador_facturas"
-            elif "compras-gastos" in request.path:
-                codigo = "ver_reporte_compras_gastos"
-            elif "auxiliares/indicadores-financieros" in request.path or "indicadores-financieros-auxiliares" in request.path:
-                codigo = "ver_reporte_indicadores_auxiliares"
-            elif "indicadores" in request.path:
-                codigo = "ver_reporte_indicadores"
-            elif "ventas" in request.path:
-                codigo = "ver_reporte_ventas"
-            elif "balance_general" in request.path or "balance-general" in request.path:
-                codigo = "ver_reporte_balance_general"
-            elif "balance" in request.path:
-                codigo = "ver_reporte_balance"
-            elif "consolidado" in request.path:
-                codigo = "ver_reporte_consolidado"
-            elif "clientes" in request.path:
-                codigo = "ver_reporte_clientes"
-            elif "proveedores" in request.path:
-                codigo = "ver_reporte_proveedores"
-            elif "productos" in request.path:
-                codigo = "ver_reporte_productos"
-            elif "nomina" in request.path:
-                codigo = "ver_reporte_nomina"
-            elif "cxc" in request.path or "cartera" in request.path:
-                codigo = "ver_reporte_cxc"
-            elif "cruce_iva" in request.path:
-                codigo = "ver_reporte_cruceivas"
-            elif "retenciones" in request.path:
-                codigo = "ver_reporte_retenciones"
-            elif "analisis_variacion_v1" in request.path or "analisis-variacion" in request.path:
-                codigo = "ver_reporte_analisis_variacion"
-            elif "pnl_v1" in request.path or "estado-resultados" in request.path or "estado_resultados" in request.path:
-                codigo = "ver_reporte_estado_resultados"
-            else:
-                codigo = "ver_reportes"
+            # Normaliza rutas:
+            # /reportes/facturas_enriquecidas -> /reportes/facturas-enriquecidas
+            # /reportes/analisis_variacion_v1 -> /reportes/analisis-variacion-v1
+            path_norm = request.path.lower().replace("_", "-")
 
-        # Si no hay permiso requerido, no aplica control
+            # ------------------------------------------
+            # Cargue de Auxiliar Contable
+            # Usado por páginas del módulo financiero:
+            # Cruce de IVA, Retenciones, P&L, Variación,
+            # Balance General e Indicadores Auxiliares.
+            # ------------------------------------------
+            if (
+                "cargar-auxiliar" in path_norm
+                or "cargar-auxiliares" in path_norm
+                or "upload-auxiliar" in path_norm
+                or "importar-auxiliar" in path_norm
+            ):
+                permisos_financieros_auxiliar = [
+                    "ver_reporte_cruceivas",
+                    "ver_reporte_retenciones",
+                    "ver_reporte_estado_resultados",
+                    "ver_reporte_analisis_variacion",
+                    "ver_reporte_balance_general",
+                    "ver_reporte_indicadores_auxiliares",
+                ]
+
+                tiene_permiso_paquete = any(
+                    cliente_tiene_permiso_en_paquete(idcliente, permiso)
+                    for permiso in permisos_financieros_auxiliar
+                )
+
+                tiene_permiso_perfil = any(
+                    _perfil_tiene_permiso(idperfil, idcliente, permiso)
+                    for permiso in permisos_financieros_auxiliar
+                )
+
+                if not tiene_permiso_paquete:
+                    return jsonify({
+                        "error": "Acceso denegado: el paquete contratado no incluye cargue de auxiliar contable.",
+                        "ruta": request.path,
+                        "motivo": "cargue_auxiliar_no_incluido_en_paquete"
+                    }), 403
+
+                if not tiene_permiso_perfil:
+                    return jsonify({
+                        "error": "Acceso denegado: el perfil no tiene permisos financieros para cargar auxiliar contable.",
+                        "ruta": request.path,
+                        "motivo": "cargue_auxiliar_no_asignado_al_perfil"
+                    }), 403
+
+                return
+
+            # ------------------------------------------
+            # Buscador Inteligente de Facturas
+            # Ejemplo:
+            # /reportes/busqueda-inteligente-facturas
+            # /reportes/financiero/buscador-facturas
+            # ------------------------------------------
+            if (
+                "busqueda-inteligente-facturas" in path_norm
+                or "buscador-facturas" in path_norm
+                or "facturas-buscador" in path_norm
+                or "busqueda-facturas" in path_norm
+                or "facturas-inteligente" in path_norm
+            ):
+                codigo = "ver_reporte_buscador_facturas"
+                
+
+            # ------------------------------------------
+            # Cuentas por Cobrar / Cartera / Aging
+            # Ejemplo:
+            # /reportes/cuentas-por-cobrar
+            # /reportes/financiero/cxc
+            # ------------------------------------------
+            elif (
+                "cuentas-por-cobrar" in path_norm
+                or "cuentasporcobrar" in path_norm
+                or "cxc" in path_norm
+                or "cartera" in path_norm
+                or "aging" in path_norm
+            ):
+                codigo = "ver_reporte_cxc"
+
+            # ------------------------------------------
+            # Ventas por Vendedor
+            # Ejemplo:
+            # /reportes/vendedores
+            # ------------------------------------------
+            elif (
+                "vendedores" in path_norm
+                or "vendedor" in path_norm
+                or "ventas-vendedor" in path_norm
+                or "sales-by-vendor" in path_norm
+            ):
+                codigo = "ver_reporte_vendedores"
+
+            # ------------------------------------------
+            # Ventas por Producto
+            # Ejemplo:
+            # /reportes/productos
+            # ------------------------------------------
+            elif (
+                "productos" in path_norm
+                or "producto" in path_norm
+                or "ventas-producto" in path_norm
+                or "sales-by-product" in path_norm
+            ):
+                codigo = "ver_reporte_productos"
+
+            # ------------------------------------------
+            # Ingresos por Ventas y endpoints auxiliares de ventas
+            # Ejemplos usados por la página de ventas:
+            # /reportes/facturas-enriquecidas
+            # /reportes/facturas-por-cliente
+            # /reportes/facturas-por-estado
+            # /reportes/facturas-detalle-mes
+            # /reportes/financiero/ventas
+            # ------------------------------------------
+            elif (
+                "ventas" in path_norm
+                or "ingresos" in path_norm
+                or "facturas-enriquecidas" in path_norm
+                or "facturas-por-cliente" in path_norm
+                or "facturas-por-estado" in path_norm
+                or "facturas-detalle-mes" in path_norm
+                or "facturacion-ventas" in path_norm
+                or "sales" in path_norm
+            ):
+                codigo = "ver_reporte_ventas"
+
+            # ------------------------------------------
+            # Facturación Clientes
+            # Se deja después de ventas para que facturas-por-cliente
+            # siga perteneciendo al reporte de ventas.
+            # ------------------------------------------
+            elif (
+                "facturas-cliente" in path_norm
+                or "facturas-clientes" in path_norm
+                or "facturacion-clientes" in path_norm
+                or "analisis-clientes" in path_norm
+                or "reporte-clientes" in path_norm
+            ):
+                codigo = "ver_reporte_clientes"
+
+            # ------------------------------------------
+            # Compras / Gastos / Egresos
+            # ------------------------------------------
+            elif (
+                "compras-gastos" in path_norm
+                or "compras-y-gastos" in path_norm
+                or "compras-gastos" in path_norm
+                or "egresos" in path_norm
+                or "gastos" in path_norm
+            ):
+                codigo = "ver_reporte_compras_gastos"
+
+            # ------------------------------------------
+            # Nómina
+            # ------------------------------------------
+            elif "nomina" in path_norm or "nómina" in path_norm:
+                codigo = "ver_reporte_nomina"
+
+            # ------------------------------------------
+            # Compras a Proveedores
+            # ------------------------------------------
+            elif (
+                "proveedores" in path_norm
+                or "proveedor" in path_norm
+                or "compras-proveedores" in path_norm
+            ):
+                codigo = "ver_reporte_proveedores"
+
+            # ------------------------------------------
+            # Financiero Consolidado
+            # ------------------------------------------
+            elif "consolidado" in path_norm:
+                codigo = "ver_reporte_consolidado"
+
+            # ------------------------------------------
+            # Cruce de IVAs
+            # ------------------------------------------
+            elif (
+                "cruce-iva" in path_norm
+                or "cruce-ivas" in path_norm
+                or "cruceiva" in path_norm
+            ):
+                codigo = "ver_reporte_cruceivas"
+
+            # ------------------------------------------
+            # Retenciones
+            # ------------------------------------------
+            elif "retenciones" in path_norm or "retencion" in path_norm:
+                codigo = "ver_reporte_retenciones"
+
+            # ------------------------------------------
+            # Estado de Resultados / P&L
+            # ------------------------------------------
+            elif (
+                "pnl-v1" in path_norm
+                or "pnl" in path_norm
+                or "estado-resultados" in path_norm
+                or "estado-de-resultados" in path_norm
+                or "estadoresultados" in path_norm
+            ):
+                codigo = "ver_reporte_estado_resultados"
+
+            # ------------------------------------------
+            # Análisis de Variación
+            # ------------------------------------------
+            elif (
+                "analisis-variacion" in path_norm
+                or "analisis-variacion-v1" in path_norm
+                or "variacion" in path_norm
+            ):
+                codigo = "ver_reporte_analisis_variacion"
+
+            # ------------------------------------------
+            # Indicadores financieros auxiliares
+            # ------------------------------------------
+            elif (
+                "auxiliares/indicadores-financieros" in path_norm
+                or "indicadores-financieros-auxiliares" in path_norm
+                or "indicadores-auxiliares" in path_norm
+            ):
+                codigo = "ver_reporte_indicadores_auxiliares"
+
+            # ------------------------------------------
+            # Indicadores financieros antiguos
+            # ------------------------------------------
+            elif "indicadores" in path_norm:
+                codigo = "ver_reporte_indicadores"
+
+            # ------------------------------------------
+            # Balance General
+            # ------------------------------------------
+            elif (
+                "balance-general" in path_norm
+                or "balancegeneral" in path_norm
+            ):
+                codigo = "ver_reporte_balance_general"
+
+            # ------------------------------------------
+            # Balance antiguo / balance prueba
+            # ------------------------------------------
+            elif "balance" in path_norm:
+                codigo = "ver_reporte_balance"
+
+            # ------------------------------------------
+            # Ruta no mapeada
+            # No usamos ver_reportes para evitar permisos demasiado amplios.
+            # ------------------------------------------
+            else:
+                return jsonify({
+                    "error": "Ruta de reporte no mapeada en control de permisos.",
+                    "ruta": request.path,
+                    "motivo": "reporte_sin_mapeo",
+                    "recomendacion": (
+                        "Agrega esta ruta al mapeo de permisos en before_request "
+                        "para asociarla con un permiso específico."
+                    )
+                }), 403
+            
+        # Si no hay permiso requerido, no aplica control global
         if not codigo:
             return
 
-        # 🔒 Verifica el permiso en BD
+        # 🔒 1. Verificar que el paquete contratado incluya el permiso
+        if not cliente_tiene_permiso_en_paquete(idcliente, codigo):
+            return jsonify({
+                "error": f"Acceso denegado: el paquete contratado no incluye el permiso '{codigo}'",
+                "permiso": codigo,
+                "ruta": request.path,
+                "motivo": "permiso_no_incluido_en_paquete"
+            }), 403
+
+        # 🔒 2. Verificar que el perfil del usuario tenga el permiso asignado
         if not _perfil_tiene_permiso(idperfil, idcliente, codigo):
             return jsonify({
                 "error": f"Acceso denegado: falta permiso '{codigo}'",
-                "ruta": request.path
+                "permiso": codigo,
+                "ruta": request.path,
+                "motivo": "permiso_no_asignado_al_perfil"
             }), 403
 
 
