@@ -73,6 +73,9 @@ from balance import (
     construir_balance_general,
 )
 
+from siigo.siigo_sync_documentos_soporte_staging import sync_documentos_soporte_staging_desde_siigo
+
+
 
 HEADER_MAP = {
     "nombre": [
@@ -12088,7 +12091,51 @@ def create_app():
                 "detalle": str(e)
             }), 500
 
- 
+
+
+    # Endpoint para llenar tabla de stagin compras
+    @app.route("/siigo/sync-documentos-soporte-staging", methods=["POST"])
+    def siigo_sync_documentos_soporte_staging():
+        """
+        Sincroniza documentos soporte desde Siigo API hacia tabla staging.
+
+        No toca siigo_compras.
+        No toca siigo_compras_items.
+        No afecta reportes actuales.
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        batch = request.args.get("batch", default=50, type=int)
+        max_pages = request.args.get("max_pages", default=None, type=int)
+
+        try:
+            resultado = sync_documentos_soporte_staging_desde_siigo(
+                idcliente=idcliente,
+                batch_size=batch if batch else 50,
+                max_pages=max_pages,
+            )
+
+            status = 500 if isinstance(resultado, dict) and resultado.get("error") else 200
+
+            return jsonify(resultado), status
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "Error sincronizando documentos soporte staging",
+                "detalle": str(e),
+            }), 500
+
+
+
+
+
+
+
+
+#----------------------------------------------------------------------------------------------------------------------------------
 # No tocar de qui para abajo 
  
     # NO TOCAR DE AQEUI PARA ABAJO

@@ -1045,3 +1045,49 @@ class DashboardResumenConfig(db.Model):
             "actualizado_en": self.actualizado_en.isoformat() if self.actualizado_en else None,
         }
 
+
+
+
+class SiigoDocumentoSoporteApiStaging(db.Model):
+    __tablename__ = "siigo_documentos_soporte_api_staging"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    idcliente = db.Column(
+        db.Integer,
+        db.ForeignKey("clientes.idcliente", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    siigo_id = db.Column(db.UUID(as_uuid=False), nullable=False)
+    name = db.Column(db.String(50), nullable=False)
+    number = db.Column(db.Integer)
+    document_id = db.Column(db.Integer)
+
+    fecha = db.Column(db.Date)
+    vencimiento = db.Column(db.Date)
+
+    proveedor_siigo_id = db.Column(db.UUID(as_uuid=False))
+    proveedor_identificacion = db.Column(db.String(50))
+    proveedor_nombre = db.Column(db.String(200))
+
+    cost_center = db.Column(db.Integer)
+
+    total = db.Column(db.Numeric(15, 2))
+    balance = db.Column(db.Numeric(15, 2))
+    payment_value = db.Column(db.Numeric(15, 2))
+
+    supplier_receipt_prefix = db.Column(db.String(50))
+    supplier_receipt_number = db.Column(db.String(100))
+    factura_proveedor = db.Column(db.String(100))
+
+    stamp_status = db.Column(db.String(50))
+    cuds = db.Column(db.Text)
+
+    items_count = db.Column(db.Integer, default=0)
+    retentions_total = db.Column(db.Numeric(15, 2), default=0)
+
+    raw_json = db.Column(db.JSON, nullable=False)
+
+    created_siigo = db.Column(db.DateTime)
+    synced_at = db.Column(db.DateTime, server_default=db.func.now())
