@@ -1925,140 +1925,11 @@ def _resumir_detalle_sync(detalle: str):
         "endpoint_fallido": endpoint_fallido,
     }
 
-# Helper para la Fecha de sincronizacion desde
-def _resolver_sync_fecha_desde(data, config):
-    """
-    Resuelve la fecha global de sincronización de documentos Siigo.
-
-    Prioridad:
-    1. sync_fecha_desde enviado desde frontend.
-    2. ds_fecha_desde enviado desde frontend, por compatibilidad.
-    3. config.sync_fecha_desde.
-    4. config.ds_fecha_desde, por compatibilidad.
-    5. None: sin límite de fecha.
-    """
-    fecha = data.get("sync_fecha_desde")
-
-    if not fecha:
-        fecha = data.get("ds_fecha_desde")
-
-    if not fecha and config and getattr(config, "sync_fecha_desde", None):
-        fecha = config.sync_fecha_desde.isoformat()
-
-    if not fecha and config and getattr(config, "ds_fecha_desde", None):
-        fecha = config.ds_fecha_desde.isoformat()
-
-    return fecha or None
-
-
-
-#Helpers para ostrar notificaicones de proceso acabado en hitoria luego de usara boton manual de sincronizacion:
-def _now_utc_aware():
-    """
-    Retorna fecha/hora UTC aware para guardar en columnas timezone=True.
-    """
-    import pytz
-    return datetime.utcnow().replace(tzinfo=pytz.utc)
-
-
-def _crear_log_sync_modulo_inicio(
-    idcliente,
-    endpoint,
-    origen="manual_modulo",
-    params=None,
-    mensaje="Proceso iniciado.",
-):
-    """
-    Crea un registro en siigo_sync_logs con estado EN_EJECUCION.
-    Sirve para que el usuario vea en historial que el proceso manual arrancó.
-    """
-    try:
-        now = _now_utc_aware()
-        params = params or {}
-
-        detalle = f"{endpoint} {params} -> EN_EJECUCION: {mensaje}"
-
-        logrec = SiigoSyncLog(
-            idcliente=idcliente,
-            fecha_programada=now,
-            ejecutado_en=now,
-            resultado="EN_EJECUCION",
-            detalle=detalle[:10000],
-            origen=origen,
-            total_pasos=1,
-            pasos_ok=0,
-            pasos_error=0,
-            endpoint_fallido=None,
-        )
-
-        db.session.add(logrec)
-        db.session.commit()
-
-        return logrec.id
-
-    except Exception as e:
-        print(f"⚠️ Error creando log inicio módulo {endpoint}: {e}")
-        db.session.rollback()
-        return None
-
-
-def _finalizar_log_sync_modulo(
-    log_id,
-    idcliente,
-    endpoint,
-    resultado,
-    detalle,
-    status_code=200,
-    duracion_segundos=None,
-):
-    """
-    Actualiza un log previamente creado como EN_EJECUCION.
-    También registra métrica individual.
-    """
-    try:
-        now = _now_utc_aware()
-
-        resultado_final = "OK" if resultado == "OK" and status_code < 400 else "ERROR"
-        pasos_ok = 1 if resultado_final == "OK" else 0
-        pasos_error = 0 if resultado_final == "OK" else 1
-        endpoint_fallido = None if resultado_final == "OK" else endpoint
-
-        detalle_final = f"{endpoint} {{}} -> {status_code}: {detalle}"
-
-        if log_id:
-            logrec = SiigoSyncLog.query.get(log_id)
-            if logrec:
-                logrec.ejecutado_en = now
-                logrec.resultado = resultado_final
-                logrec.detalle = detalle_final[:10000]
-                logrec.total_pasos = 1
-                logrec.pasos_ok = pasos_ok
-                logrec.pasos_error = pasos_error
-                logrec.endpoint_fallido = endpoint_fallido
-                db.session.add(logrec)
-
-        metric = SiigoSyncMetric(
-            idcliente=idcliente,
-            endpoint=endpoint,
-            duracion_segundos=duracion_segundos,
-            status_code=status_code,
-            resultado=resultado_final,
-            detalle_resumen=detalle_final[:300],
-        )
-        db.session.add(metric)
-
-        db.session.commit()
-
-    except Exception as e:
-        print(f"⚠️ Error finalizando log módulo {endpoint}: {e}")
-        db.session.rollback()
 
 
 
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
-#---------------------------------------------------------------------------------------------------------
-
 
 def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
@@ -3448,27 +3319,24 @@ def create_app():
         except Exception:
             frecuencia_dias = 1
 
-        sync_fecha_desde = _parse_date_yyyy_mm_dd(data.get("sync_fecha_desde") or data.get("ds_fecha_desde"))
+        ds_fecha_desde = _parse_date_yyyy_mm_dd(ds_fecha_desde_raw)
 
-        config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
+        cfg = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
-        if not config:
-            config = SiigoSyncConfig(
+        if not cfg:
+            cfg = SiigoSyncConfig(
                 idcliente=idcliente,
                 hora_ejecucion=hora_ejecucion,
                 frecuencia_dias=frecuencia_dias,
                 activo=bool(activo_raw),
-                sync_fecha_desde=sync_fecha_desde,
-                ds_fecha_desde=sync_fecha_desde,
+                ds_fecha_desde=ds_fecha_desde,
             )
         else:
-            config.hora_ejecucion = hora_ejecucion
-            config.frecuencia_dias = frecuencia_dias
-            config.activo = bool(activo_raw)
-            config.sync_fecha_desde = sync_fecha_desde
-            config.ds_fecha_desde = sync_fecha_desde
-        
-        
+            cfg.hora_ejecucion = hora_ejecucion
+            cfg.frecuencia_dias = frecuencia_dias
+            cfg.activo = bool(activo_raw)
+            cfg.ds_fecha_desde = ds_fecha_desde
+
         db.session.add(cfg)
         db.session.commit()
 
@@ -3527,7 +3395,7 @@ def create_app():
 
         # Solo tocamos ds_fecha_desde si viene explícitamente en el payload.
         # Esto evita borrar la configuración si el frontend viejo no manda el campo.
-        if "sync_fecha_desde" in data or "ds_fecha_desde" in data:
+        if "ds_fecha_desde" in data:
             if not sync_cfg:
                 sync_cfg = SiigoSyncConfig(
                     idcliente=idcliente,
@@ -3536,20 +3404,15 @@ def create_app():
                     activo=True,
                 )
 
-            fecha_global = _parse_date_yyyy_mm_dd(data.get("sync_fecha_desde") or data.get("ds_fecha_desde"))
-
-            sync_cfg.sync_fecha_desde = fecha_global
-            sync_cfg.ds_fecha_desde = fecha_global
-
+            sync_cfg.ds_fecha_desde = _parse_date_yyyy_mm_dd(ds_fecha_desde_raw)
             db.session.add(sync_cfg)
 
         db.session.commit()
 
         return jsonify({
             "message": "Configuración guardada",
-            "sync_fecha_desde": sync_cfg.sync_fecha_desde.isoformat() if sync_cfg and sync_cfg.sync_fecha_desde else None,
             "ds_fecha_desde": sync_cfg.ds_fecha_desde.isoformat() if sync_cfg and sync_cfg.ds_fecha_desde else None,
-         }), 200
+        }), 200
 
 
     @app.route("/siigo/test_auth", methods=["POST"])
@@ -3772,7 +3635,7 @@ def create_app():
         batch = request.args.get("batch", default=None, type=int)
         only_missing = request.args.get("only_missing", default="1") in ("1", "true", "yes")
         since = request.args.get("since")
-        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"  # 👈 marca que viene desde /sync-all
 
         kwargs = {
             "idcliente": idcliente,
@@ -3780,101 +3643,30 @@ def create_app():
             "only_missing": only_missing,
             "since": since,
         }
-
         if batch:
             kwargs["batch_size"] = batch
 
-        endpoint_log = "/siigo/sync-facturas"
-        params_log = {
-            "deep": deep,
-            "batch": batch,
-            "only_missing": only_missing,
-            "since": since,
-        }
-
-        nombre_proceso = "Facturas detalle" if deep else "Facturas de venta"
-
         try:
             if modo_sync_all:
-                # Ejecución sincrónica cuando viene desde sync-all.
+                # 🔹 Ejecución sin background (sincrónica)
                 mensaje = sync_facturas_desde_siigo(**kwargs)
                 return jsonify({"mensaje": mensaje}), 200
+            else:
+                # 🔹 Ejecución background para UI manual
+                def trabajo_lento(local_kwargs):
+                    with app.app_context():
+                        try:
+                            mensaje = sync_facturas_desde_siigo(**local_kwargs)
+                            print(f"[siigo_sync_facturas] ✅ Terminado: {mensaje}")
+                        except Exception:
+                            traceback.print_exc()
 
-            # Modo UI manual: background con registro en historial.
-            log_id = _crear_log_sync_modulo_inicio(
-                idcliente=idcliente,
-                endpoint=endpoint_log,
-                origen="manual_modulo",
-                params=params_log,
-                mensaje=(
-                    f"{nombre_proceso}: proceso iniciado"
-                    + (f" con fecha desde {since}." if since else " sin límite de fecha.")
-                ),
-            )
-
-            def trabajo_lento(local_kwargs, local_log_id, local_endpoint_log, local_nombre_proceso):
-                with app.app_context():
-                    inicio = time.time()
-
-                    try:
-                        mensaje = sync_facturas_desde_siigo(**local_kwargs)
-                        duracion = round(time.time() - inicio, 2)
-
-                        detalle = (
-                            f"{local_nombre_proceso} finalizado correctamente. "
-                            f"{mensaje}"
-                        )
-
-                        print(f"[siigo_sync_facturas] ✅ Terminado: {mensaje}")
-
-                        _finalizar_log_sync_modulo(
-                            log_id=local_log_id,
-                            idcliente=local_kwargs["idcliente"],
-                            endpoint=local_endpoint_log,
-                            resultado="OK",
-                            detalle=detalle,
-                            status_code=200,
-                            duracion_segundos=duracion,
-                        )
-
-                    except Exception as e:
-                        duracion = round(time.time() - inicio, 2)
-                        detalle_error = traceback.format_exc()
-
-                        print(f"[siigo_sync_facturas] ❌ Error: {e}")
-                        traceback.print_exc()
-
-                        _finalizar_log_sync_modulo(
-                            log_id=local_log_id,
-                            idcliente=local_kwargs["idcliente"],
-                            endpoint=local_endpoint_log,
-                            resultado="ERROR",
-                            detalle=detalle_error,
-                            status_code=500,
-                            duracion_segundos=duracion,
-                        )
-
-            t = Thread(
-                target=trabajo_lento,
-                args=(kwargs, log_id, endpoint_log, nombre_proceso),
-                daemon=True,
-            )
-            t.start()
-
-            return jsonify({
-                "mensaje": (
-                    f"{nombre_proceso}: proceso iniciado"
-                    + (f" con fecha desde {since}." if since else " sin límite de fecha.")
-                    + " Puedes revisar el resultado en el historial de sincronizaciones."
-                ),
-                "log_id": log_id,
-                "origen": "manual_modulo",
-                "estado": "EN_EJECUCION",
-                "since": since,
-            }), 202
-
+                t = Thread(target=trabajo_lento, args=(kwargs,), daemon=True)
+                t.start()
+                return jsonify({"mensaje": "Sincronización iniciada en background. Revisar logs para progreso."}), 202
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
 
 
 
@@ -5515,138 +5307,48 @@ def create_app():
 
     # --- ENDPOINT: Sincronizar notas crédito desde Siigo ---
     @app.route("/siigo/sync-notas-credito", methods=["POST"])
+    
     def siigo_sync_notas_credito():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
-        since = request.args.get("since") or request.args.get("fecha_desde")
-        since_date = _parse_date_yyyy_mm_dd(since)
-        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
-
-        endpoint_log = "/siigo/sync-notas-credito"
-        params_log = {
-            "since": since,
-        }
-
-        log_id = None
-        inicio = time.time()
-
-        if not modo_sync_all:
-            log_id = _crear_log_sync_modulo_inicio(
-                idcliente=idcliente,
-                endpoint=endpoint_log,
-                origen="manual_modulo",
-                params=params_log,
-                mensaje=(
-                    "Notas crédito: proceso iniciado"
-                    + (f" con fecha desde {since}." if since else " sin límite de fecha.")
-                ),
-            )
-
         try:
             cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
             if not cred or not cred.client_id or not cred.client_secret or not cred.base_url:
-                detalle = "Credenciales de Siigo no configuradas."
-
-                if not modo_sync_all:
-                    _finalizar_log_sync_modulo(
-                        log_id=log_id,
-                        idcliente=idcliente,
-                        endpoint=endpoint_log,
-                        resultado="ERROR",
-                        detalle=detalle,
-                        status_code=400,
-                        duracion_segundos=round(time.time() - inicio, 2),
-                    )
-
-                return jsonify({"error": detalle}), 400
+                return jsonify({"error": "Credenciales de Siigo no configuradas"}), 400
 
             access_key = dec(cred.client_secret)
             if not access_key:
-                detalle = "No se pudo desencriptar el Access Key."
-
-                if not modo_sync_all:
-                    _finalizar_log_sync_modulo(
-                        log_id=log_id,
-                        idcliente=idcliente,
-                        endpoint=endpoint_log,
-                        resultado="ERROR",
-                        detalle=detalle,
-                        status_code=400,
-                        duracion_segundos=round(time.time() - inicio, 2),
-                    )
-
-                return jsonify({"error": detalle}), 400
+                return jsonify({"error": "No se pudo desencriptar el Access Key"}), 400
 
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data.get("access_token")
             if not token:
-                detalle = "Error al obtener token Siigo."
-
-                if not modo_sync_all:
-                    _finalizar_log_sync_modulo(
-                        log_id=log_id,
-                        idcliente=idcliente,
-                        endpoint=endpoint_log,
-                        resultado="ERROR",
-                        detalle=detalle,
-                        status_code=500,
-                        duracion_segundos=round(time.time() - inicio, 2),
-                    )
-
-                return jsonify({"error": detalle}), 500
+                return jsonify({"error": "Error al obtener token Siigo"}), 500
 
             page = 1
-            nuevas = 0
-            actualizadas = 0
-            omitidas_por_fecha = 0
-            total_leidas = 0
-
+            nuevas, actualizadas = 0, 0
             while True:
                 url = f"{cred.base_url.rstrip('/')}/v1/credit-notes?page={page}&page_size=100"
                 r = _request_with_retries("GET", url, headers=_headers_bearer(token))
-
                 if r.status_code != 200:
-                    detalle = f"Siigo error {r.status_code}: {r.text}"
-
-                    if not modo_sync_all:
-                        _finalizar_log_sync_modulo(
-                            log_id=log_id,
-                            idcliente=idcliente,
-                            endpoint=endpoint_log,
-                            resultado="ERROR",
-                            detalle=detalle,
-                            status_code=r.status_code,
-                            duracion_segundos=round(time.time() - inicio, 2),
-                        )
-
-                    return jsonify({"error": detalle}), r.status_code
-
+                    return jsonify({"error": f"Siigo error {r.status_code}: {r.text}"}), r.status_code
                 data = r.json() or {}
                 notas = data.get("results") or []
-
                 if not notas:
                     break
 
                 for n in notas:
-                    total_leidas += 1
-
                     nota_id = _str(n.get("name"))
                     if not nota_id:
                         continue
 
                     fecha_str = n.get("date")
                     try:
-                        fecha = datetime.fromisoformat(str(fecha_str)).date() if fecha_str else None
+                        fecha = datetime.fromisoformat(fecha_str).date() if fecha_str else None
                     except Exception:
                         fecha = None
-
-                    # Filtro global de fecha inicial de datos Siigo.
-                    if since_date:
-                        if not fecha or fecha < since_date:
-                            omitidas_por_fecha += 1
-                            continue
 
                     total = float(n.get("total") or 0)
                     estado = _str(n.get("status"))
@@ -5659,53 +5361,26 @@ def create_app():
 
                     factura_afectada_id = _str((n.get("invoice") or {}).get("name"))
                     factura_afectada_uuid = _str((n.get("invoice") or {}).get("id"))
-                    metadata_json = n
+                    metadata_json = n  # guarda el JSON completo
 
-                    nota = SiigoNotaCredito.query.filter_by(
-                        idcliente=idcliente,
-                        nota_id=nota_id
-                    ).first()
-
+                    # Buscar si ya existe por nota_id
+                    nota = SiigoNotaCredito.query.filter_by(idcliente=idcliente, nota_id=nota_id).first()
                     if nota:
                         changes = 0
-
-                        if nota.fecha != fecha:
-                            nota.fecha = fecha
-                            changes += 1
-                        if nota.total != total:
-                            nota.total = total
-                            changes += 1
-                        if nota.estado != estado:
-                            nota.estado = estado
-                            changes += 1
-                        if nota.observaciones != observaciones:
-                            nota.observaciones = observaciones
-                            changes += 1
-                        if nota.motivo != motivo:
-                            nota.motivo = motivo
-                            changes += 1
-                        if nota.uuid != uuid:
-                            nota.uuid = uuid
-                            changes += 1
-                        if nota.cliente_nombre != cliente_nombre:
-                            nota.cliente_nombre = cliente_nombre
-                            changes += 1
-                        if nota.customer_id != customer_id:
-                            nota.customer_id = customer_id
-                            changes += 1
-                        if nota.factura_afectada_id != factura_afectada_id:
-                            nota.factura_afectada_id = factura_afectada_id
-                            changes += 1
-                        if nota.factura_afectada_uuid != factura_afectada_uuid:
-                            nota.factura_afectada_uuid = factura_afectada_uuid
-                            changes += 1
-                        if nota.metadata_json != metadata_json:
-                            nota.metadata_json = metadata_json
-                            changes += 1
+                        if nota.fecha != fecha: nota.fecha = fecha; changes += 1
+                        if nota.total != total: nota.total = total; changes += 1
+                        if nota.estado != estado: nota.estado = estado; changes += 1
+                        if nota.observaciones != observaciones: nota.observaciones = observaciones; changes += 1
+                        if nota.motivo != motivo: nota.motivo = motivo; changes += 1
+                        if nota.uuid != uuid: nota.uuid = uuid; changes += 1
+                        if nota.cliente_nombre != cliente_nombre: nota.cliente_nombre = cliente_nombre; changes += 1
+                        if nota.customer_id != customer_id: nota.customer_id = customer_id; changes += 1
+                        if nota.factura_afectada_id != factura_afectada_id: nota.factura_afectada_id = factura_afectada_id; changes += 1
+                        if nota.factura_afectada_uuid != factura_afectada_uuid: nota.factura_afectada_uuid = factura_afectada_uuid; changes += 1
+                        if nota.metadata_json != metadata_json: nota.metadata_json = metadata_json; changes += 1
 
                         if changes > 0:
                             actualizadas += 1
-
                     else:
                         nota = SiigoNotaCredito(
                             idcliente=idcliente,
@@ -5730,52 +5405,14 @@ def create_app():
                 next_href = ((data.get("_links") or {}).get("next") or {}).get("href")
                 if not next_href or len(notas) < 100:
                     break
-
                 page += 1
 
-            mensaje = (
-                f"Sincronización de notas crédito completa: "
-                f"{nuevas} nuevas, {actualizadas} actualizadas, "
-                f"{omitidas_por_fecha} omitidas por fecha."
-            )
-
-            respuesta = {
-                "mensaje": mensaje,
-                "since": since_date.isoformat() if since_date else None,
-                "total_leidas_siigo": total_leidas,
-                "nuevas": nuevas,
-                "actualizadas": actualizadas,
-                "omitidas_por_fecha": omitidas_por_fecha,
-                "total_procesadas": nuevas + actualizadas,
-            }
-
-            if not modo_sync_all:
-                _finalizar_log_sync_modulo(
-                    log_id=log_id,
-                    idcliente=idcliente,
-                    endpoint=endpoint_log,
-                    resultado="OK",
-                    detalle=str(respuesta),
-                    status_code=200,
-                    duracion_segundos=round(time.time() - inicio, 2),
-                )
-
-            return jsonify(respuesta), 200
+            return jsonify({
+                "mensaje": f"Sincronización de notas crédito completa: {nuevas} nuevas, {actualizadas} actualizadas.",
+                "total_procesadas": nuevas + actualizadas
+            })
 
         except Exception as e:
-            detalle_error = traceback.format_exc()
-
-            if not modo_sync_all:
-                _finalizar_log_sync_modulo(
-                    log_id=log_id,
-                    idcliente=idcliente,
-                    endpoint=endpoint_log,
-                    resultado="ERROR",
-                    detalle=detalle_error,
-                    status_code=500,
-                    duracion_segundos=round(time.time() - inicio, 2),
-                )
-
             return jsonify({"error": str(e)}), 500
 
 
@@ -6650,6 +6287,7 @@ def create_app():
 
 
 
+
     @app.route("/siigo/sync-compras", methods=["POST"])
     def siigo_sync_compras():
         idcliente = obtener_idcliente_desde_request()
@@ -6662,17 +6300,9 @@ def create_app():
         since = request.args.get("since")
         modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
 
-        endpoint_log = "/siigo/sync-compras"
-        params_log = {
-            "deep": deep,
-            "batch": batch,
-            "only_missing": only_missing,
-            "since": since,
-        }
-
         try:
             if modo_sync_all:
-                # Ejecutar directamente cuando viene desde sync-all.
+                # 🔹 Ejecutar directamente (sin hilo)
                 resultado = sync_compras_desde_siigo(
                     idcliente=idcliente,
                     deep=deep,
@@ -6694,97 +6324,27 @@ def create_app():
 
                 return jsonify({"mensaje": f"Compras sincronizadas: {resultado}"}), 200
 
-            # Modo UI manual: background con historial.
-            log_id = _crear_log_sync_modulo_inicio(
-                idcliente=idcliente,
-                endpoint=endpoint_log,
-                origen="manual_modulo",
-                params=params_log,
-                mensaje=(
-                    "Compras: proceso iniciado"
-                    + (f" con fecha desde {since}." if since else " sin límite de fecha.")
-                ),
-            )
-
-            def run_background(local_log_id):
+            # 🔹 Modo UI manual: background thread
+            def run_background():
                 with app.app_context():
-                    inicio = time.time()
-
                     try:
                         print(f"[sync-compras] 🔁 Iniciando para cliente {idcliente}")
-
-                        resultado = sync_compras_desde_siigo(
+                        sync_compras_desde_siigo(
                             idcliente=idcliente,
                             deep=deep,
                             batch_size=batch if batch else 50,
                             only_missing=only_missing,
                             since=since,
                         )
-
-                        duracion = round(time.time() - inicio, 2)
-
-                        if isinstance(resultado, dict) and resultado.get("error"):
-                            detalle = str(resultado.get("detalle") or resultado)
-                            status = 429 if "429" in str(resultado.get("error")) or "requests_limit" in detalle else 500
-
-                            print(f"[sync-compras] ❌ Error: {resultado}")
-
-                            _finalizar_log_sync_modulo(
-                                log_id=local_log_id,
-                                idcliente=idcliente,
-                                endpoint=endpoint_log,
-                                resultado="ERROR",
-                                detalle=f"Error sincronizando compras: {resultado}",
-                                status_code=status,
-                                duracion_segundos=duracion,
-                            )
-                            return
-
-                        print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}: {resultado}")
-
-                        _finalizar_log_sync_modulo(
-                            log_id=local_log_id,
-                            idcliente=idcliente,
-                            endpoint=endpoint_log,
-                            resultado="OK",
-                            detalle=f"Compras sincronizadas correctamente: {resultado}",
-                            status_code=200,
-                            duracion_segundos=duracion,
-                        )
-
+                        print(f"[sync-compras] ✅ Finalizado para cliente {idcliente}")
                     except Exception as e:
-                        duracion = round(time.time() - inicio, 2)
-                        detalle_error = traceback.format_exc()
-
                         print(f"[sync-compras] ❌ Error en background: {e}")
-                        traceback.print_exc()
 
-                        _finalizar_log_sync_modulo(
-                            log_id=local_log_id,
-                            idcliente=idcliente,
-                            endpoint=endpoint_log,
-                            resultado="ERROR",
-                            detalle=detalle_error,
-                            status_code=500,
-                            duracion_segundos=duracion,
-                        )
-
-            threading.Thread(target=run_background, args=(log_id,), daemon=True).start()
-
-            return jsonify({
-                "mensaje": (
-                    "Compras: proceso iniciado"
-                    + (f" con fecha desde {since}." if since else " sin límite de fecha.")
-                    + " Puedes revisar el resultado en el historial de sincronizaciones."
-                ),
-                "log_id": log_id,
-                "origen": "manual_modulo",
-                "estado": "EN_EJECUCION",
-                "since": since,
-            }), 202
-
+            threading.Thread(target=run_background, daemon=True).start()
+            return jsonify({"mensaje": "Sincronización de compras iniciada en segundo plano."}), 202
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
 
 
 
@@ -13310,76 +12870,28 @@ def create_app():
     @jwt_required()
     @cross_origin()
     def get_sync_config():
-        claims = get_jwt()
-        perfilid = claims.get("perfilid")
-        idcliente = claims.get("idcliente")
-
-        q_idcliente = request.args.get("idcliente", type=int)
-
-        if perfilid == 0:
-            if q_idcliente:
-                idcliente = q_idcliente
-            elif not idcliente:
-                return jsonify({"error": "Falta idcliente"}), 400
-        else:
-            if not idcliente:
-                return jsonify({"error": "No autorizado"}), 403
+        idcliente = get_jwt().get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
 
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
-
-        if not config:
-            return jsonify({
-                "idcliente": idcliente,
-                "hora_ejecucion": None,
-                "frecuencia_dias": 1,
-                "activo": False,
-                "ultimo_ejecutado": None,
-                "ultimo_auto_ejecutado": None,
-                "resultado_ultima_sync": None,
-                "detalle_ultima_sync": None,
-                "created_at": None,
-
-                # Fecha global oficial para documentos transaccionales Siigo
-                "sync_fecha_desde": None,
-
-                # Compatibilidad con implementación anterior de Documento Soporte
-                "ds_fecha_desde": None,
-            }), 200
-
-        return jsonify(config.as_dict()), 200
+        return jsonify(config.as_dict()) if config else jsonify({})
 
 
     @app.route("/config/sync", methods=["POST", "OPTIONS"])
     @jwt_required()
     @cross_origin()
     def save_sync_config():
-        claims = get_jwt()
-        perfilid = claims.get("perfilid")
-        idcliente = claims.get("idcliente")
-
-        q_idcliente = request.args.get("idcliente", type=int)
-
-        if perfilid == 0:
-            if q_idcliente:
-                idcliente = q_idcliente
-            elif not idcliente:
-                return jsonify({"error": "Falta idcliente"}), 400
-        else:
-            if not idcliente:
-                return jsonify({"error": "No autorizado"}), 403
+        idcliente = get_jwt().get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
 
         data = request.get_json() or {}
 
         hora_ejecucion = _parse_time_hh_mm(data.get("hora_ejecucion") or "02:00")
         frecuencia_dias_raw = data.get("frecuencia_dias", 1)
         activo_raw = data.get("activo", True)
-
-        # Fecha global oficial:
-        # aplica a facturas de venta, notas crédito, compras y Documento Soporte API.
-        # ds_fecha_desde queda como compatibilidad, pero se sincroniza con la global.
-        sync_fecha_desde = _parse_date_yyyy_mm_dd(
-            data.get("sync_fecha_desde") or data.get("ds_fecha_desde")
-        )
+        ds_fecha_desde = _parse_date_yyyy_mm_dd(data.get("ds_fecha_desde"))
 
         try:
             frecuencia_dias = int(frecuencia_dias_raw or 1)
@@ -13396,23 +12908,13 @@ def create_app():
                 hora_ejecucion=hora_ejecucion,
                 frecuencia_dias=frecuencia_dias,
                 activo=bool(activo_raw),
-
-                # Fecha global oficial
-                sync_fecha_desde=sync_fecha_desde,
-
-                # Compatibilidad Documento Soporte
-                ds_fecha_desde=sync_fecha_desde,
+                ds_fecha_desde=ds_fecha_desde,
             )
         else:
             config.hora_ejecucion = hora_ejecucion
             config.frecuencia_dias = frecuencia_dias
             config.activo = bool(activo_raw)
-
-            # Fecha global oficial
-            config.sync_fecha_desde = sync_fecha_desde
-
-            # Compatibilidad Documento Soporte
-            config.ds_fecha_desde = sync_fecha_desde
+            config.ds_fecha_desde = ds_fecha_desde
 
         db.session.add(config)
         db.session.commit()
@@ -13422,81 +12924,50 @@ def create_app():
             "config": config.as_dict()
         }), 200
 
-
-    @app.route("/config/siigo-sync-status", methods=["GET", "OPTIONS"])
+    
+    @app.route("/config/siigo-sync-status", methods=["GET", "OPTIONS"]) 
     @jwt_required()
-    @cross_origin()
+    @cross_origin()  # opcional si ya tienes CORS global
     def config_siigo_sync_status():
-        claims = get_jwt()
-        perfilid = claims.get("perfilid")
-        idcliente = claims.get("idcliente")
-
-        q_idcliente = request.args.get("idcliente", type=int)
-
-        if perfilid == 0:
-            if q_idcliente:
-                idcliente = q_idcliente
-            elif not idcliente:
-                return jsonify({"error": "Falta idcliente"}), 400
-        else:
-            if not idcliente:
-                return jsonify({"error": "No autorizado"}), 403
-
-        cliente = Cliente.query.get(idcliente)
-        tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
+        idcliente = get_jwt().get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
 
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
-
         if not config:
             return jsonify({
                 "pendientes": 0,
                 "ultimo_ejec": None,
-                "ultimo_auto_ejec": None,
                 "resultado": None,
                 "detalle": "",
                 "hora_ejecucion": None,
                 "frecuencia_dias": 1,
                 "activo": False,
-                "timezone": tz_str,
-
-                # Fecha global oficial para documentos transaccionales Siigo
-                "sync_fecha_desde": None,
-
-                # Compatibilidad con implementación previa de Documento Soporte
                 "ds_fecha_desde": None,
-            }), 200
+            })
+        # 🔹 Obtener timezone del cliente (o Bogotá por defecto)
+        cliente = Cliente.query.get(idcliente)
+        tz_str = (cliente.timezone if cliente and cliente.timezone else "America/Bogota")
 
-        # Última ejecución general: manual o cron
+        # 🔹 Convertir de UTC (BD) → hora local del cliente
         if config.ultimo_ejecutado:
             dt_local = utc_to_local(config.ultimo_ejecutado, tz_str)
             ultimo_ejec = dt_local.isoformat()
         else:
             ultimo_ejec = None
 
-        # Última ejecución automática: solo cron
-        if config.ultimo_auto_ejecutado:
-            dt_auto_local = utc_to_local(config.ultimo_auto_ejecutado, tz_str)
-            ultimo_auto_ejec = dt_auto_local.isoformat()
-        else:
-            ultimo_auto_ejec = None
-
         return jsonify({
             "pendientes": 0,
             "ultimo_ejec": ultimo_ejec,
-            "ultimo_auto_ejec": ultimo_auto_ejec,
             "resultado": config.resultado_ultima_sync,
             "detalle": config.detalle_ultima_sync or "",
             "hora_ejecucion": config.hora_ejecucion.strftime("%H:%M") if config.hora_ejecucion else None,
             "frecuencia_dias": config.frecuencia_dias,
             "activo": config.activo,
             "timezone": tz_str,
-
-            # Fecha global oficial
-            "sync_fecha_desde": config.sync_fecha_desde.isoformat() if config.sync_fecha_desde else None,
-
-            # Compatibilidad Documento Soporte
             "ds_fecha_desde": config.ds_fecha_desde.isoformat() if config.ds_fecha_desde else None,
-        }), 200
+        })
+
 
 
 
@@ -13527,70 +12998,24 @@ def create_app():
         # 🧩 Configuración actual del cliente
         config_actual = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
-        # ==========================================================
-        # Fecha global de datos Siigo
-        # ==========================================================
-        # Aplica a documentos transaccionales:
-        # - Facturas de venta
-        # - Notas crédito
-        # - Compras
-        # - Documento Soporte API al insertar desde staging
-        #
-        # No aplica a:
-        # - Catálogos
-        # - Clientes
-        # - Proveedores
-        # - Productos
-        # - Accounts payable
-        # - Cross accounts payable
-        #
+        # Fecha mínima para insertar Documentos Soporte desde staging a siigo_compras.
         # Prioridad:
-        # 1. sync_fecha_desde enviada por frontend
-        # 2. ds_fecha_desde enviada por compatibilidad
-        # 3. config.sync_fecha_desde
-        # 4. config.ds_fecha_desde por compatibilidad
-        # 5. Sin fecha
-        # ==========================================================
-        sync_fecha_desde = None
+        # 1. Fecha enviada en el body del Sync-all manual.
+        # 2. Fecha configurada en siigo_sync_config.ds_fecha_desde.
+        # 3. Si no hay fecha, no se limita por fecha.
+        ds_fecha_desde = data.get("ds_fecha_desde")
 
-        if data.get("sync_fecha_desde"):
-            sync_fecha_desde = data.get("sync_fecha_desde")
-        elif data.get("ds_fecha_desde"):
-            sync_fecha_desde = data.get("ds_fecha_desde")
-        elif config_actual and getattr(config_actual, "sync_fecha_desde", None):
-            sync_fecha_desde = config_actual.sync_fecha_desde.isoformat()
-        elif config_actual and getattr(config_actual, "ds_fecha_desde", None):
-            sync_fecha_desde = config_actual.ds_fecha_desde.isoformat()
+        if not ds_fecha_desde and config_actual and config_actual.ds_fecha_desde:
+            ds_fecha_desde = config_actual.ds_fecha_desde.isoformat()
 
-        # Validar formato. Si viene inválida, la dejamos sin límite.
-        if sync_fecha_desde:
-            fecha_validada = _parse_date_yyyy_mm_dd(sync_fecha_desde)
-            sync_fecha_desde = fecha_validada.isoformat() if fecha_validada else None
-
-        print(
-            f"📅 Fecha global de datos Siigo para cliente {idcliente}: "
-            f"{sync_fecha_desde or 'SIN LÍMITE'}"
-        )
-
-        # Parámetros por módulo
-        facturas_params = {}
-        facturas_deep_params = {
-            "deep": 1,
-            "batch": 100,
-            "only_missing": 1,
-        }
-        notas_credito_params = {}
-        compras_params = {}
         ds_insert_params = {
             "dry_run": 0
         }
 
-        if sync_fecha_desde:
-            facturas_params["since"] = sync_fecha_desde
-            facturas_deep_params["since"] = sync_fecha_desde
-            notas_credito_params["since"] = sync_fecha_desde
-            compras_params["since"] = sync_fecha_desde
-            ds_insert_params["fecha_desde"] = sync_fecha_desde
+        if ds_fecha_desde:
+            ds_insert_params["fecha_desde"] = ds_fecha_desde
+
+        print(f"📄 DS fecha desde resuelta para cliente {idcliente}: {ds_fecha_desde or 'SIN LÍMITE'}")
 
         # 🔁 Secuencia de endpoints Siigo a ejecutar
         sequence = [
@@ -13599,19 +13024,16 @@ def create_app():
             ("/siigo/sync-proveedores", {}),
             ("/siigo/sync-productos", {}),
 
-            # Documentos transaccionales con fecha global
-            ("/siigo/sync-facturas", facturas_params),
-            ("/siigo/sync-facturas", facturas_deep_params),
-            ("/siigo/sync-notas-credito", notas_credito_params),
-            ("/siigo/sync-compras", compras_params),
+            ("/siigo/sync-facturas", {}),
+            ("/siigo/sync-facturas", {"deep": 1, "batch": 100, "only_missing": 1}),
+            ("/siigo/sync-notas-credito", {}),
+            ("/siigo/sync-compras", {}),
 
-            # Documento Soporte API
-            # Staging trae información desde API, pero la inserción a compras
-            # sí respeta la fecha global mediante fecha_desde.
+            # ✅ Documento Soporte API
             ("/siigo/sync-documentos-soporte-staging", {"batch": 50}),
             ("/siigo/insert-documentos-soporte-desde-staging", ds_insert_params),
 
-            # Cuentas por pagar y cruce NO llevan fecha global.
+            # ✅ Cuentas por pagar y cruce
             ("/siigo/sync-accounts-payable", {}),
             ("/siigo/cross-accounts-payable", {}),
         ]
@@ -13711,14 +13133,10 @@ def create_app():
             # Sync-all manual o por cron NO debe cambiar hora_ejecucion.
             # hora_ejecucion solo se cambia desde /config/sync.
 
-            # Si el frontend manda fecha global explícitamente, actualizamos configuración.
-            # Esto permite que el botón manual respete lo que el usuario acaba de configurar.
-            if "sync_fecha_desde" in data or "ds_fecha_desde" in data:
-                fecha_global = _parse_date_yyyy_mm_dd(
-                    data.get("sync_fecha_desde") or data.get("ds_fecha_desde")
-                )
-                config.sync_fecha_desde = fecha_global
-                config.ds_fecha_desde = fecha_global
+            # Si el frontend manda ds_fecha_desde explícitamente, actualizamos la configuración.
+            if "ds_fecha_desde" in data:
+                valor_fecha = data.get("ds_fecha_desde")
+                config.ds_fecha_desde = _parse_date_yyyy_mm_dd(valor_fecha)
 
             # Última ejecución general: manual o cron.
             config.ultimo_ejecutado = now_local
@@ -13733,11 +13151,9 @@ def create_app():
             db.session.add(config)
 
         else:
-            nueva_fecha_global = None
-            if data.get("sync_fecha_desde") or data.get("ds_fecha_desde"):
-                nueva_fecha_global = _parse_date_yyyy_mm_dd(
-                    data.get("sync_fecha_desde") or data.get("ds_fecha_desde")
-                )
+            nueva_ds_fecha_desde = None
+            if data.get("ds_fecha_desde"):
+                nueva_ds_fecha_desde = _parse_date_yyyy_mm_dd(data.get("ds_fecha_desde"))
 
             config = SiigoSyncConfig(
                 idcliente=idcliente,
@@ -13748,8 +13164,7 @@ def create_app():
                 ultimo_auto_ejecutado=now_local if es_cron else None,
                 resultado_ultima_sync=overall_status,
                 detalle_ultima_sync=detalle[:10000],
-                sync_fecha_desde=nueva_fecha_global,
-                ds_fecha_desde=nueva_fecha_global,
+                ds_fecha_desde=nueva_ds_fecha_desde,
             )
             db.session.add(config)
 
@@ -13830,8 +13245,7 @@ def create_app():
         return jsonify({
             "status": overall_status,
             "detalle": detalle,
-            "sync_fecha_desde": sync_fecha_desde,
-            "ds_fecha_desde": sync_fecha_desde,
+            "ds_fecha_desde": ds_fecha_desde,
             "origen": origen,
             "ultimo_auto_ejecutado": (
                 config.ultimo_auto_ejecutado.isoformat()
