@@ -830,17 +830,28 @@ class SiigoSyncLog(db.Model):
     detalle = db.Column(db.Text)
     creado_en = db.Column(db.DateTime(timezone=True), server_default=func.now())
 
+    # Nuevos campos para historial amigable
+    origen = db.Column(db.String(20))
+    total_pasos = db.Column(db.Integer, default=0)
+    pasos_ok = db.Column(db.Integer, default=0)
+    pasos_error = db.Column(db.Integer, default=0)
+    endpoint_fallido = db.Column(db.Text)
+
     def as_dict(self):
         return {
             "id": self.id,
             "idcliente": self.idcliente,
-            "fecha_programada": self.fecha_programada.isoformat(),
+            "fecha_programada": self.fecha_programada.isoformat() if self.fecha_programada else None,
             "ejecutado_en": self.ejecutado_en.isoformat() if self.ejecutado_en else None,
             "resultado": self.resultado,
             "detalle": self.detalle,
-            "creado_en": self.creado_en.isoformat()
+            "creado_en": self.creado_en.isoformat() if self.creado_en else None,
+            "origen": self.origen,
+            "total_pasos": self.total_pasos or 0,
+            "pasos_ok": self.pasos_ok or 0,
+            "pasos_error": self.pasos_error or 0,
+            "endpoint_fallido": self.endpoint_fallido,
         }
-
 
 
 class SiigoSyncMetric(db.Model):

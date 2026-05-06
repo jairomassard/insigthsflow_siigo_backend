@@ -1876,6 +1876,58 @@ def _extraer_espera_rate_limit(texto, default=6):
     return default
 
 
+
+
+# Helpers de detalles de resultado sincronizaciones API siigo:
+def _resumir_detalle_sync(detalle: str):
+    """
+    Lee el detalle técnico de sync-all y calcula:
+    - total de pasos
+    - pasos OK
+    - pasos con error
+    - endpoint fallido
+    """
+    if not detalle:
+        return {
+            "total_pasos": 0,
+            "pasos_ok": 0,
+            "pasos_error": 0,
+            "endpoint_fallido": None,
+        }
+
+    lines = [l for l in detalle.split("\n") if l.strip()]
+    total_pasos = 0
+    pasos_ok = 0
+    pasos_error = 0
+    endpoint_fallido = None
+
+    import re
+
+    for line in lines:
+        match = re.search(r"->\s+(\d{3})", line)
+        if not match:
+            continue
+
+        total_pasos += 1
+        status = int(match.group(1))
+
+        if 200 <= status < 400:
+            pasos_ok += 1
+        else:
+            pasos_error += 1
+            if not endpoint_fallido:
+                endpoint_fallido = line.split(" ")[0]
+
+    return {
+        "total_pasos": total_pasos,
+        "pasos_ok": pasos_ok,
+        "pasos_error": pasos_error,
+        "endpoint_fallido": endpoint_fallido,
+    }
+
+
+
+
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
 
@@ -12319,8 +12371,66 @@ def create_app():
             }), 500
 
 
+    #Endpoints para consultar historial ed sincronizaciones
+    @app.route("/config/siigo-sync-history", methods=["GET"])
+    @jwt_required()
+    def get_siigo_sync_history():
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        limit = request.args.get("limit", default=10, type=int)
+
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        if limit < 1:
+            limit = 10
+        if limit > 50:
+            limit = 50
+
+        cliente = Cliente.query.get(idcliente)
+        tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
+
+        logs = (
+            SiigoSyncLog.query
+            .filter_by(idcliente=idcliente)
+            .order_by(SiigoSyncLog.ejecutado_en.desc().nullslast(), SiigoSyncLog.creado_en.desc())
+            .limit(limit)
+            .all()
+        )
+
+        data = []
+
+        for log in logs:
+            resumen = _resumir_detalle_sync(log.detalle or "")
+
+            data.append({
+                "id": log.id,
+                "idcliente": log.idcliente,
+                "origen": log.origen or "desconocido",
+                "resultado": log.resultado,
+                "ejecutado_en": log.ejecutado_en.isoformat() if log.ejecutado_en else None,
+                "creado_en": log.creado_en.isoformat() if log.creado_en else None,
+                "total_pasos": log.total_pasos if log.total_pasos is not None else resumen["total_pasos"],
+                "pasos_ok": log.pasos_ok if log.pasos_ok is not None else resumen["pasos_ok"],
+                "pasos_error": log.pasos_error if log.pasos_error is not None else resumen["pasos_error"],
+                "endpoint_fallido": log.endpoint_fallido or resumen["endpoint_fallido"],
+                "detalle": log.detalle or "",
+            })
+
+        return jsonify({
+            "timezone": tz_str,
+            "items": data,
+        }), 200
 
 
+# Hasta aqui endpoints de reportes
+#_____________________________________________________________________________________________________________________________________
 
 #----------------------------------------------------------------------------------------------------------------------------------
 # No tocar de qui para abajo 
@@ -13059,12 +13169,19 @@ def create_app():
             db.session.add(config)
 
         # 🧾 Registrar log histórico
+        resumen_sync = _resumir_detalle_sync(detalle)
+
         logrec = SiigoSyncLog(
             idcliente=idcliente,
             fecha_programada=now_local,
             ejecutado_en=now_local,
             resultado=overall_status,
             detalle=detalle[:10000],
+            origen=origen,
+            total_pasos=resumen_sync["total_pasos"],
+            pasos_ok=resumen_sync["pasos_ok"],
+            pasos_error=resumen_sync["pasos_error"],
+            endpoint_fallido=resumen_sync["endpoint_fallido"],
         )
         db.session.add(logrec)
         db.session.commit()
