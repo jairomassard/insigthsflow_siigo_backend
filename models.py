@@ -798,6 +798,10 @@ class SiigoSyncConfig(db.Model):
     detalle_ultima_sync = db.Column(db.Text)
     created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
 
+    # Fecha inicial para insertar Documentos Soporte API desde staging hacia siigo_compras.
+    # Si es NULL, no se limita por fecha.
+    ds_fecha_desde = db.Column(db.Date, nullable=True)
+
     def as_dict(self):
         return {
             "id": self.id,
@@ -808,9 +812,9 @@ class SiigoSyncConfig(db.Model):
             "ultimo_ejecutado": self.ultimo_ejecutado.isoformat() if self.ultimo_ejecutado else None,
             "resultado_ultima_sync": self.resultado_ultima_sync,
             "detalle_ultima_sync": self.detalle_ultima_sync,
-            "created_at": self.created_at.isoformat() if self.created_at else None
-        }
-
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "ds_fecha_desde": self.ds_fecha_desde.isoformat() if self.ds_fecha_desde else None,
+        }   
 
 
 class SiigoSyncLog(db.Model):
