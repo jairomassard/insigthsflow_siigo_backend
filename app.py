@@ -9064,159 +9064,350 @@ def create_app():
 
 
 
-    # 1. Para Botón 1 - Sincronizar cuentas por pagar desde Siigo
+    # 1. Sincronizar cuentas por pagar desde Siigo
     @app.route("/siigo/sync-accounts-payable", methods=["POST"])
-    
     def sync_accounts_payable():
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
-        
-        cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
-        if not cred:
-            return jsonify({"error": "Credenciales no encontradas"}), 404
 
-        access_key = dec(cred.client_secret)
-        token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
-        token = token_data["access_token"]
+        try:
+            cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+            if not cred:
+                return jsonify({
+                    "error": "Credenciales no encontradas",
+                    "tipo": "credenciales_no_encontradas"
+                }), 404
 
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        if cred.partner_id:
-            headers["Partner-Id"] = cred.partner_id
+            if not cred.base_url or not cred.client_id or not cred.client_secret:
+                return jsonify({
+                    "error": "Credenciales de Siigo incompletas",
+                    "tipo": "credenciales_incompletas"
+                }), 400
 
-        url = f"{cred.base_url.rstrip('/')}/v1/accounts-payable?page=1&page_size=100"
-        
-        all_results = []
-        while url:
-            res = requests.get(url, headers=headers)
-            data = res.json()
-            all_results.extend(data.get("results", []))
-            url = data.get("_links", {}).get("next", {}).get("href")
+            access_key = dec(cred.client_secret)
+            if not access_key:
+                return jsonify({
+                    "error": "No se pudo desencriptar el Access Key de Siigo",
+                    "tipo": "access_key_invalida"
+                }), 400
 
-        # Limpiar registros previos de este cliente
-        SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).delete()
+            try:
+                token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            except Exception as e:
+                return jsonify({
+                    "error": "Error autenticando contra Siigo",
+                    "detalle": str(e),
+                    "tipo": "siigo_auth_error"
+                }), 502
 
-        # Insertar nuevos registros (sin fecha/idcompra todavía)
-        for item in all_results:
-            row = SiigoCuentasPorCobrar(
-                idcliente=idcliente,
-                documento=f"{item['due']['prefix']}-{item['due']['consecutive']}",
-                fecha=None,  # pendiente hasta el cruce
-                fecha_vencimiento=item["due"]["date"],
-                proveedor_identificacion=item["provider"]["identification"],
-                proveedor_nombre=item["provider"]["name"],
-                valor=item["due"]["balance"],
-                saldo=item["due"]["balance"],
-                centro_costo=item.get("cost_center", {}).get("name")
-            )
-            db.session.add(row)
+            token = token_data.get("access_token")
+            if not token:
+                return jsonify({
+                    "error": "Siigo no devolvió access_token",
+                    "detalle": token_data,
+                    "tipo": "siigo_token_error"
+                }), 502
 
-        db.session.commit()
-        return jsonify({"mensaje": f"{len(all_results)} registros de cuentas por pagar sincronizados."})
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+
+            if cred.partner_id:
+                headers["Partner-Id"] = cred.partner_id
+
+            base_url = cred.base_url.rstrip("/")
+            url = f"{base_url}/v1/accounts-payable?page=1&page_size=100"
+
+            all_results = []
+            page_count = 0
+            max_pages = 200  # defensa para evitar loops infinitos por enlaces defectuosos
+
+            while url:
+                page_count += 1
+
+                if page_count > max_pages:
+                    return jsonify({
+                        "error": "Se superó el máximo de páginas consultando cuentas por pagar",
+                        "tipo": "accounts_payable_max_pages",
+                        "max_pages": max_pages,
+                        "total_parcial": len(all_results)
+                    }), 500
+
+                try:
+                    res = requests.get(url, headers=headers, timeout=90)
+                except requests.Timeout:
+                    return jsonify({
+                        "error": "Timeout consultando cuentas por pagar en Siigo",
+                        "tipo": "siigo_timeout",
+                        "url": url,
+                        "total_parcial": len(all_results)
+                    }), 504
+                except requests.RequestException as e:
+                    return jsonify({
+                        "error": "Error de conexión consultando cuentas por pagar en Siigo",
+                        "detalle": str(e),
+                        "tipo": "siigo_request_error",
+                        "url": url,
+                        "total_parcial": len(all_results)
+                    }), 502
+
+                if res.status_code != 200:
+                    # Intentar devolver JSON si Siigo lo envía; si no, texto plano truncado.
+                    try:
+                        detalle_siigo = res.json()
+                    except Exception:
+                        detalle_siigo = res.text[:1000]
+
+                    status = 429 if res.status_code == 429 else 502
+
+                    return jsonify({
+                        "error": f"Siigo respondió error HTTP {res.status_code} al consultar cuentas por pagar",
+                        "detalle": detalle_siigo,
+                        "tipo": "siigo_accounts_payable_error",
+                        "url": url,
+                        "total_parcial": len(all_results)
+                    }), status
+
+                try:
+                    data = res.json() or {}
+                except Exception:
+                    return jsonify({
+                        "error": "Siigo devolvió una respuesta no JSON al consultar cuentas por pagar",
+                        "detalle": res.text[:1000],
+                        "tipo": "siigo_non_json_response",
+                        "url": url,
+                        "total_parcial": len(all_results)
+                    }), 502
+
+                results = data.get("results") or []
+                if not isinstance(results, list):
+                    return jsonify({
+                        "error": "Formato inesperado en respuesta de cuentas por pagar",
+                        "detalle": data,
+                        "tipo": "siigo_unexpected_format",
+                        "url": url,
+                        "total_parcial": len(all_results)
+                    }), 502
+
+                all_results.extend(results)
+
+                next_href = ((data.get("_links") or {}).get("next") or {}).get("href")
+
+                if next_href:
+                    # Si Siigo devuelve URL relativa, la convertimos en absoluta.
+                    if str(next_href).startswith("http"):
+                        url = next_href
+                    else:
+                        url = f"{base_url}{next_href}"
+                else:
+                    url = None
+
+            # Limpiar registros previos de este cliente
+            SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).delete()
+
+            insertadas = 0
+            omitidas = 0
+
+            for item in all_results:
+                try:
+                    due = item.get("due") or {}
+                    provider = item.get("provider") or {}
+
+                    prefix = due.get("prefix")
+                    consecutive = due.get("consecutive")
+                    due_date = due.get("date")
+                    balance = due.get("balance")
+
+                    provider_identification = provider.get("identification")
+                    provider_name = provider.get("name")
+
+                    if not prefix or not consecutive:
+                        omitidas += 1
+                        continue
+
+                    documento = f"{prefix}-{consecutive}"
+
+                    centro_costo = None
+                    cost_center = item.get("cost_center")
+                    if isinstance(cost_center, dict):
+                        centro_costo = cost_center.get("name")
+                    elif cost_center:
+                        centro_costo = str(cost_center)
+
+                    row = SiigoCuentasPorCobrar(
+                        idcliente=idcliente,
+                        documento=documento,
+                        fecha=None,  # pendiente hasta el cruce
+                        fecha_vencimiento=due_date,
+                        proveedor_identificacion=provider_identification,
+                        proveedor_nombre=provider_name,
+                        valor=balance,
+                        saldo=balance,
+                        centro_costo=centro_costo
+                    )
+                    db.session.add(row)
+                    insertadas += 1
+
+                except Exception as e:
+                    print(f"⚠️ Error procesando cuenta por pagar: {e} | item={item}")
+                    omitidas += 1
+                    continue
+
+            db.session.commit()
+
+            return jsonify({
+                "mensaje": f"{insertadas} registros de cuentas por pagar sincronizados.",
+                "total_resultados_siigo": len(all_results),
+                "insertadas": insertadas,
+                "omitidas": omitidas,
+                "paginas_consultadas": page_count
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+            traceback.print_exc()
+
+            return jsonify({
+                "error": "Error interno sincronizando cuentas por pagar",
+                "detalle": str(e),
+                "tipo": "accounts_payable_internal_error"
+            }), 500
 
 
     # 2. Cruce con compras locales
     # --- ENDPOINT: Cruce de cuentas por pagar con compras locales ---
     @app.route("/siigo/cross-accounts-payable", methods=["POST"])
-    
     def cross_accounts_payable():
-        from sqlalchemy import func
+        try:
+            from sqlalchemy import func, or_
 
-        idcliente = obtener_idcliente_desde_request()
-        if not idcliente:
-            return jsonify({"error": "Cliente no autorizado"}), 403
+            idcliente = obtener_idcliente_desde_request()
+            if not idcliente:
+                return jsonify({"error": "Cliente no autorizado"}), 403
 
+            # --- Paso 1: Traer las cuentas pendientes desde Siigo ya sincronizadas localmente ---
+            cuentas = SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).all()
 
-        # --- Paso 1: Traer las cuentas pendientes desde Siigo (API /v1/accounts-payable) ---
-        cuentas = SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).all()
+            # --- Paso 2: Traer las compras locales ---
+            compras = {
+                (c.factura_proveedor, c.proveedor_identificacion): (c.idcompra, c.fecha)
+                for c in SiigoCompra.query.filter_by(idcliente=idcliente).all()
+            }
 
-        # --- Paso 2: Traer las compras locales ---
-        compras = {
-            (c.factura_proveedor, c.proveedor_identificacion): (c.idcompra, c.fecha)
-            for c in SiigoCompra.query.filter_by(idcliente=idcliente).all()
-        }
+            matched = 0
+            total = len(cuentas)
+            cuentas_keys = set()
 
-        matched, total = 0, len(cuentas)
-        cuentas_keys = set()
+            # --- Paso 3: Cruce positivo (pendientes) ---
+            for cuenta in cuentas:
+                key = (cuenta.documento, cuenta.proveedor_identificacion)
+                cuentas_keys.add(key)
 
-        # --- Paso 3: Cruce positivo (pendientes) ---
-        for cuenta in cuentas:
-            key = (cuenta.documento, cuenta.proveedor_identificacion)
-            cuentas_keys.add(key)
+                if key in compras:
+                    idcompra, fecha = compras[key]
+                    cuenta.idcompra = idcompra
+                    cuenta.fecha = fecha
 
-            if key in compras:
-                idcompra, fecha = compras[key]
-                cuenta.idcompra, cuenta.fecha = idcompra, fecha
+                    compra = SiigoCompra.query.filter_by(
+                        idcliente=idcliente,
+                        idcompra=idcompra
+                    ).first()
 
-                compra = SiigoCompra.query.filter_by(idcliente=idcliente, idcompra=idcompra).first()
+                    if compra:
+                        compra.estado = "pendiente"
+                        compra.saldo = cuenta.saldo  # saldo directo desde Siigo
+
+                    matched += 1
+
+            # --- Paso 4: Cruce negativo (ya no están pendientes en Siigo) ---
+            compras_keys = set(compras.keys())
+            pagadas = compras_keys - cuentas_keys
+
+            marcadas_pagadas = 0
+
+            for key in pagadas:
+                idcompra, _ = compras[key]
+
+                compra = SiigoCompra.query.filter_by(
+                    idcliente=idcliente,
+                    idcompra=idcompra
+                ).first()
+
                 if compra:
-                    compra.estado = "pendiente"
-                    compra.saldo = cuenta.saldo  # Actualizar saldo directo desde Siigo
-                matched += 1
-
-        # --- Paso 4: Cruce negativo (ya no están pendientes en Siigo) ---
-        compras_keys = set(compras.keys())
-        pagadas = compras_keys - cuentas_keys
-
-        for key in pagadas:
-            idcompra, _ = compras[key]
-            compra = SiigoCompra.query.filter_by(idcliente=idcliente, idcompra=idcompra).first()
-            if compra:
-                compra.estado = "pagado"
-                compra.saldo = 0  # aseguramos saldo cero
-
-        # --- Paso 5: Ajuste especial para Documentos Soporte (DS) ---
-        from sqlalchemy import func, or_
-
-        ds_compras = SiigoCompra.query.filter(
-            SiigoCompra.idcliente == idcliente,
-            SiigoCompra.idcompra.like("DS%")
-        ).all()
-
-        ds_ajustadas = 0
-        detalles_ajuste = {}
-
-        for compra in ds_compras:
-            total_pagado = db.session.query(func.sum(SiigoPagoProveedor.valor)).filter(
-                SiigoPagoProveedor.idcliente == idcliente,
-                or_(
-                    func.trim(func.upper(SiigoPagoProveedor.factura_aplicada)) == func.trim(func.upper(compra.idcompra)),
-                    func.trim(func.upper(SiigoPagoProveedor.factura_aplicada)) == func.trim(func.upper(compra.factura_proveedor))
-                ),
-                SiigoPagoProveedor.proveedor_identificacion == compra.proveedor_identificacion
-            ).scalar() or 0
-
-            if total_pagado > 0:
-                nuevo_saldo = max(float(compra.total or 0) - float(total_pagado), 0)
-                compra.saldo = nuevo_saldo
-
-                if nuevo_saldo == 0:
                     compra.estado = "pagado"
-                elif nuevo_saldo < float(compra.total or 0):
-                    compra.estado = "parcial"
-                else:
-                    compra.estado = "pendiente"
+                    compra.saldo = 0
+                    marcadas_pagadas += 1
 
-                ds_ajustadas += 1
-                detalles_ajuste[str(compra.idcompra)] = {
-                    "factura_proveedor": str(compra.factura_proveedor or ""),
-                    "total": float(compra.total or 0),
-                    "pagado": float(total_pagado),
-                    "saldo": float(nuevo_saldo),
-                    "estado": str(compra.estado or "")
-                }
+            # --- Paso 5: Ajuste especial para Documentos Soporte (DS) ---
+            ds_compras = SiigoCompra.query.filter(
+                SiigoCompra.idcliente == idcliente,
+                SiigoCompra.idcompra.like("DS%")
+            ).all()
 
-        db.session.commit()
+            ds_ajustadas = 0
+            detalles_ajuste = {}
 
-        return jsonify({
-            "mensaje": (
-                f"Cruce completado. {matched}/{total} cuentas vinculadas. "
-                f"{len(pagadas)} marcadas como pagadas. "
-                f"{ds_ajustadas} DS ajustadas por pagos reales."
-            ),
-            "detalles_ds": detalles_ajuste
-        })
+            for compra in ds_compras:
+                total_pagado = db.session.query(func.sum(SiigoPagoProveedor.valor)).filter(
+                    SiigoPagoProveedor.idcliente == idcliente,
+                    or_(
+                        func.trim(func.upper(SiigoPagoProveedor.factura_aplicada)) == func.trim(func.upper(compra.idcompra)),
+                        func.trim(func.upper(SiigoPagoProveedor.factura_aplicada)) == func.trim(func.upper(compra.factura_proveedor))
+                    ),
+                    SiigoPagoProveedor.proveedor_identificacion == compra.proveedor_identificacion
+                ).scalar() or 0
 
+                if total_pagado > 0:
+                    nuevo_saldo = max(float(compra.total or 0) - float(total_pagado), 0)
+                    compra.saldo = nuevo_saldo
+
+                    if nuevo_saldo == 0:
+                        compra.estado = "pagado"
+                    elif nuevo_saldo < float(compra.total or 0):
+                        compra.estado = "parcial"
+                    else:
+                        compra.estado = "pendiente"
+
+                    ds_ajustadas += 1
+
+                    # Evitamos devolver un JSON gigantesco al sync-all/historial.
+                    # Guardamos solo una muestra razonable.
+                    if len(detalles_ajuste) < 50:
+                        detalles_ajuste[str(compra.idcompra)] = {
+                            "factura_proveedor": str(compra.factura_proveedor or ""),
+                            "total": float(compra.total or 0),
+                            "pagado": float(total_pagado),
+                            "saldo": float(nuevo_saldo),
+                            "estado": str(compra.estado or "")
+                        }
+
+            db.session.commit()
+
+            return jsonify({
+                "mensaje": (
+                    f"Cruce completado. {matched}/{total} cuentas vinculadas. "
+                    f"{marcadas_pagadas} marcadas como pagadas. "
+                    f"{ds_ajustadas} DS ajustadas por pagos reales."
+                ),
+                "cuentas_pendientes_leidas": total,
+                "cuentas_vinculadas": matched,
+                "compras_marcadas_pagadas": marcadas_pagadas,
+                "ds_ajustadas": ds_ajustadas,
+                "detalles_ds_muestra": detalles_ajuste,
+                "detalles_ds_total": ds_ajustadas
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+            traceback.print_exc()
+
+            return jsonify({
+                "error": "Error interno cruzando cuentas por pagar",
+                "detalle": str(e),
+                "tipo": "cross_accounts_payable_internal_error"
+            }), 500
 
 
     # --- Importar info de Nómina desde Archivo Excel ---
