@@ -13030,38 +13030,31 @@ def create_app():
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
         if config:
-            if es_manual:
-                config.hora_ejecucion = now_local.time()
+            # IMPORTANTE:
+            # Sync-all manual o por cron NO debe cambiar la hora programada.
+            # La hora_ejecucion solo debe modificarse desde /config/sync.
 
             # Si el frontend manda ds_fecha_desde explícitamente, actualizamos la configuración.
             # Si no la manda, preservamos la que ya exista.
             if "ds_fecha_desde" in data:
                 valor_fecha = data.get("ds_fecha_desde")
-                if valor_fecha:
-                    try:
-                        config.ds_fecha_desde = _parse_date_yyyy_mm_dd(valor_fecha)
-                    except Exception:
-                        pass
-                else:
-                    config.ds_fecha_desde = None
+                config.ds_fecha_desde = _parse_date_yyyy_mm_dd(valor_fecha)
 
             config.ultimo_ejecutado = now_local
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
-        else:
-            hora = now_local.time() if es_manual else _parse_time_hh_mm("02:00")
 
+        else:
+            # Si no existe configuración, creamos una por defecto.
+            # Pero NO usamos la hora manual actual como hora programada.
             nueva_ds_fecha_desde = None
             if data.get("ds_fecha_desde"):
-                try:
-                    nueva_ds_fecha_desde = datetime.strptime(str(data.get("ds_fecha_desde"))[:10], "%Y-%m-%d").date()
-                except Exception:
-                    nueva_ds_fecha_desde = None
+                nueva_ds_fecha_desde = _parse_date_yyyy_mm_dd(data.get("ds_fecha_desde"))
 
             config = SiigoSyncConfig(
                 idcliente=idcliente,
-                hora_ejecucion=hora,
+                hora_ejecucion=_parse_time_hh_mm("02:00"),
                 frecuencia_dias=1,
                 activo=True,
                 ultimo_ejecutado=now_local,
