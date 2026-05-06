@@ -12874,7 +12874,7 @@ def create_app():
 
         data = request.get_json(silent=True) or {}
         origen = data.get("origen", "cron")
-        es_manual = origen == "manual"
+        es_cron = origen == "cron"
 
         log_parts = []
         overall_status = "OK"
@@ -12883,6 +12883,7 @@ def create_app():
         cliente = Cliente.query.get_or_404(idcliente)
         tz_str = cliente.timezone or "America/Bogota"
         print(f"🌎 Zona horaria detectada para cliente {idcliente}: {tz_str}")
+        print(f"🧭 Origen sync-all: {origen}")
 
         # 🧩 Configuración actual del cliente
         config_actual = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
@@ -12907,12 +12908,6 @@ def create_app():
         print(f"📄 DS fecha desde resuelta para cliente {idcliente}: {ds_fecha_desde or 'SIN LÍMITE'}")
 
         # 🔁 Secuencia de endpoints Siigo a ejecutar
-        # Orden importante:
-        # - Primero catálogos/terceros/productos.
-        # - Luego documentos comerciales.
-        # - Luego Documento Soporte API a staging.
-        # - Luego insertar DS nuevos desde staging a siigo_compras.
-        # - Al final cuentas por pagar y cruce para actualizar saldo/estado.
         sequence = [
             ("/siigo/sync-catalogos", {}),
             ("/siigo/sync-customers", {}),
@@ -12924,23 +12919,17 @@ def create_app():
             ("/siigo/sync-notas-credito", {}),
             ("/siigo/sync-compras", {}),
 
-            # ✅ Nuevo flujo Documento Soporte API
-            # 1) Trae todos los DS a staging, incluyendo estados no definitivos.
-            #    Staging NO alimenta reportes.
+            # ✅ Documento Soporte API
             ("/siigo/sync-documentos-soporte-staging", {"batch": 50}),
-
-            # 2) Inserta a siigo_compras solo DS nuevos, Accepted, con total > 0 e items_count > 0.
-            #    Si ds_fecha_desde existe, la aplica; si no existe, no limita por fecha.
             ("/siigo/insert-documentos-soporte-desde-staging", ds_insert_params),
 
-            # ✅ Luego sí se actualizan cuentas por pagar y cruces.
+            # ✅ Cuentas por pagar y cruce
             ("/siigo/sync-accounts-payable", {}),
             ("/siigo/cross-accounts-payable", {}),
         ]
 
         print("🚀 === INICIO SECUENCIA SYNC-ALL ===")
 
-        # 🧠 Ejecuta cada endpoint localmente (sin salir del proceso Flask)
         with app.test_client() as client:
             for ep, params in sequence:
                 try:
@@ -13006,7 +12995,7 @@ def create_app():
                         overall_status = "ERROR"
                         break
 
-                    # Pausa defensiva para evitar rate limit de Siigo entre módulos pesados
+                    # Pausa defensiva para evitar rate limit de Siigo entre módulos
                     if ep.startswith("/siigo/"):
                         time.sleep(2)
 
@@ -13015,39 +13004,43 @@ def create_app():
                     log_parts.append(f"{ep} excepción: {str(e)}")
                     break
 
-        # 🟢 Consolidar logs finales
         detalle = "\n".join(log_parts)
 
-        # ✅ Usar pytz solo localmente
+        # ✅ Usar pytz localmente
         import pytz
         tz_obj = pytz.timezone(tz_str)
         now_local = datetime.now(tz_obj)
+
         print(f"🕒 Fecha/hora local: {now_local.isoformat()}")
         print(f"🕐 Offset local detectado: {now_local.utcoffset()}")
-        print(f"📦 Guardando hora local con zona horaria incluida para cliente {idcliente}")
+        print(f"📦 Guardando resultado sync-all para cliente {idcliente}")
 
         # 🧩 Actualizar configuración o crearla
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
 
         if config:
             # IMPORTANTE:
-            # Sync-all manual o por cron NO debe cambiar la hora programada.
-            # La hora_ejecucion solo debe modificarse desde /config/sync.
+            # Sync-all manual o por cron NO debe cambiar hora_ejecucion.
+            # hora_ejecucion solo se cambia desde /config/sync.
 
             # Si el frontend manda ds_fecha_desde explícitamente, actualizamos la configuración.
-            # Si no la manda, preservamos la que ya exista.
             if "ds_fecha_desde" in data:
                 valor_fecha = data.get("ds_fecha_desde")
                 config.ds_fecha_desde = _parse_date_yyyy_mm_dd(valor_fecha)
 
+            # Última ejecución general: manual o cron.
             config.ultimo_ejecutado = now_local
+
+            # Última ejecución automática: SOLO cron.
+            # Esto evita que una ejecución manual bloquee la ejecución automática del día siguiente.
+            if es_cron:
+                config.ultimo_auto_ejecutado = now_local
+
             config.resultado_ultima_sync = overall_status
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
 
         else:
-            # Si no existe configuración, creamos una por defecto.
-            # Pero NO usamos la hora manual actual como hora programada.
             nueva_ds_fecha_desde = None
             if data.get("ds_fecha_desde"):
                 nueva_ds_fecha_desde = _parse_date_yyyy_mm_dd(data.get("ds_fecha_desde"))
@@ -13058,6 +13051,7 @@ def create_app():
                 frecuencia_dias=1,
                 activo=True,
                 ultimo_ejecutado=now_local,
+                ultimo_auto_ejecutado=now_local if es_cron else None,
                 resultado_ultima_sync=overall_status,
                 detalle_ultima_sync=detalle[:10000],
                 ds_fecha_desde=nueva_ds_fecha_desde,
@@ -13077,7 +13071,7 @@ def create_app():
 
         # 🟢 Crear notificación para administradores del cliente
         try:
-            titulo = "Sincronización automática completada"
+            titulo = "Sincronización automática completada" if es_cron else "Sincronización manual completada"
 
             ep_fallido = None
             for line in reversed(log_parts):
@@ -13086,10 +13080,32 @@ def create_app():
                     break
 
             if overall_status == "OK":
-                mensaje = f"✅ La sincronización automática de Siigo finalizó correctamente el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str})."
+                if es_cron:
+                    mensaje = (
+                        f"✅ La sincronización automática de Siigo finalizó correctamente "
+                        f"el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str})."
+                    )
+                else:
+                    mensaje = (
+                        f"✅ La sincronización manual de Siigo finalizó correctamente "
+                        f"el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str})."
+                    )
                 nivel = "success"
             else:
-                mensaje = f"❌ La sincronización automática de Siigo falló en {ep_fallido or 'uno de los módulos'} el {now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). Revisa los reportes de integración para más detalles."
+                if es_cron:
+                    mensaje = (
+                        f"❌ La sincronización automática de Siigo falló en "
+                        f"{ep_fallido or 'uno de los módulos'} el "
+                        f"{now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). "
+                        f"Revisa los reportes de integración para más detalles."
+                    )
+                else:
+                    mensaje = (
+                        f"❌ La sincronización manual de Siigo falló en "
+                        f"{ep_fallido or 'uno de los módulos'} el "
+                        f"{now_local.strftime('%d/%m/%Y %H:%M')} ({tz_str}). "
+                        f"Revisa los reportes de integración para más detalles."
+                    )
                 nivel = "error"
 
             notif = SystemNotification(
@@ -13107,15 +13123,20 @@ def create_app():
         except Exception as e:
             print(f"⚠️ Error creando notificación: {e}")
 
-        print("✅ Registro en BD completado. Verifica hora con offset correcto en logs/DB.\n")
+        print("✅ Registro en BD completado.\n")
 
         return jsonify({
             "status": overall_status,
             "detalle": detalle,
-            "ds_fecha_desde": ds_fecha_desde
+            "ds_fecha_desde": ds_fecha_desde,
+            "origen": origen,
+            "ultimo_auto_ejecutado": (
+                config.ultimo_auto_ejecutado.isoformat()
+                if config and config.ultimo_auto_ejecutado else None
+            )
         })
 
-
+# Este endpoint no esta en suso pero se deja para futura posible verificacion o uso
     # --- CRON: Verificador automático de sincronización Siigo (cada 4 horas) ---
     @app.route("/cron/siigo-verifier", methods=["GET"])
     def cron_siigo_verifier():
