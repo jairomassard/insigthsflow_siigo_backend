@@ -13148,13 +13148,36 @@ def create_app():
         No toca siigo_compras.
         No toca siigo_compras_items.
         No afecta reportes actuales.
+
+        Si se ejecuta manualmente, registra historial.
+        Si viene desde sync-all, no registra log individual porque sync-all ya registra toda la ejecución.
         """
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+
         batch = request.args.get("batch", default=50, type=int)
         max_pages = request.args.get("max_pages", default=None, type=int)
+
+        endpoint_log = "/siigo/sync-documentos-soporte-staging"
+        log_id = None
+        inicio = time.time()
+
+        params_log = {
+            "batch": batch,
+            "max_pages": max_pages,
+        }
+
+        if not modo_sync_all:
+            log_id = _crear_log_sync_modulo_inicio(
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                origen="manual_modulo",
+                params=params_log,
+                mensaje="Documento Soporte API staging: proceso iniciado."
+            )
 
         try:
             resultado = sync_documentos_soporte_staging_desde_siigo(
@@ -13165,14 +13188,53 @@ def create_app():
 
             status = 500 if isinstance(resultado, dict) and resultado.get("error") else 200
 
+            if not modo_sync_all:
+                if status >= 400:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=f"Error actualizando staging de Documento Soporte: {resultado}",
+                        status_code=status,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+                else:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="OK",
+                        detalle=f"Staging de Documento Soporte actualizado correctamente: {resultado}",
+                        status_code=200,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
             return jsonify(resultado), status
 
         except Exception as e:
             db.session.rollback()
+            traceback.print_exc()
+
+            detalle = f"Error sincronizando documentos soporte staging: {str(e)}"
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="ERROR",
+                    detalle=detalle,
+                    status_code=500,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
+
             return jsonify({
                 "error": "Error sincronizando documentos soporte staging",
                 "detalle": str(e),
+                "tipo": "documentos_soporte_staging_error",
             }), 500
+
 
 
     @app.route("/siigo/insert-documentos-soporte-desde-staging", methods=["POST"])
@@ -13183,10 +13245,18 @@ def create_app():
         No actualiza documentos existentes.
         No inserta Failed, Draft, Rejected, Sent.
         No usa balance API como saldo definitivo.
+
+        dry_run = true  -> Simulación
+        dry_run = false -> Inserción real
+
+        Si se ejecuta manualmente, registra historial.
+        Si viene desde sync-all, no registra log individual porque sync-all ya registra toda la ejecución.
         """
         idcliente = obtener_idcliente_desde_request()
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
+
+        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
 
         payload = request.get_json(silent=True) or {}
 
@@ -13202,6 +13272,34 @@ def create_app():
 
         max_registros = request.args.get("max_registros", default=None, type=int)
 
+        endpoint_log = "/siigo/insert-documentos-soporte-desde-staging"
+        log_id = None
+        inicio = time.time()
+
+        nombre_proceso = (
+            "Simulación de inserción de Documento Soporte"
+            if dry_run
+            else "Inserción de Documento Soporte en compras"
+        )
+
+        params_log = {
+            "dry_run": dry_run,
+            "fecha_desde": fecha_desde,
+            "max_registros": max_registros,
+        }
+
+        if not modo_sync_all:
+            log_id = _crear_log_sync_modulo_inicio(
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                origen="manual_modulo",
+                params=params_log,
+                mensaje=(
+                    f"{nombre_proceso}: proceso iniciado"
+                    + (f" con fecha desde {fecha_desde}." if fecha_desde else " sin límite de fecha.")
+                )
+            )
+
         try:
             resultado = insertar_documentos_soporte_desde_staging(
                 idcliente=idcliente,
@@ -13210,14 +13308,44 @@ def create_app():
                 max_registros=max_registros,
             )
 
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="OK",
+                    detalle=f"{nombre_proceso} finalizada correctamente: {resultado}",
+                    status_code=200,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
+
             return jsonify(resultado), 200
 
         except Exception as e:
             db.session.rollback()
+            traceback.print_exc()
+
+            detalle = f"Error en {nombre_proceso}: {str(e)}"
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="ERROR",
+                    detalle=detalle,
+                    status_code=500,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
+
             return jsonify({
                 "error": "Error insertando documentos soporte desde staging",
                 "detalle": str(e),
+                "tipo": "documentos_soporte_insert_error",
+                "dry_run": dry_run,
+                "fecha_desde": fecha_desde,
             }), 500
+
 
 
     #Endpoints para consultar historial ed sincronizaciones
