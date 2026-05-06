@@ -9071,30 +9071,96 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+        endpoint_log = "/siigo/sync-accounts-payable"
+        log_id = None
+        inicio = time.time()
+
+        if not modo_sync_all:
+            log_id = _crear_log_sync_modulo_inicio(
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                origen="manual_modulo",
+                params={},
+                mensaje="Cuentas por pagar: proceso iniciado."
+            )
+
         try:
             cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
             if not cred:
+                detalle = "Credenciales no encontradas."
+
+                if not modo_sync_all:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=detalle,
+                        status_code=404,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
                 return jsonify({
-                    "error": "Credenciales no encontradas",
+                    "error": detalle,
                     "tipo": "credenciales_no_encontradas"
                 }), 404
 
             if not cred.base_url or not cred.client_id or not cred.client_secret:
+                detalle = "Credenciales de Siigo incompletas."
+
+                if not modo_sync_all:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=detalle,
+                        status_code=400,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
                 return jsonify({
-                    "error": "Credenciales de Siigo incompletas",
+                    "error": detalle,
                     "tipo": "credenciales_incompletas"
                 }), 400
 
             access_key = dec(cred.client_secret)
             if not access_key:
+                detalle = "No se pudo desencriptar el Access Key de Siigo."
+
+                if not modo_sync_all:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=detalle,
+                        status_code=400,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
                 return jsonify({
-                    "error": "No se pudo desencriptar el Access Key de Siigo",
+                    "error": detalle,
                     "tipo": "access_key_invalida"
                 }), 400
 
             try:
                 token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             except Exception as e:
+                detalle = f"Error autenticando contra Siigo: {str(e)}"
+
+                if not modo_sync_all:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=detalle,
+                        status_code=502,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
                 return jsonify({
                     "error": "Error autenticando contra Siigo",
                     "detalle": str(e),
@@ -9103,6 +9169,19 @@ def create_app():
 
             token = token_data.get("access_token")
             if not token:
+                detalle = f"Siigo no devolvió access_token. Respuesta: {token_data}"
+
+                if not modo_sync_all:
+                    _finalizar_log_sync_modulo(
+                        log_id=log_id,
+                        idcliente=idcliente,
+                        endpoint=endpoint_log,
+                        resultado="ERROR",
+                        detalle=detalle,
+                        status_code=502,
+                        duracion_segundos=round(time.time() - inicio, 2),
+                    )
+
                 return jsonify({
                     "error": "Siigo no devolvió access_token",
                     "detalle": token_data,
@@ -9122,12 +9201,28 @@ def create_app():
 
             all_results = []
             page_count = 0
-            max_pages = 200  # defensa para evitar loops infinitos por enlaces defectuosos
+            max_pages = 200
 
             while url:
                 page_count += 1
 
                 if page_count > max_pages:
+                    detalle = (
+                        f"Se superó el máximo de páginas consultando cuentas por pagar. "
+                        f"max_pages={max_pages}, total_parcial={len(all_results)}"
+                    )
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=500,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
+
                     return jsonify({
                         "error": "Se superó el máximo de páginas consultando cuentas por pagar",
                         "tipo": "accounts_payable_max_pages",
@@ -9138,13 +9233,40 @@ def create_app():
                 try:
                     res = requests.get(url, headers=headers, timeout=90)
                 except requests.Timeout:
+                    detalle = f"Timeout consultando cuentas por pagar en Siigo. url={url}"
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=504,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
+
                     return jsonify({
                         "error": "Timeout consultando cuentas por pagar en Siigo",
                         "tipo": "siigo_timeout",
                         "url": url,
                         "total_parcial": len(all_results)
                     }), 504
+
                 except requests.RequestException as e:
+                    detalle = f"Error de conexión consultando cuentas por pagar en Siigo: {str(e)}"
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=502,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
+
                     return jsonify({
                         "error": "Error de conexión consultando cuentas por pagar en Siigo",
                         "detalle": str(e),
@@ -9154,13 +9276,27 @@ def create_app():
                     }), 502
 
                 if res.status_code != 200:
-                    # Intentar devolver JSON si Siigo lo envía; si no, texto plano truncado.
                     try:
                         detalle_siigo = res.json()
                     except Exception:
                         detalle_siigo = res.text[:1000]
 
                     status = 429 if res.status_code == 429 else 502
+                    detalle = (
+                        f"Siigo respondió HTTP {res.status_code} al consultar cuentas por pagar. "
+                        f"Detalle: {detalle_siigo}"
+                    )
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=status,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
 
                     return jsonify({
                         "error": f"Siigo respondió error HTTP {res.status_code} al consultar cuentas por pagar",
@@ -9173,6 +9309,19 @@ def create_app():
                 try:
                     data = res.json() or {}
                 except Exception:
+                    detalle = f"Siigo devolvió una respuesta no JSON. Respuesta: {res.text[:1000]}"
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=502,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
+
                     return jsonify({
                         "error": "Siigo devolvió una respuesta no JSON al consultar cuentas por pagar",
                         "detalle": res.text[:1000],
@@ -9183,6 +9332,19 @@ def create_app():
 
                 results = data.get("results") or []
                 if not isinstance(results, list):
+                    detalle = f"Formato inesperado en respuesta de cuentas por pagar: {data}"
+
+                    if not modo_sync_all:
+                        _finalizar_log_sync_modulo(
+                            log_id=log_id,
+                            idcliente=idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle,
+                            status_code=502,
+                            duracion_segundos=round(time.time() - inicio, 2),
+                        )
+
                     return jsonify({
                         "error": "Formato inesperado en respuesta de cuentas por pagar",
                         "detalle": data,
@@ -9196,7 +9358,6 @@ def create_app():
                 next_href = ((data.get("_links") or {}).get("next") or {}).get("href")
 
                 if next_href:
-                    # Si Siigo devuelve URL relativa, la convertimos en absoluta.
                     if str(next_href).startswith("http"):
                         url = next_href
                     else:
@@ -9204,7 +9365,6 @@ def create_app():
                 else:
                     url = None
 
-            # Limpiar registros previos de este cliente
             SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).delete()
 
             insertadas = 0
@@ -9239,7 +9399,7 @@ def create_app():
                     row = SiigoCuentasPorCobrar(
                         idcliente=idcliente,
                         documento=documento,
-                        fecha=None,  # pendiente hasta el cruce
+                        fecha=None,
                         fecha_vencimiento=due_date,
                         proveedor_identificacion=provider_identification,
                         proveedor_nombre=provider_name,
@@ -9251,46 +9411,83 @@ def create_app():
                     insertadas += 1
 
                 except Exception as e:
-                    print(f"⚠️ Error procesando cuenta por pagar: {e} | item={item}")
+                    print(f"Error procesando cuenta por pagar: {e} | item={item}")
                     omitidas += 1
                     continue
 
             db.session.commit()
 
-            return jsonify({
+            respuesta = {
                 "mensaje": f"{insertadas} registros de cuentas por pagar sincronizados.",
                 "total_resultados_siigo": len(all_results),
                 "insertadas": insertadas,
                 "omitidas": omitidas,
                 "paginas_consultadas": page_count
-            }), 200
+            }
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="OK",
+                    detalle=str(respuesta),
+                    status_code=200,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
+
+            return jsonify(respuesta), 200
 
         except Exception as e:
             db.session.rollback()
             traceback.print_exc()
+
+            detalle = f"Error interno sincronizando cuentas por pagar: {str(e)}"
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="ERROR",
+                    detalle=detalle,
+                    status_code=500,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
 
             return jsonify({
                 "error": "Error interno sincronizando cuentas por pagar",
                 "detalle": str(e),
                 "tipo": "accounts_payable_internal_error"
             }), 500
-
+        
 
     # 2. Cruce con compras locales
-    # --- ENDPOINT: Cruce de cuentas por pagar con compras locales ---
     @app.route("/siigo/cross-accounts-payable", methods=["POST"])
     def cross_accounts_payable():
+        modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+        endpoint_log = "/siigo/cross-accounts-payable"
+        log_id = None
+        inicio = time.time()
+
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        if not modo_sync_all:
+            log_id = _crear_log_sync_modulo_inicio(
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                origen="manual_modulo",
+                params={},
+                mensaje="Cruce de cuentas por pagar: proceso iniciado."
+            )
+
         try:
             from sqlalchemy import func, or_
 
-            idcliente = obtener_idcliente_desde_request()
-            if not idcliente:
-                return jsonify({"error": "Cliente no autorizado"}), 403
-
-            # --- Paso 1: Traer las cuentas pendientes desde Siigo ya sincronizadas localmente ---
             cuentas = SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).all()
 
-            # --- Paso 2: Traer las compras locales ---
             compras = {
                 (c.factura_proveedor, c.proveedor_identificacion): (c.idcompra, c.fecha)
                 for c in SiigoCompra.query.filter_by(idcliente=idcliente).all()
@@ -9300,7 +9497,6 @@ def create_app():
             total = len(cuentas)
             cuentas_keys = set()
 
-            # --- Paso 3: Cruce positivo (pendientes) ---
             for cuenta in cuentas:
                 key = (cuenta.documento, cuenta.proveedor_identificacion)
                 cuentas_keys.add(key)
@@ -9317,11 +9513,10 @@ def create_app():
 
                     if compra:
                         compra.estado = "pendiente"
-                        compra.saldo = cuenta.saldo  # saldo directo desde Siigo
+                        compra.saldo = cuenta.saldo
 
                     matched += 1
 
-            # --- Paso 4: Cruce negativo (ya no están pendientes en Siigo) ---
             compras_keys = set(compras.keys())
             pagadas = compras_keys - cuentas_keys
 
@@ -9340,7 +9535,6 @@ def create_app():
                     compra.saldo = 0
                     marcadas_pagadas += 1
 
-            # --- Paso 5: Ajuste especial para Documentos Soporte (DS) ---
             ds_compras = SiigoCompra.query.filter(
                 SiigoCompra.idcliente == idcliente,
                 SiigoCompra.idcompra.like("DS%")
@@ -9372,8 +9566,6 @@ def create_app():
 
                     ds_ajustadas += 1
 
-                    # Evitamos devolver un JSON gigantesco al sync-all/historial.
-                    # Guardamos solo una muestra razonable.
                     if len(detalles_ajuste) < 50:
                         detalles_ajuste[str(compra.idcompra)] = {
                             "factura_proveedor": str(compra.factura_proveedor or ""),
@@ -9385,7 +9577,7 @@ def create_app():
 
             db.session.commit()
 
-            return jsonify({
+            respuesta = {
                 "mensaje": (
                     f"Cruce completado. {matched}/{total} cuentas vinculadas. "
                     f"{marcadas_pagadas} marcadas como pagadas. "
@@ -9397,18 +9589,44 @@ def create_app():
                 "ds_ajustadas": ds_ajustadas,
                 "detalles_ds_muestra": detalles_ajuste,
                 "detalles_ds_total": ds_ajustadas
-            }), 200
+            }
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="OK",
+                    detalle=str(respuesta),
+                    status_code=200,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
+
+            return jsonify(respuesta), 200
 
         except Exception as e:
             db.session.rollback()
             traceback.print_exc()
+
+            detalle = f"Error interno cruzando cuentas por pagar: {str(e)}"
+
+            if not modo_sync_all:
+                _finalizar_log_sync_modulo(
+                    log_id=log_id,
+                    idcliente=idcliente,
+                    endpoint=endpoint_log,
+                    resultado="ERROR",
+                    detalle=detalle,
+                    status_code=500,
+                    duracion_segundos=round(time.time() - inicio, 2),
+                )
 
             return jsonify({
                 "error": "Error interno cruzando cuentas por pagar",
                 "detalle": str(e),
                 "tipo": "cross_accounts_payable_internal_error"
             }), 500
-
+    
 
     # --- Importar info de Nómina desde Archivo Excel ---
     # --- Importar info de Nómina desde Archivo Excel ---
