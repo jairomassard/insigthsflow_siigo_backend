@@ -1861,6 +1861,22 @@ def _parse_time_hh_mm(value, default_hour=2, default_minute=0):
         return datetime.strptime(f"{default_hour:02d}:{default_minute:02d}", "%H:%M").time()
 
 
+def _extraer_espera_rate_limit(texto, default=6):
+    """
+    Extrae segundos desde mensajes de Siigo como:
+    'Rate limit is exceeded. Try again in 2 seconds.'
+    """
+    try:
+        match = re.search(r"Try again in\s+(\d+)\s+seconds", str(texto), re.IGNORECASE)
+        if match:
+            return max(int(match.group(1)) + 1, default)
+    except Exception:
+        pass
+
+    return default
+
+
+#---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
 
 def create_app():
@@ -12931,20 +12947,43 @@ def create_app():
                     print(f"➡️  Ejecutando {ep} ...")
                     inicio = time.time()
 
-                    resp = client.post(
-                        ep,
-                        headers={
-                            "X-ID-CLIENTE": str(idcliente),
-                            "X-SYNC-ALL": "1"
-                        },
-                        query_string=params
-                    )
+                    max_reintentos_429 = 3
+                    intento_429 = 0
+
+                    while True:
+                        resp = client.post(
+                            ep,
+                            headers={
+                                "X-ID-CLIENTE": str(idcliente),
+                                "X-SYNC-ALL": "1"
+                            },
+                            query_string=params
+                        )
+
+                        status = resp.status_code
+                        body = resp.get_data(as_text=True)
+
+                        if status != 429:
+                            break
+
+                        intento_429 += 1
+
+                        if intento_429 > max_reintentos_429:
+                            print(f"❌ {ep} mantuvo 429 después de {max_reintentos_429} reintentos.")
+                            break
+
+                        espera = _extraer_espera_rate_limit(body, default=6)
+
+                        print(
+                            f"⏳ {ep} respondió 429. "
+                            f"Reintento {intento_429}/{max_reintentos_429} en {espera}s..."
+                        )
+
+                        time.sleep(espera)
 
                     dur = round(time.time() - inicio, 1)
-                    print(f"✅ {ep} completado en {dur}s → {resp.status_code}")
+                    print(f"✅ {ep} completado en {dur}s -> {status}")
 
-                    status = resp.status_code
-                    body = resp.get_data(as_text=True)
                     log_parts.append(f"{ep} {params} -> {status}: {body}")
 
                     # 📊 Guardar métrica individual del endpoint
