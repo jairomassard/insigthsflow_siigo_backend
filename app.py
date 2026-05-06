@@ -6242,6 +6242,18 @@ def create_app():
                     only_missing=only_missing,
                     since=since,
                 )
+
+                # Si la función interna devuelve error, no responder 200.
+                if isinstance(resultado, dict) and resultado.get("error"):
+                    detalle = str(resultado.get("detalle") or "")
+                    status = 429 if "429" in str(resultado.get("error")) or "requests_limit" in detalle else 500
+
+                    return jsonify({
+                        "error": resultado.get("error"),
+                        "detalle": resultado.get("detalle"),
+                        "mensaje": "Error sincronizando compras desde Siigo."
+                    }), status
+
                 return jsonify({"mensaje": f"Compras sincronizadas: {resultado}"}), 200
 
             # 🔹 Modo UI manual: background thread
@@ -12954,6 +12966,10 @@ def create_app():
                     if status >= 400:
                         overall_status = "ERROR"
                         break
+
+                    # Pausa defensiva para evitar rate limit de Siigo entre módulos pesados
+                    if ep.startswith("/siigo/"):
+                        time.sleep(2)
 
                 except Exception as e:
                     overall_status = "ERROR"

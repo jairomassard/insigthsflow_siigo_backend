@@ -2,6 +2,9 @@ import requests
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
+import time
+import re
+
 from models import (
     db,
     SiigoCredencial,
@@ -10,7 +13,63 @@ from models import (
     SiigoDocumentoSoporteApiStaging,
 )
 from utils import _siigo_auth_json_for_client, _siigo_headers_bearer
+def _extraer_segundos_rate_limit(data, default=6):
+    """
+    Intenta leer el mensaje de Siigo:
+    'Rate limit is exceeded. Try again in 5 seconds.'
+    y extrae los segundos sugeridos.
+    """
+    try:
+        texto = ""
 
+        if isinstance(data, dict):
+            errores = data.get("Errors") or data.get("errors") or []
+            if isinstance(errores, list) and errores:
+                texto = str(errores[0].get("Message") or errores[0].get("message") or "")
+            else:
+                texto = str(data)
+        else:
+            texto = str(data)
+
+        match = re.search(r"Try again in\s+(\d+)\s+seconds", texto, re.IGNORECASE)
+        if match:
+            return max(int(match.group(1)) + 1, default)
+
+    except Exception:
+        pass
+
+    return default
+
+
+def _get_siigo_con_reintentos(url, headers, timeout=90, max_retries=5):
+    """
+    GET con reintentos para manejar rate limit 429 de Siigo.
+    """
+    intento = 0
+
+    while True:
+        intento += 1
+        r = requests.get(url, headers=headers, timeout=timeout)
+
+        if r.status_code != 429:
+            return r
+
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+
+        espera = _extraer_segundos_rate_limit(data, default=6)
+
+        print(
+            f"[DS-STAGING] Rate limit 429 en intento {intento}/{max_retries}. "
+            f"Esperando {espera}s antes de reintentar..."
+        )
+
+        if intento >= max_retries:
+            return r
+
+        time.sleep(espera)
 
 def _to_decimal(value):
     if value is None:
@@ -203,7 +262,7 @@ def sync_documentos_soporte_staging_desde_siigo(
         url = f"{base_url}/v1/purchase-support-documents?page_size={batch_size}&page={page}"
         print(f"[DS-STAGING] Consultando página {page}: {url}")
 
-        r = requests.get(url, headers=headers, timeout=90)
+        r = _get_siigo_con_reintentos(url, headers=headers, timeout=90, max_retries=5)
 
         try:
             data = r.json()
@@ -329,7 +388,10 @@ def sync_documentos_soporte_staging_desde_siigo(
 
         db.session.commit()
 
+        # Pausa leve entre páginas para no saturar la API de Siigo
+        time.sleep(0.5)
         page += 1
+
 
     return {
         "mensaje": "Sincronización staging de documentos soporte finalizada.",
