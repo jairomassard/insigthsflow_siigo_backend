@@ -12740,8 +12740,6 @@ def create_app():
         return jsonify(config.as_dict()) if config else jsonify({})
 
 
-
-
     @app.route("/config/sync", methods=["POST", "OPTIONS"])
     @jwt_required()
     @cross_origin()
@@ -12752,18 +12750,41 @@ def create_app():
 
         data = request.get_json() or {}
 
+        hora_ejecucion = _parse_time_hh_mm(data.get("hora_ejecucion") or "02:00")
+        frecuencia_dias_raw = data.get("frecuencia_dias", 1)
+        activo_raw = data.get("activo", True)
+        ds_fecha_desde = _parse_date_yyyy_mm_dd(data.get("ds_fecha_desde"))
+
+        try:
+            frecuencia_dias = int(frecuencia_dias_raw or 1)
+            if frecuencia_dias < 1:
+                frecuencia_dias = 1
+        except Exception:
+            frecuencia_dias = 1
+
         config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
+
         if not config:
-            config = SiigoSyncConfig(idcliente=idcliente)
-            db.session.add(config)
+            config = SiigoSyncConfig(
+                idcliente=idcliente,
+                hora_ejecucion=hora_ejecucion,
+                frecuencia_dias=frecuencia_dias,
+                activo=bool(activo_raw),
+                ds_fecha_desde=ds_fecha_desde,
+            )
+        else:
+            config.hora_ejecucion = hora_ejecucion
+            config.frecuencia_dias = frecuencia_dias
+            config.activo = bool(activo_raw)
+            config.ds_fecha_desde = ds_fecha_desde
 
-        config.hora_ejecucion = data["hora_ejecucion"]
-        config.frecuencia_dias = data.get("frecuencia_dias", 1)
-        config.activo = data.get("activo", True)
-
+        db.session.add(config)
         db.session.commit()
-        return jsonify({"mensaje": "Configuración guardada"}), 200
 
+        return jsonify({
+            "mensaje": "Configuración guardada",
+            "config": config.as_dict()
+        }), 200
 
     
     @app.route("/config/siigo-sync-status", methods=["GET", "OPTIONS"]) 
@@ -12784,8 +12805,8 @@ def create_app():
                 "hora_ejecucion": None,
                 "frecuencia_dias": 1,
                 "activo": False,
+                "ds_fecha_desde": None,
             })
-
         # 🔹 Obtener timezone del cliente (o Bogotá por defecto)
         cliente = Cliente.query.get(idcliente)
         tz_str = (cliente.timezone if cliente and cliente.timezone else "America/Bogota")
@@ -12799,13 +12820,14 @@ def create_app():
 
         return jsonify({
             "pendientes": 0,
-            "ultimo_ejec": ultimo_ejec,  # ← ya viene en hora local
+            "ultimo_ejec": ultimo_ejec,
             "resultado": config.resultado_ultima_sync,
             "detalle": config.detalle_ultima_sync or "",
             "hora_ejecucion": config.hora_ejecucion.strftime("%H:%M") if config.hora_ejecucion else None,
             "frecuencia_dias": config.frecuencia_dias,
             "activo": config.activo,
-            "timezone": tz_str  # 👈 nuevo campo
+            "timezone": tz_str,
+            "ds_fecha_desde": config.ds_fecha_desde.isoformat() if config.ds_fecha_desde else None,
         })
 
 
@@ -12962,7 +12984,7 @@ def create_app():
                 valor_fecha = data.get("ds_fecha_desde")
                 if valor_fecha:
                     try:
-                        config.ds_fecha_desde = datetime.strptime(str(valor_fecha)[:10], "%Y-%m-%d").date()
+                        config.ds_fecha_desde = _parse_date_yyyy_mm_dd(valor_fecha)
                     except Exception:
                         pass
                 else:
@@ -12973,7 +12995,7 @@ def create_app():
             config.detalle_ultima_sync = detalle[:10000]
             db.session.add(config)
         else:
-            hora = now_local.time() if es_manual else datetime.time(2, 0)
+            hora = now_local.time() if es_manual else _parse_time_hh_mm("02:00")
 
             nueva_ds_fecha_desde = None
             if data.get("ds_fecha_desde"):
