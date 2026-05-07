@@ -2896,27 +2896,47 @@ def create_app():
             db.session.flush()
 
             # =====================================================
-            # 6. Clonar solo permisos incluidos en el paquete
+            # 6. Crear permisos del cliente desde los códigos del paquete
+            #    IMPORTANTE:
+            #    Antes esto clonaba desde Permiso.idcliente == 1.
+            #    Eso hacía que el sistema dependiera de Binaria como cliente plantilla.
+            #    Ahora los permisos se crean desde paquete_permisos / codigos_permitidos.
             # =====================================================
-            permisos_base = (
-                Permiso.query
-                .filter(
-                    Permiso.idcliente == 1,
-                    Permiso.codigo.in_(codigos_permitidos),
-                    Permiso.activo.is_(True)
-                )
-                .all()
-            )
+
+            def nombre_permiso_desde_codigo(codigo: str) -> str:
+                """
+                Convierte un código como 'ver_reporte_balance_general'
+                en un nombre legible como 'Ver Reporte Balance General'.
+                """
+                return str(codigo or "").replace("_", " ").strip().title()
 
             permisos_creados = []
 
-            for p in permisos_base:
+            for codigo in sorted(codigos_permitidos):
+                codigo_limpio = str(codigo).strip()
+
+                if not codigo_limpio:
+                    continue
+
+                permiso_existente = (
+                    Permiso.query
+                    .filter(
+                        Permiso.idcliente == cliente.idcliente,
+                        Permiso.codigo == codigo_limpio
+                    )
+                    .first()
+                )
+
+                if permiso_existente:
+                    permisos_creados.append(permiso_existente)
+                    continue
+
                 nuevo = Permiso(
                     idcliente=cliente.idcliente,
-                    nombre=p.nombre,
-                    codigo=p.codigo,
-                    descripcion=p.descripcion,
-                    activo=p.activo
+                    nombre=nombre_permiso_desde_codigo(codigo_limpio),
+                    codigo=codigo_limpio,
+                    descripcion=f"Permiso generado automáticamente para el código '{codigo_limpio}'.",
+                    activo=True
                 )
 
                 db.session.add(nuevo)
@@ -2927,9 +2947,13 @@ def create_app():
             if not permisos_creados:
                 db.session.rollback()
                 return jsonify({
-                    "error": "No se encontraron permisos base en cliente 1 para los códigos del paquete."
+                    "error": "No se pudieron crear permisos para el cliente desde los códigos del paquete.",
+                    "detalle": (
+                        "Verifica que paquete_permisos tenga códigos activos para los paquetes seleccionados."
+                    )
                 }), 400
-
+            
+            
             # =====================================================
             # 7. Asignar todos los permisos contratados al perfil administrador
             # =====================================================
