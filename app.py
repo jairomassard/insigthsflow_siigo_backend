@@ -4110,9 +4110,15 @@ def create_app():
     @app.route("/siigo/sync-catalogos", methods=["POST"])
     def siigo_sync_catalogos():
         idcliente = obtener_idcliente_desde_request()
+        print(f"🔹 Sync catálogos iniciado para cliente {idcliente}")
 
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
+
+        # Cuando este endpoint es llamado desde /siigo/sync-all,
+        # NO debe crear log individual para no duplicar el historial.
+        # El log general lo crea /siigo/sync-all al final.
+        es_sync_all = request.headers.get("X-SYNC-ALL") == "1"
 
         endpoint_actual = "/siigo/sync-catalogos"
         ejecutado_en = datetime.now(timezone.utc)
@@ -4123,12 +4129,20 @@ def create_app():
         endpoint_fallido = None
 
         def guardar_log(resultado: str, detalle: str):
+            """
+            Guarda historial solo cuando la ejecución es manual por módulo.
+            Si viene desde sync-all, no guarda log individual para evitar duplicados.
+            """
+            if es_sync_all:
+                return None
+
             try:
                 log = SiigoSyncLog(
                     idcliente=idcliente,
+                    fecha_programada=ejecutado_en,
+                    ejecutado_en=ejecutado_en,
                     origen="manual_modulo",
                     resultado=resultado,
-                    ejecutado_en=ejecutado_en,
                     total_pasos=2,
                     pasos_ok=pasos_ok,
                     pasos_error=pasos_error,
@@ -4138,10 +4152,10 @@ def create_app():
                 db.session.add(log)
                 db.session.commit()
                 return log.id
+
             except Exception as log_error:
                 db.session.rollback()
-                print(f"Error guardando log de sincronización catálogos: {log_error}")
-                return None
+                raise Exception(f"Error guardando log de sincronización catálogos: {str(log_error)}")
 
         cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
 
@@ -4149,11 +4163,20 @@ def create_app():
             pasos_error = 1
             endpoint_fallido = endpoint_actual
             detalle = "❌ Credenciales no encontradas para el cliente."
-            log_id = guardar_log("ERROR", detalle)
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Credenciales no encontradas",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
 
             return jsonify({
                 "error": "Credenciales no encontradas",
                 "log_id": log_id,
+                "detalle": detalle,
             }), 400
 
         access_key = dec(cred.client_secret)
@@ -4162,11 +4185,20 @@ def create_app():
             pasos_error = 1
             endpoint_fallido = endpoint_actual
             detalle = "❌ No se pudo desencriptar access_key de Siigo."
-            log_id = guardar_log("ERROR", detalle)
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "No se pudo desencriptar access_key",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
 
             return jsonify({
                 "error": "No se pudo desencriptar access_key",
                 "log_id": log_id,
+                "detalle": detalle,
             }), 400
 
         try:
@@ -4174,9 +4206,9 @@ def create_app():
             token = token_data["access_token"]
             headers = _headers_bearer(token)
 
-            # =====================================================
-            # Paso 1: Sync vendedores
-            # =====================================================
+            # -------------------------
+            # Sync vendedores
+            # -------------------------
             vendedores_insertados = 0
 
             r_v = _request_with_retries(
@@ -4192,6 +4224,7 @@ def create_app():
 
                 payload = r_v.json()
 
+                # Puede ser lista o dict con results
                 if isinstance(payload, list):
                     results = payload
                 else:
@@ -4218,19 +4251,21 @@ def create_app():
 
                 pasos_ok += 1
                 detalle_lines.append(
-                    f"✅ GET /v1/users -> {r_v.status_code}. Vendedores sincronizados: {vendedores_insertados}."
+                    f"✅ GET /v1/users -> {r_v.status_code}. "
+                    f"Vendedores sincronizados: {vendedores_insertados}."
                 )
 
             else:
                 pasos_error += 1
-                endpoint_fallido = "/v1/users"
+                endpoint_fallido = endpoint_fallido or "/v1/users"
                 detalle_lines.append(
-                    f"❌ GET /v1/users -> {r_v.status_code}. Respuesta: {r_v.text[:1000]}"
+                    f"❌ GET /v1/users -> {r_v.status_code}. "
+                    f"Respuesta: {r_v.text[:1000]}"
                 )
 
-            # =====================================================
-            # Paso 2: Sync centros de costo
-            # =====================================================
+            # -------------------------
+            # Sync centros de costo
+            # -------------------------
             centros_insertados = 0
 
             r_cc = _request_with_retries(
@@ -4246,6 +4281,7 @@ def create_app():
 
                 payload = r_cc.json()
 
+                # Puede ser lista o dict con results
                 if isinstance(payload, list):
                     results = payload
                 else:
@@ -4268,42 +4304,56 @@ def create_app():
 
                 pasos_ok += 1
                 detalle_lines.append(
-                    f"✅ GET /v1/cost-centers -> {r_cc.status_code}. Centros de costo sincronizados: {centros_insertados}."
+                    f"✅ GET /v1/cost-centers -> {r_cc.status_code}. "
+                    f"Centros de costo sincronizados: {centros_insertados}."
                 )
 
             else:
                 pasos_error += 1
-                if not endpoint_fallido:
-                    endpoint_fallido = "/v1/cost-centers"
-
+                endpoint_fallido = endpoint_fallido or "/v1/cost-centers"
                 detalle_lines.append(
-                    f"❌ GET /v1/cost-centers -> {r_cc.status_code}. Respuesta: {r_cc.text[:1000]}"
+                    f"❌ GET /v1/cost-centers -> {r_cc.status_code}. "
+                    f"Respuesta: {r_cc.text[:1000]}"
                 )
 
-            # =====================================================
-            # Commit de datos sincronizados
-            # =====================================================
-            if pasos_error > 0:
-                db.session.rollback()
+            # IMPORTANTE:
+            # Se conserva el comportamiento anterior: si Siigo devuelve error en un catálogo,
+            # no frenamos necesariamente toda la operación con HTTP 500.
+            # Guardamos detalle e historial, pero el endpoint puede responder 200 si no hubo excepción Python.
+            db.session.commit()
 
-                detalle = "\n".join(detalle_lines)
-                log_id = guardar_log("ERROR", detalle)
+            detalle = "\n".join(detalle_lines)
+            resultado_log = "OK" if pasos_error == 0 else "ERROR"
 
+            try:
+                log_id = guardar_log(resultado_log, detalle)
+            except Exception as log_error:
                 return jsonify({
-                    "error": "No se pudieron sincronizar completamente los catálogos.",
+                    "error": "Los catálogos se procesaron, pero falló el registro del historial.",
                     "detalle": detalle,
-                    "log_id": log_id,
+                    "error_log": str(log_error),
                     "pasos_ok": pasos_ok,
                     "pasos_error": pasos_error,
                 }), 500
 
-            db.session.commit()
-
-            detalle = "\n".join(detalle_lines)
-            log_id = guardar_log("OK", detalle)
+            if pasos_error > 0:
+                return jsonify({
+                    "mensaje": "Catálogos procesados con alertas.",
+                    "estado": "ERROR",
+                    "log_id": log_id,
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                    "endpoint_fallido": endpoint_fallido,
+                    "detalle": detalle,
+                    "resumen": {
+                        "vendedores_insertados": vendedores_insertados,
+                        "centros_costo_insertados": centros_insertados,
+                    }
+                }), 200
 
             return jsonify({
                 "mensaje": "Catálogos sincronizados correctamente",
+                "estado": "OK",
                 "log_id": log_id,
                 "pasos_ok": pasos_ok,
                 "pasos_error": pasos_error,
@@ -4319,18 +4369,23 @@ def create_app():
 
             pasos_error = max(pasos_error, 1)
             endpoint_fallido = endpoint_fallido or endpoint_actual
-
             detalle_lines.append(f"❌ Error general en sincronización de catálogos: {str(e)}")
             detalle = "\n".join(detalle_lines)
 
-            log_id = guardar_log("ERROR", detalle)
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": str(e),
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
 
             return jsonify({
                 "error": str(e),
                 "detalle": detalle,
                 "log_id": log_id,
-            }), 500
-        
+            }), 500      
 
     # ------------------------------------------
     # Catálogo de Vendedores
