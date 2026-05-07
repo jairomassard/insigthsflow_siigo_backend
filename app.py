@@ -4106,36 +4106,92 @@ def create_app():
 
 
     # Sincronización de vendedores y de centros de costos
+    # Sincronización de vendedores y centros de costos
     @app.route("/siigo/sync-catalogos", methods=["POST"])
-
     def siigo_sync_catalogos():
         idcliente = obtener_idcliente_desde_request()
+
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        endpoint_actual = "/siigo/sync-catalogos"
+        ejecutado_en = datetime.now(timezone.utc)
+
+        detalle_lines = []
+        pasos_ok = 0
+        pasos_error = 0
+        endpoint_fallido = None
+
+        def guardar_log(resultado: str, detalle: str):
+            try:
+                log = SiigoSyncLog(
+                    idcliente=idcliente,
+                    origen="manual_modulo",
+                    resultado=resultado,
+                    ejecutado_en=ejecutado_en,
+                    total_pasos=2,
+                    pasos_ok=pasos_ok,
+                    pasos_error=pasos_error,
+                    endpoint_fallido=endpoint_fallido,
+                    detalle=detalle,
+                )
+                db.session.add(log)
+                db.session.commit()
+                return log.id
+            except Exception as log_error:
+                db.session.rollback()
+                print(f"Error guardando log de sincronización catálogos: {log_error}")
+                return None
+
         cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+
         if not cred:
-            return jsonify({"error": "Credenciales no encontradas"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ Credenciales no encontradas para el cliente."
+            log_id = guardar_log("ERROR", detalle)
+
+            return jsonify({
+                "error": "Credenciales no encontradas",
+                "log_id": log_id,
+            }), 400
 
         access_key = dec(cred.client_secret)
+
         if not access_key:
-            return jsonify({"error": "No se pudo desencriptar access_key"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ No se pudo desencriptar access_key de Siigo."
+            log_id = guardar_log("ERROR", detalle)
+
+            return jsonify({
+                "error": "No se pudo desencriptar access_key",
+                "log_id": log_id,
+            }), 400
 
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data["access_token"]
             headers = _headers_bearer(token)
 
-            # -------------------------
-            # Sync vendedores
-            # -------------------------
-            r_v = _request_with_retries("GET", f"{cred.base_url.rstrip('/')}/v1/users", headers=headers)
+            # =====================================================
+            # Paso 1: Sync vendedores
+            # =====================================================
+            vendedores_insertados = 0
+
+            r_v = _request_with_retries(
+                "GET",
+                f"{cred.base_url.rstrip('/')}/v1/users",
+                headers=headers
+            )
+
             if r_v.status_code == 200:
-                db.session.query(SiigoVendedor).filter_by(idcliente=idcliente).delete(synchronize_session=False)
+                db.session.query(SiigoVendedor).filter_by(idcliente=idcliente).delete(
+                    synchronize_session=False
+                )
 
                 payload = r_v.json()
 
-                # puede ser lista o dict con results
                 if isinstance(payload, list):
                     results = payload
                 else:
@@ -4147,27 +4203,49 @@ def create_app():
                         u.get("name")
                         or u.get("full_name")
                         or u.get("display_name")
-                        or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+                        or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
                     )
+
                     if vid:
                         db.session.add(SiigoVendedor(
                             id=vid,
-                            idcliente=idcliente,  # ← Este campo es clave
+                            idcliente=idcliente,
                             nombre=nombre,
                             activo=bool(u.get("active", True)),
                             metadata_json=u
                         ))
+                        vendedores_insertados += 1
 
-            # -------------------------
-            # Sync centros de costo
-            # -------------------------
-            r_cc = _request_with_retries("GET", f"{cred.base_url.rstrip('/')}/v1/cost-centers", headers=headers)
+                pasos_ok += 1
+                detalle_lines.append(
+                    f"✅ GET /v1/users -> {r_v.status_code}. Vendedores sincronizados: {vendedores_insertados}."
+                )
+
+            else:
+                pasos_error += 1
+                endpoint_fallido = "/v1/users"
+                detalle_lines.append(
+                    f"❌ GET /v1/users -> {r_v.status_code}. Respuesta: {r_v.text[:1000]}"
+                )
+
+            # =====================================================
+            # Paso 2: Sync centros de costo
+            # =====================================================
+            centros_insertados = 0
+
+            r_cc = _request_with_retries(
+                "GET",
+                f"{cred.base_url.rstrip('/')}/v1/cost-centers",
+                headers=headers
+            )
+
             if r_cc.status_code == 200:
-                db.session.query(SiigoCentroCosto).filter_by(idcliente=idcliente).delete(synchronize_session=False)
+                db.session.query(SiigoCentroCosto).filter_by(idcliente=idcliente).delete(
+                    synchronize_session=False
+                )
 
                 payload = r_cc.json()
 
-                # puede ser lista o dict con results
                 if isinstance(payload, list):
                     results = payload
                 else:
@@ -4176,23 +4254,83 @@ def create_app():
                 for c in results:
                     cid = c.get("id")
                     nombre = _str(c.get("name") or c.get("description") or c.get("code"))
+
                     if cid:
                         db.session.add(SiigoCentroCosto(
                             id=cid,
-                            idcliente=idcliente,  # ✅ Obligatorio después del cambio
+                            idcliente=idcliente,
                             nombre=nombre,
                             codigo=_str(c.get("code")),
                             activo=bool(c.get("active", True)),
                             metadata_json=c
                         ))
+                        centros_insertados += 1
+
+                pasos_ok += 1
+                detalle_lines.append(
+                    f"✅ GET /v1/cost-centers -> {r_cc.status_code}. Centros de costo sincronizados: {centros_insertados}."
+                )
+
+            else:
+                pasos_error += 1
+                if not endpoint_fallido:
+                    endpoint_fallido = "/v1/cost-centers"
+
+                detalle_lines.append(
+                    f"❌ GET /v1/cost-centers -> {r_cc.status_code}. Respuesta: {r_cc.text[:1000]}"
+                )
+
+            # =====================================================
+            # Commit de datos sincronizados
+            # =====================================================
+            if pasos_error > 0:
+                db.session.rollback()
+
+                detalle = "\n".join(detalle_lines)
+                log_id = guardar_log("ERROR", detalle)
+
+                return jsonify({
+                    "error": "No se pudieron sincronizar completamente los catálogos.",
+                    "detalle": detalle,
+                    "log_id": log_id,
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                }), 500
 
             db.session.commit()
-            return jsonify({"mensaje": "Catálogos sincronizados correctamente"}), 200
+
+            detalle = "\n".join(detalle_lines)
+            log_id = guardar_log("OK", detalle)
+
+            return jsonify({
+                "mensaje": "Catálogos sincronizados correctamente",
+                "log_id": log_id,
+                "pasos_ok": pasos_ok,
+                "pasos_error": pasos_error,
+                "detalle": detalle,
+                "resumen": {
+                    "vendedores_insertados": vendedores_insertados,
+                    "centros_costo_insertados": centros_insertados,
+                }
+            }), 200
 
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": str(e)}), 500
 
+            pasos_error = max(pasos_error, 1)
+            endpoint_fallido = endpoint_fallido or endpoint_actual
+
+            detalle_lines.append(f"❌ Error general en sincronización de catálogos: {str(e)}")
+            detalle = "\n".join(detalle_lines)
+
+            log_id = guardar_log("ERROR", detalle)
+
+            return jsonify({
+                "error": str(e),
+                "detalle": detalle,
+                "log_id": log_id,
+            }), 500
+        
 
     # ------------------------------------------
     # Catálogo de Vendedores
