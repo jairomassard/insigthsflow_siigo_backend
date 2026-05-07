@@ -4454,19 +4454,98 @@ def create_app():
 
     # Sincronización de clientes (terceros) desde Siigo
     @app.route("/siigo/sync-customers", methods=["POST"])
-    
     def siigo_sync_customers():
         idcliente = obtener_idcliente_desde_request()
+        print(f"🔹 Sync clientes iniciado para cliente {idcliente}")
+
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        # Cuando este endpoint es llamado desde /siigo/sync-all,
+        # NO debe crear log individual para no duplicar el historial.
+        # El log general lo crea /siigo/sync-all al final.
+        es_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+
+        endpoint_actual = "/siigo/sync-customers"
+        ejecutado_en = datetime.now(timezone.utc)
+
+        detalle_lines = []
+        pasos_ok = 0
+        pasos_error = 0
+        endpoint_fallido = None
+
+        def guardar_log(resultado: str, detalle: str):
+            """
+            Guarda historial solo cuando la ejecución es manual por módulo.
+            Si viene desde sync-all, no guarda log individual para evitar duplicados.
+            """
+            if es_sync_all:
+                return None
+
+            try:
+                log = SiigoSyncLog(
+                    idcliente=idcliente,
+                    fecha_programada=ejecutado_en,
+                    ejecutado_en=ejecutado_en,
+                    origen="manual_modulo",
+                    resultado=resultado,
+                    total_pasos=1,
+                    pasos_ok=pasos_ok,
+                    pasos_error=pasos_error,
+                    endpoint_fallido=endpoint_fallido,
+                    detalle=detalle,
+                )
+                db.session.add(log)
+                db.session.commit()
+                return log.id
+
+            except Exception as log_error:
+                db.session.rollback()
+                raise Exception(f"Error guardando log de sincronización clientes: {str(log_error)}")
+
         cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+
         if not cred:
-            return jsonify({"error": "Credenciales no encontradas"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ Credenciales no encontradas para el cliente."
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Credenciales no encontradas",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": "Credenciales no encontradas",
+                "log_id": log_id,
+                "detalle": detalle,
+            }), 400
 
         access_key = dec(cred.client_secret)
+
         if not access_key:
-            return jsonify({"error": "No se pudo desencriptar access_key"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ No se pudo desencriptar access_key de Siigo."
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "No se pudo desencriptar access_key",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": "No se pudo desencriptar access_key",
+                "log_id": log_id,
+                "detalle": detalle,
+            }), 400
 
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
@@ -4477,30 +4556,46 @@ def create_app():
             page = 1
             page_size = 100
             total_insertados = 0
+            total_paginas = 0
 
-            # limpiar tabla antes de insertar
+            # Limpiar tabla antes de insertar
             db.session.query(SiigoCustomer).filter_by(idcliente=idcliente).delete()
 
             while True:
                 url = f"{base_url}/v1/customers?page={page}&page_size={page_size}"
                 r = _request_with_retries("GET", url, headers=headers)
+
                 if r.status_code != 200:
+                    pasos_error += 1
+                    endpoint_fallido = endpoint_fallido or "/v1/customers"
+                    detalle_lines.append(
+                        f"❌ GET /v1/customers page={page} page_size={page_size} -> {r.status_code}. "
+                        f"Respuesta: {r.text[:1000]}"
+                    )
                     break
 
                 payload = r.json()
-                results = []
+
                 if isinstance(payload, list):
                     results = payload
                 else:
                     results = payload.get("results", [])
 
                 if not results:
+                    detalle_lines.append(
+                        f"ℹ️ GET /v1/customers page={page} -> {r.status_code}. "
+                        f"Sin más clientes para sincronizar."
+                    )
                     break
+
+                total_paginas += 1
 
                 for c in results:
                     cid = c.get("id")
+
                     if not cid:
                         continue
+
                     sc = SiigoCustomer(
                         id=cid,
                         idcliente=idcliente,
@@ -4515,23 +4610,98 @@ def create_app():
                         contacts=c.get("contacts"),
                         metadata_json=c,
                     )
+
                     db.session.add(sc)
                     total_insertados += 1
 
-                # ¿hay más páginas?
+                detalle_lines.append(
+                    f"✅ GET /v1/customers page={page} page_size={page_size} -> {r.status_code}. "
+                    f"Clientes recibidos en página: {len(results)}. "
+                    f"Acumulado insertado: {total_insertados}."
+                )
+
+                # ¿Hay más páginas?
                 links = payload.get("_links", {}) if isinstance(payload, dict) else {}
+
                 if not links.get("next") or not links["next"].get("href"):
                     break
 
                 page += 1
 
+            if pasos_error == 0:
+                pasos_ok = 1
+
             db.session.commit()
-            return jsonify({"mensaje": f"Clientes sincronizados: {total_insertados}"}), 200
+
+            detalle_lines.append(
+                f"📊 Resumen clientes: páginas procesadas: {total_paginas}, "
+                f"clientes sincronizados: {total_insertados}, errores: {pasos_error}."
+            )
+
+            detalle = "\n".join(detalle_lines)
+            resultado_log = "OK" if pasos_error == 0 else "ERROR"
+
+            try:
+                log_id = guardar_log(resultado_log, detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Los clientes se procesaron, pero falló el registro del historial.",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                }), 500
+
+            if pasos_error > 0:
+                return jsonify({
+                    "mensaje": f"Clientes procesados con alertas. Sincronizados: {total_insertados}",
+                    "estado": "ERROR",
+                    "log_id": log_id,
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                    "endpoint_fallido": endpoint_fallido,
+                    "detalle": detalle,
+                    "resumen": {
+                        "clientes_insertados": total_insertados,
+                        "paginas_procesadas": total_paginas,
+                    }
+                }), 200
+
+            return jsonify({
+                "mensaje": f"Clientes sincronizados: {total_insertados}",
+                "estado": "OK",
+                "log_id": log_id,
+                "pasos_ok": pasos_ok,
+                "pasos_error": pasos_error,
+                "detalle": detalle,
+                "resumen": {
+                    "clientes_insertados": total_insertados,
+                    "paginas_procesadas": total_paginas,
+                }
+            }), 200
 
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": str(e)}), 500
 
+            pasos_error = max(pasos_error, 1)
+            endpoint_fallido = endpoint_fallido or endpoint_actual
+            detalle_lines.append(f"❌ Error general en sincronización de clientes: {str(e)}")
+            detalle = "\n".join(detalle_lines)
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": str(e),
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": str(e),
+                "detalle": detalle,
+                "log_id": log_id,
+            }), 500
 
 
     # ==========================
@@ -7509,22 +7679,100 @@ def create_app():
 
 
 
-    # realiza la sincronización de provedores trayendo tanprovedores, clientes y otros (ULTIMO SEP 24 2025)
+    # realiza la sincronización de proveedores trayendo proveedores, clientes y otros
     @app.route("/siigo/sync-proveedores", methods=["POST"])
-    
     def siigo_sync_proveedores():
         idcliente = obtener_idcliente_desde_request()
+        print(f"🔹 Sync proveedores iniciado para cliente {idcliente}")
+
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        # Cuando este endpoint es llamado desde /siigo/sync-all,
+        # NO debe crear log individual para no duplicar el historial.
+        # El log general lo crea /siigo/sync-all al final.
+        es_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+
+        endpoint_actual = "/siigo/sync-proveedores"
+        ejecutado_en = datetime.now(timezone.utc)
+
+        detalle_lines = []
+        pasos_ok = 0
+        pasos_error = 0
+        endpoint_fallido = None
+
+        def guardar_log(resultado: str, detalle: str):
+            """
+            Guarda historial solo cuando la ejecución es manual por módulo.
+            Si viene desde sync-all, no guarda log individual para evitar duplicados.
+            """
+            if es_sync_all:
+                return None
+
+            try:
+                log = SiigoSyncLog(
+                    idcliente=idcliente,
+                    fecha_programada=ejecutado_en,
+                    ejecutado_en=ejecutado_en,
+                    origen="manual_modulo",
+                    resultado=resultado,
+                    total_pasos=1,
+                    pasos_ok=pasos_ok,
+                    pasos_error=pasos_error,
+                    endpoint_fallido=endpoint_fallido,
+                    detalle=detalle,
+                )
+                db.session.add(log)
+                db.session.commit()
+                return log.id
+
+            except Exception as log_error:
+                db.session.rollback()
+                raise Exception(f"Error guardando log de sincronización proveedores: {str(log_error)}")
 
         cred = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
+
         if not cred:
-            return jsonify({"error": "Credenciales Siigo no configuradas"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ Credenciales Siigo no configuradas para el cliente."
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Credenciales Siigo no configuradas",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": "Credenciales Siigo no configuradas",
+                "log_id": log_id,
+                "detalle": detalle,
+            }), 400
 
         access_key = dec(cred.client_secret)
+
         if not access_key:
-            return jsonify({"error": "No se pudo desencriptar access_key"}), 400
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+            detalle = "❌ No se pudo desencriptar access_key de Siigo."
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "No se pudo desencriptar access_key",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": "No se pudo desencriptar access_key",
+                "log_id": log_id,
+                "detalle": detalle,
+            }), 400
 
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
@@ -7536,17 +7784,33 @@ def create_app():
             page_size = 100
             total_insertados = 0
             total_actualizados = 0
+            total_paginas = 0
 
             while True:
                 url = f"{base_url}/v1/customers?page={page}&page_size={page_size}"
                 r = requests.get(url, headers=headers)
+
                 if r.status_code != 200:
+                    pasos_error += 1
+                    endpoint_fallido = endpoint_fallido or "/v1/customers"
+                    detalle_lines.append(
+                        f"❌ GET /v1/customers page={page} page_size={page_size} -> {r.status_code}. "
+                        f"Respuesta: {r.text[:1000]}"
+                    )
                     break
 
                 payload = r.json()
                 results = payload if isinstance(payload, list) else payload.get("results", [])
+
                 if not results:
+                    detalle_lines.append(
+                        f"ℹ️ GET /v1/customers page={page} -> {r.status_code}. "
+                        f"Sin más proveedores/terceros para sincronizar."
+                    )
                     break
+
+                total_paginas += 1
+                procesados_pagina = 0
 
                 for c in results:
                     # Si no tiene identificación, ignorar
@@ -7555,16 +7819,23 @@ def create_app():
                         continue
 
                     nombre_raw = c.get("name", [])
-                    nombre = " ".join([n for n in nombre_raw if n is not None]).strip()
+
+                    if isinstance(nombre_raw, list):
+                        nombre = " ".join([str(n) for n in nombre_raw if n is not None]).strip()
+                    else:
+                        nombre = str(nombre_raw or "").strip()
+
                     tipo_ident = quitar_tildes(c.get("id_type", {}).get("name", ""))
                     dv = c.get("check_digit", "")
                     direccion = c.get("address", {}).get("address", "")
                     ciudad = quitar_tildes(c.get("address", {}).get("city", {}).get("city_name", ""))
                     telefonos = c.get("phones", [])
                     telefono = ""
+
                     if telefonos:
                         tel = telefonos[0]
                         telefono = f"{tel.get('indicative', '')} {tel.get('number', '')}".strip()
+
                     estado = "Activo" if c.get("active") else "Inactivo"
 
                     stmt = insert(SiigoProveedor).values(
@@ -7591,25 +7862,105 @@ def create_app():
                     )
 
                     res = db.session.execute(stmt)
+
                     if res.rowcount == 1:
                         total_insertados += 1
                     else:
                         total_actualizados += 1
+
+                    procesados_pagina += 1
+
+                detalle_lines.append(
+                    f"✅ GET /v1/customers page={page} page_size={page_size} -> {r.status_code}. "
+                    f"Terceros procesados en página: {procesados_pagina}. "
+                    f"Acumulado insertados: {total_insertados}, actualizados: {total_actualizados}."
+                )
 
                 if "_links" in payload and payload["_links"].get("next"):
                     page += 1
                 else:
                     break
 
+            if pasos_error == 0:
+                pasos_ok = 1
+
             db.session.commit()
+
+            detalle_lines.append(
+                f"📊 Resumen proveedores: páginas procesadas: {total_paginas}, "
+                f"insertados: {total_insertados}, actualizados: {total_actualizados}, "
+                f"errores: {pasos_error}."
+            )
+
+            detalle = "\n".join(detalle_lines)
+            resultado_log = "OK" if pasos_error == 0 else "ERROR"
+
+            try:
+                log_id = guardar_log(resultado_log, detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Los proveedores se procesaron, pero falló el registro del historial.",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                }), 500
+
+            if pasos_error > 0:
+                return jsonify({
+                    "mensaje": (
+                        f"Proveedores procesados con alertas: "
+                        f"{total_insertados}, actualizados: {total_actualizados}"
+                    ),
+                    "estado": "ERROR",
+                    "log_id": log_id,
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                    "endpoint_fallido": endpoint_fallido,
+                    "detalle": detalle,
+                    "resumen": {
+                        "proveedores_insertados": total_insertados,
+                        "proveedores_actualizados": total_actualizados,
+                        "paginas_procesadas": total_paginas,
+                    }
+                }), 200
+
             return jsonify({
-                "mensaje": f"Proveedores sincronizados: {total_insertados}, actualizados: {total_actualizados}"
+                "mensaje": f"Proveedores sincronizados: {total_insertados}, actualizados: {total_actualizados}",
+                "estado": "OK",
+                "log_id": log_id,
+                "pasos_ok": pasos_ok,
+                "pasos_error": pasos_error,
+                "detalle": detalle,
+                "resumen": {
+                    "proveedores_insertados": total_insertados,
+                    "proveedores_actualizados": total_actualizados,
+                    "paginas_procesadas": total_paginas,
+                }
             }), 200
 
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": str(e)}), 500
 
+            pasos_error = max(pasos_error, 1)
+            endpoint_fallido = endpoint_fallido or endpoint_actual
+            detalle_lines.append(f"❌ Error general en sincronización de proveedores: {str(e)}")
+            detalle = "\n".join(detalle_lines)
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": str(e),
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": str(e),
+                "detalle": detalle,
+                "log_id": log_id,
+            }), 500
 
 
     # PReview en pagina de los proveedores que se cargaran
@@ -10298,19 +10649,111 @@ def create_app():
 
     ############ ENDPOINTS PRODUCTOS ############
     @app.route("/siigo/sync-productos", methods=["POST"])
-    
     def siigo_sync_productos():
         idcliente = obtener_idcliente_desde_request()
+        print(f"🔹 Sync productos iniciado para cliente {idcliente}")
+
         if not idcliente:
             return jsonify({"error": "Cliente no autorizado"}), 403
 
+        # Cuando este endpoint es llamado desde /siigo/sync-all,
+        # NO debe crear log individual para no duplicar el historial.
+        # El log general lo crea /siigo/sync-all al final.
+        es_sync_all = request.headers.get("X-SYNC-ALL") == "1"
+
+        endpoint_actual = "/siigo/sync-productos"
+        ejecutado_en = datetime.now(timezone.utc)
+
+        pasos_ok = 0
+        pasos_error = 0
+        endpoint_fallido = None
+        detalle_lines = []
+
+        def guardar_log(resultado: str, detalle: str):
+            """
+            Guarda historial solo cuando la ejecución es manual por módulo.
+            Si viene desde sync-all, no guarda log individual para evitar duplicados.
+            """
+            if es_sync_all:
+                return None
+
+            try:
+                log = SiigoSyncLog(
+                    idcliente=idcliente,
+                    fecha_programada=ejecutado_en,
+                    ejecutado_en=ejecutado_en,
+                    origen="manual_modulo",
+                    resultado=resultado,
+                    total_pasos=1,
+                    pasos_ok=pasos_ok,
+                    pasos_error=pasos_error,
+                    endpoint_fallido=endpoint_fallido,
+                    detalle=detalle,
+                )
+                db.session.add(log)
+                db.session.commit()
+                return log.id
+
+            except Exception as log_error:
+                db.session.rollback()
+                raise Exception(f"Error guardando log de sincronización productos: {str(log_error)}")
+
         try:
             from siigo.siigo_sync_productos import sync_productos_desde_siigo
-            mensaje = sync_productos_desde_siigo(idcliente)
-            return jsonify({"mensaje": mensaje})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
 
+            mensaje = sync_productos_desde_siigo(idcliente)
+
+            pasos_ok = 1
+            pasos_error = 0
+            detalle_lines.append(f"✅ Productos sincronizados correctamente.")
+            detalle_lines.append(str(mensaje))
+
+            detalle = "\n".join(detalle_lines)
+
+            try:
+                log_id = guardar_log("OK", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": "Los productos se procesaron, pero falló el registro del historial.",
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                    "pasos_ok": pasos_ok,
+                    "pasos_error": pasos_error,
+                }), 500
+
+            return jsonify({
+                "mensaje": mensaje,
+                "estado": "OK",
+                "log_id": log_id,
+                "pasos_ok": pasos_ok,
+                "pasos_error": pasos_error,
+                "detalle": detalle,
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+
+            pasos_ok = 0
+            pasos_error = 1
+            endpoint_fallido = endpoint_actual
+
+            detalle_lines.append(f"❌ Error general en sincronización de productos: {str(e)}")
+            detalle = "\n".join(detalle_lines)
+
+            try:
+                log_id = guardar_log("ERROR", detalle)
+            except Exception as log_error:
+                return jsonify({
+                    "error": str(e),
+                    "detalle": detalle,
+                    "error_log": str(log_error),
+                }), 500
+
+            return jsonify({
+                "error": str(e),
+                "detalle": detalle,
+                "log_id": log_id,
+            }), 500
 
 
 
