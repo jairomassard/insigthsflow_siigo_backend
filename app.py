@@ -2953,7 +2953,7 @@ def create_app():
                     )
                 }), 400
             
-            
+
             # =====================================================
             # 7. Asignar todos los permisos contratados al perfil administrador
             # =====================================================
@@ -3449,9 +3449,10 @@ def create_app():
         q_idcliente = request.args.get("idcliente", type=int)
 
         if perfilid == 0:
-            if not q_idcliente:
+            if q_idcliente:
+                idcliente = q_idcliente
+            elif not idcliente:
                 return jsonify({"error": "Falta idcliente"}), 400
-            idcliente = q_idcliente
         else:
             if not idcliente:
                 return jsonify({"error": "No autorizado"}), 403
@@ -3461,7 +3462,6 @@ def create_app():
         hora_ejecucion_raw = data.get("hora_ejecucion") or "02:00"
         frecuencia_dias_raw = data.get("frecuencia_dias", 1)
         activo_raw = data.get("activo", True)
-        ds_fecha_desde_raw = data.get("ds_fecha_desde")
 
         hora_ejecucion = _parse_time_hh_mm(hora_ejecucion_raw, 2, 0)
 
@@ -3472,35 +3472,63 @@ def create_app():
         except Exception:
             frecuencia_dias = 1
 
-        sync_fecha_desde = _parse_date_yyyy_mm_dd(data.get("sync_fecha_desde") or data.get("ds_fecha_desde"))
-
-        config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
-
-        if not config:
-            config = SiigoSyncConfig(
-                idcliente=idcliente,
-                hora_ejecucion=hora_ejecucion,
-                frecuencia_dias=frecuencia_dias,
-                activo=bool(activo_raw),
-                sync_fecha_desde=sync_fecha_desde,
-                ds_fecha_desde=sync_fecha_desde,
-            )
+        if isinstance(activo_raw, bool):
+            activo = activo_raw
+        elif isinstance(activo_raw, str):
+            activo = activo_raw.strip().lower() in ("true", "1", "yes", "si", "sí", "on")
         else:
-            config.hora_ejecucion = hora_ejecucion
-            config.frecuencia_dias = frecuencia_dias
-            config.activo = bool(activo_raw)
-            config.sync_fecha_desde = sync_fecha_desde
-            config.ds_fecha_desde = sync_fecha_desde
-        
-        
-        db.session.add(cfg)
-        db.session.commit()
+            activo = bool(activo_raw)
 
-        return jsonify({
-            "message": "Configuración de sincronización guardada",
-            "config": cfg.as_dict()
-        }), 200
+        sync_fecha_desde = _parse_date_yyyy_mm_dd(
+            data.get("sync_fecha_desde") or data.get("ds_fecha_desde")
+        )
 
+        try:
+            config = SiigoSyncConfig.query.filter_by(idcliente=idcliente).first()
+
+            if not config:
+                config = SiigoSyncConfig(
+                    idcliente=idcliente,
+                    hora_ejecucion=hora_ejecucion,
+                    frecuencia_dias=frecuencia_dias,
+                    activo=activo,
+                    sync_fecha_desde=sync_fecha_desde,
+                    ds_fecha_desde=sync_fecha_desde,
+                )
+                db.session.add(config)
+            else:
+                config.hora_ejecucion = hora_ejecucion
+                config.frecuencia_dias = frecuencia_dias
+                config.activo = activo
+                config.sync_fecha_desde = sync_fecha_desde
+                config.ds_fecha_desde = sync_fecha_desde
+
+            db.session.commit()
+
+            return jsonify({
+                "message": "Configuración de sincronización guardada",
+                "config": config.as_dict() if hasattr(config, "as_dict") else {
+                    "id": config.id,
+                    "idcliente": config.idcliente,
+                    "hora_ejecucion": str(config.hora_ejecucion) if config.hora_ejecucion else None,
+                    "frecuencia_dias": config.frecuencia_dias,
+                    "activo": config.activo,
+                    "sync_fecha_desde": config.sync_fecha_desde.isoformat() if config.sync_fecha_desde else None,
+                    "ds_fecha_desde": config.ds_fecha_desde.isoformat() if config.ds_fecha_desde else None,
+                    "ultimo_ejecutado": config.ultimo_ejecutado.isoformat() if config.ultimo_ejecutado else None,
+                    "ultimo_auto_ejecutado": config.ultimo_auto_ejecutado.isoformat() if config.ultimo_auto_ejecutado else None,
+                    "resultado_ultima_sync": config.resultado_ultima_sync,
+                    "detalle_ultima_sync": config.detalle_ultima_sync,
+                }
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo guardar la configuración de sincronización.",
+                "detalle": str(e),
+                "idcliente": idcliente,
+            }), 500
 
     @app.route("/config/siigo", methods=["PUT"])
     @jwt_required()
