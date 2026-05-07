@@ -9630,11 +9630,18 @@ def create_app():
 
     # --- Importar info de Nómina desde Archivo Excel ---
     # --- Importar info de Nómina desde Archivo Excel ---
+    # --- Importar info de Nómina desde Archivo Excel ---
     @app.route("/importar/nomina-excel", methods=["POST"])
     @jwt_required()
     def importar_nomina_desde_excel():
         import pandas as pd
         from datetime import date
+        import time
+        import traceback
+
+        inicio = time.time()
+        endpoint_log = "/importar/nomina-excel"
+        log_id = None
 
         claims = get_jwt()
         idcliente = claims.get("idcliente")
@@ -9642,21 +9649,75 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "Token sin cliente asociado"}), 400
 
-        if "archivo" not in request.files:
-            return jsonify({"error": "Archivo no proporcionado"}), 400
-
         mes = request.form.get("mes")
         anio = request.form.get("anio")
 
+        params_log = {
+            "mes": mes,
+            "anio": anio,
+        }
+
+        # Crear log desde el inicio para que también queden rastros de errores de archivo/formato.
+        log_id = _crear_log_sync_modulo_inicio(
+            idcliente=idcliente,
+            endpoint=endpoint_log,
+            origen="manual_modulo",
+            params=params_log,
+            mensaje=(
+                "Carga de nomina desde Excel: proceso iniciado"
+                + (f" para periodo {mes}/{anio}." if mes and anio else ".")
+            )
+        )
+
+        if "archivo" not in request.files:
+            detalle = "Archivo no proporcionado."
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=400,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
+            return jsonify({"error": "Archivo no proporcionado"}), 400
+
         if not mes or not anio:
+            detalle = "Debe indicar mes y ano de la nomina."
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=400,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
             return jsonify({"error": "Debe indicar mes y año de la nómina"}), 400
 
         try:
             periodo = date(int(anio), int(mes), 1)
         except Exception:
+            detalle = f"Mes o ano invalido. mes={mes}, anio={anio}"
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=400,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
             return jsonify({"error": "Mes o año inválido"}), 400
 
         file = request.files["archivo"]
+        filename = getattr(file, "filename", "") or ""
 
         try:
             df_raw = pd.read_excel(file, header=None, engine="calamine")
@@ -9671,12 +9732,24 @@ def create_app():
             df = df.dropna(how="all")
             df = df.where(pd.notnull(df), None)
 
-            print("✅ Encabezados detectados:", headers)
-            print("✅ Total filas a importar:", len(df))
+            print("Encabezados detectados:", headers)
+            print("Total filas a importar:", len(df))
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
+
+            detalle = f"No se pudo leer el Excel de nomina. Archivo={filename}. Error={str(e)}"
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=400,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
             return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
         # Resolver columnas por equivalencias
@@ -9684,14 +9757,31 @@ def create_app():
 
         faltantes = [campo for campo in REQUIRED_DB_FIELDS if campo not in columnas_resueltas]
         if faltantes:
+            detalle = (
+                "El archivo de nomina no contiene todas las columnas minimas requeridas. "
+                f"Faltantes={faltantes}. Columnas detectadas={headers}"
+            )
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=400,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
             return jsonify({
                 "error": "El archivo no contiene todas las columnas mínimas requeridas.",
                 "faltantes": faltantes,
-                "columnas_detectadas": headers
+                "columnas_detectadas": headers,
+                "log_id": log_id,
             }), 400
 
         registros_creados = 0
         errores = []
+        eliminados = 0
 
         try:
             # Borrado previo del periodo para evitar duplicados
@@ -9700,7 +9790,7 @@ def create_app():
                 periodo=periodo
             ).delete(synchronize_session=False)
 
-            print(f"🗑️ Registros previos eliminados para cliente={idcliente}, periodo={periodo}: {eliminados}")
+            print(f"Registros previos eliminados para cliente={idcliente}, periodo={periodo}: {eliminados}")
 
             for idx, row in df.iterrows():
                 try:
@@ -9734,19 +9824,60 @@ def create_app():
 
         except Exception as e:
             db.session.rollback()
-            import traceback
             traceback.print_exc()
-            return jsonify({"error": f"Error al guardar en BD: {str(e)}"}), 500
 
-        return jsonify({
+            detalle = (
+                f"Error al guardar nomina en BD. Periodo={periodo}. "
+                f"Archivo={filename}. Error={str(e)}"
+            )
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=detalle,
+                status_code=500,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
+            return jsonify({
+                "error": f"Error al guardar en BD: {str(e)}",
+                "log_id": log_id,
+            }), 500
+
+        respuesta = {
             "mensaje": f"Nómina {periodo.strftime('%B %Y')} importada correctamente.",
             "registros_creados": registros_creados,
             "registros_reemplazados_previos": eliminados,
             "errores": errores[:10],
-            "columnas_mapeadas": columnas_resueltas
-        })
+            "total_errores": len(errores),
+            "columnas_mapeadas": columnas_resueltas,
+            "periodo": periodo.isoformat(),
+            "archivo": filename,
+            "log_id": log_id,
+        }
 
+        # Si hubo errores parciales por fila, lo dejamos como OK porque el archivo cargó,
+        # pero el detalle técnico conserva el conteo de errores.
+        _finalizar_log_sync_modulo(
+            log_id=log_id,
+            idcliente=idcliente,
+            endpoint=endpoint_log,
+            resultado="OK",
+            detalle=(
+                f"Carga de nomina finalizada correctamente. "
+                f"Periodo={periodo.isoformat()}. "
+                f"Archivo={filename}. "
+                f"Registros creados={registros_creados}. "
+                f"Registros reemplazados previos={eliminados}. "
+                f"Errores por fila={len(errores)}."
+            ),
+            status_code=200,
+            duracion_segundos=round(time.time() - inicio, 2),
+        )
 
+        return jsonify(respuesta), 200
 
 
 
