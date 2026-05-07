@@ -3930,6 +3930,243 @@ def create_app():
 
 
 
+    @app.route("/siigo/sync-facturas-completar-detalle", methods=["POST"])
+    def siigo_sync_facturas_completar_detalle():
+        idcliente = obtener_idcliente_desde_request()
+
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        data = request.get_json(silent=True) or {}
+
+        # Mantener estable: lotes de 100
+        batch_size = data.get("batch_size") or request.args.get("batch", default=100, type=int)
+        since = data.get("since") or request.args.get("since")
+        max_lotes = data.get("max_lotes") or request.args.get("max_lotes", default=100, type=int)
+
+        try:
+            batch_size = int(batch_size or 100)
+        except Exception:
+            batch_size = 100
+
+        try:
+            max_lotes = int(max_lotes or 100)
+        except Exception:
+            max_lotes = 100
+
+        # Protección para evitar cargas exageradas por error
+        if batch_size < 1:
+            batch_size = 100
+
+        if batch_size > 100:
+            batch_size = 100
+
+        if max_lotes < 1:
+            max_lotes = 100
+
+        if max_lotes > 100:
+            max_lotes = 100
+
+        endpoint_log = "/siigo/sync-facturas-completar-detalle"
+
+        params_log = {
+            "batch_size": batch_size,
+            "since": since,
+            "max_lotes": max_lotes,
+        }
+
+        try:
+            from siigo.siigo_sync_refactor import sync_facturas_desde_siigo, contar_facturas_pendientes
+
+            pendientes_iniciales = contar_facturas_pendientes(
+                idcliente=idcliente,
+                since=since,
+            )
+
+            log_id = _crear_log_sync_modulo_inicio(
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                origen="manual_modulo",
+                params=params_log,
+                mensaje=(
+                    f"Completar detalle de facturas: proceso iniciado. "
+                    f"Pendientes iniciales: {pendientes_iniciales}. "
+                    f"Lote máximo: {batch_size}. "
+                    + (f"Fecha desde: {since}." if since else "Sin límite de fecha.")
+                ),
+            )
+
+            def trabajo_completar_detalle(
+                local_idcliente,
+                local_log_id,
+                local_batch_size,
+                local_since,
+                local_max_lotes,
+            ):
+                with app.app_context():
+                    inicio = time.time()
+
+                    try:
+                        from siigo.siigo_sync_refactor import sync_facturas_desde_siigo, contar_facturas_pendientes
+
+                        pendientes_antes_global = contar_facturas_pendientes(
+                            idcliente=local_idcliente,
+                            since=local_since,
+                        )
+
+                        detalle_lines = []
+                        detalle_lines.append("Completar detalle de facturas iniciado.")
+                        detalle_lines.append(f"Pendientes iniciales: {pendientes_antes_global}.")
+                        detalle_lines.append(f"Tamaño de lote: {local_batch_size}.")
+                        detalle_lines.append(f"Máximo de lotes permitidos: {local_max_lotes}.")
+                        detalle_lines.append(f"Fecha desde: {local_since or 'SIN LIMITE'}.")
+                        detalle_lines.append("")
+
+                        lotes_ejecutados = 0
+                        pendientes_actuales = pendientes_antes_global
+
+                        while pendientes_actuales > 0 and lotes_ejecutados < local_max_lotes:
+                            lotes_ejecutados += 1
+
+                            pendientes_antes_lote = contar_facturas_pendientes(
+                                idcliente=local_idcliente,
+                                since=local_since,
+                            )
+
+                            if pendientes_antes_lote <= 0:
+                                pendientes_actuales = 0
+                                break
+
+                            mensaje_lote = sync_facturas_desde_siigo(
+                                idcliente=local_idcliente,
+                                deep=True,
+                                batch_size=local_batch_size,
+                                only_missing=True,
+                                since=local_since,
+                            )
+
+                            pendientes_despues_lote = contar_facturas_pendientes(
+                                idcliente=local_idcliente,
+                                since=local_since,
+                            )
+
+                            procesadas_lote = max(
+                                pendientes_antes_lote - pendientes_despues_lote,
+                                0,
+                            )
+
+                            detalle_lines.append(
+                                f"Lote {lotes_ejecutados}: "
+                                f"pendientes antes={pendientes_antes_lote}, "
+                                f"procesadas={procesadas_lote}, "
+                                f"pendientes después={pendientes_despues_lote}."
+                            )
+                            detalle_lines.append(str(mensaje_lote))
+                            detalle_lines.append("")
+
+                            pendientes_actuales = pendientes_despues_lote
+
+                            # Evita ciclo infinito si Siigo no permite enriquecer alguna factura
+                            if procesadas_lote == 0:
+                                detalle_lines.append(
+                                    "El proceso se detuvo porque el último lote no redujo los pendientes. "
+                                    "Puede haber facturas con error al consultar detalle en Siigo."
+                                )
+                                break
+
+                        pendientes_finales = contar_facturas_pendientes(
+                            idcliente=local_idcliente,
+                            since=local_since,
+                        )
+
+                        procesadas_total = max(
+                            pendientes_antes_global - pendientes_finales,
+                            0,
+                        )
+
+                        progreso = (
+                            100
+                            if pendientes_antes_global == 0
+                            else round((procesadas_total / pendientes_antes_global) * 100, 1)
+                        )
+
+                        finalizado = pendientes_finales == 0
+
+                        detalle_lines.append("Resumen final:")
+                        detalle_lines.append(f"Pendientes iniciales: {pendientes_antes_global}.")
+                        detalle_lines.append(f"Procesadas en esta ejecución: {procesadas_total}.")
+                        detalle_lines.append(f"Pendientes finales: {pendientes_finales}.")
+                        detalle_lines.append(f"Lotes ejecutados: {lotes_ejecutados}.")
+                        detalle_lines.append(f"Progreso de esta ejecución: {progreso}%.")
+                        detalle_lines.append(f"Finalizado: {'sí' if finalizado else 'no'}.")
+
+                        if not finalizado and lotes_ejecutados >= local_max_lotes:
+                            detalle_lines.append(
+                                "El proceso se detuvo porque alcanzó el máximo de lotes configurado. "
+                                "Puedes ejecutarlo nuevamente para continuar."
+                            )
+
+                        duracion = round(time.time() - inicio, 2)
+                        detalle = "\n".join(detalle_lines)
+
+                        resultado = "OK" if finalizado else "PARCIAL"
+
+                        _finalizar_log_sync_modulo(
+                            log_id=local_log_id,
+                            idcliente=local_idcliente,
+                            endpoint=endpoint_log,
+                            resultado=resultado,
+                            detalle=detalle,
+                            status_code=200,
+                            duracion_segundos=duracion,
+                        )
+
+                    except Exception as e:
+                        duracion = round(time.time() - inicio, 2)
+                        detalle_error = traceback.format_exc()
+
+                        print(f"[siigo_sync_facturas_completar_detalle] ❌ Error: {e}")
+                        traceback.print_exc()
+
+                        _finalizar_log_sync_modulo(
+                            log_id=local_log_id,
+                            idcliente=local_idcliente,
+                            endpoint=endpoint_log,
+                            resultado="ERROR",
+                            detalle=detalle_error,
+                            status_code=500,
+                            duracion_segundos=duracion,
+                        )
+
+            t = Thread(
+                target=trabajo_completar_detalle,
+                args=(idcliente, log_id, batch_size, since, max_lotes),
+                daemon=True,
+            )
+            t.start()
+
+            return jsonify({
+                "mensaje": (
+                    f"Completar detalle de facturas iniciado. "
+                    f"Pendientes iniciales: {pendientes_iniciales}. "
+                    f"El sistema procesará lotes de hasta {batch_size} facturas automáticamente. "
+                    f"Puedes revisar el avance en el historial de sincronizaciones."
+                ),
+                "log_id": log_id,
+                "origen": "manual_modulo",
+                "estado": "EN_EJECUCION",
+                "batch_size": batch_size,
+                "max_lotes": max_lotes,
+                "pendientes_iniciales": pendientes_iniciales,
+                "since": since,
+            }), 202
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
+
+
     @app.route("/siigo/debug-invoice", methods=["GET"])
     @jwt_required()
     def siigo_debug_invoice():
