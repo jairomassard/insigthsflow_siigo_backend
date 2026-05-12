@@ -9559,14 +9559,25 @@ def create_app():
         from datetime import datetime
 
         claims = get_jwt()
+        perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
-        if not idcliente:
-            return jsonify({"error": "Token sin cliente"}), 403
+
+        # Permitir que SuperAdmin consulte un cliente específico si manda ?idcliente=9
+        q_idcliente = request.args.get("idcliente", type=int)
+
+        if perfilid == 0:
+            if q_idcliente:
+                idcliente = q_idcliente
+            elif not idcliente:
+                return jsonify({"error": "Falta idcliente para consulta SuperAdmin"}), 400
+        else:
+            if not idcliente:
+                return jsonify({"error": "Token sin cliente"}), 403
 
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         proveedor = request.args.get("proveedor")
-        centro_costos = request.args.get("centro_costos")
+        centro_costos = request.args.get("centro_costos", type=int)
 
         condiciones = ["c.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
@@ -9574,18 +9585,26 @@ def create_app():
         def validar_fecha(fecha_str):
             try:
                 return datetime.strptime(fecha_str, "%Y-%m-%d").date()
-            except:
+            except Exception:
                 return None
 
-        if desde and validar_fecha(desde):
+        fecha_desde_val = validar_fecha(desde) if desde else None
+        fecha_hasta_val = validar_fecha(hasta) if hasta else None
+
+        if fecha_desde_val:
             condiciones.append("c.fecha >= :desde")
-            params["desde"] = desde
-        if hasta and validar_fecha(hasta):
+            params["desde"] = fecha_desde_val
+
+        if fecha_hasta_val:
             condiciones.append("c.fecha <= :hasta")
-            params["hasta"] = hasta
+            params["hasta"] = fecha_hasta_val
+
         if proveedor:
-            condiciones.append("LOWER(COALESCE(c.proveedor_nombre, 'sin proveedor')) = LOWER(:proveedor)")
-            params["proveedor"] = proveedor
+            condiciones.append(
+                "LOWER(COALESCE(c.proveedor_nombre, 'sin proveedor')) = LOWER(:proveedor)"
+            )
+            params["proveedor"] = proveedor.strip()
+
         if centro_costos:
             condiciones.append("c.cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
@@ -9594,6 +9613,7 @@ def create_app():
 
         sql = text(f"""
             SELECT 
+                c.id,
                 c.idcompra,
                 c.proveedor_nombre,
                 c.factura_proveedor,
@@ -9603,17 +9623,24 @@ def create_app():
                 c.saldo,
                 cc.nombre AS centro_costo_nombre,
                 CASE 
-                    WHEN c.estado = 'pagado' THEN 'Pagada'
+                    WHEN LOWER(COALESCE(c.estado, '')) = 'pagado' THEN 'Pagada'
                     ELSE 'No Pagada'
                 END AS estado
             FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo cc ON c.cost_center = cc.id
+            LEFT JOIN siigo_centros_costo cc
+                ON c.cost_center = cc.id
+            AND cc.idcliente = c.idcliente
             WHERE {where_sql}
-            ORDER BY c.fecha DESC
+            ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
         """)
 
         rows = db.session.execute(sql, params).mappings().all()
-        return jsonify({"rows": [dict(r) for r in rows]})
+
+        return jsonify({
+            "rows": [dict(r) for r in rows],
+            "total": len(rows),
+            "idcliente": idcliente
+        }), 200
 
 
 
