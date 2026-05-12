@@ -2056,6 +2056,51 @@ def _finalizar_log_sync_modulo(
         db.session.rollback()
 
 
+def _cliente_as_dict_con_paquete(cliente):
+    """
+    Extiende Cliente.as_dict() agregando el paquete base activo actual.
+    """
+    data = cliente.as_dict()
+
+    row = (
+        db.session.query(ClientePaquete, PaqueteInsightflow)
+        .join(
+            PaqueteInsightflow,
+            PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete
+        )
+        .filter(
+            ClientePaquete.idcliente == cliente.idcliente,
+            ClientePaquete.activo.is_(True),
+            PaqueteInsightflow.activo.is_(True),
+            PaqueteInsightflow.es_modulo_adicional.is_(False),
+        )
+        .order_by(ClientePaquete.created_at.desc())
+        .first()
+    )
+
+    data["paquete_actual"] = None
+    data["paquete_codigo"] = None
+    data["paquete_nombre"] = None
+    data["idpaquete"] = None
+
+    if row:
+        cliente_paquete, paquete = row
+
+        data["paquete_actual"] = {
+            "idcliente_paquete": cliente_paquete.id,
+            "idpaquete": paquete.idpaquete,
+            "codigo": paquete.codigo,
+            "nombre": paquete.nombre,
+            "descripcion": paquete.descripcion,
+            "activo": paquete.activo,
+        }
+
+        data["paquete_codigo"] = paquete.codigo
+        data["paquete_nombre"] = paquete.nombre
+        data["idpaquete"] = paquete.idpaquete
+
+    return data
+
 
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
@@ -2230,12 +2275,23 @@ def create_app():
     @jwt_required()
     def get_clientes():
         claims = get_jwt()
-        if claims["perfilid"] == 0:  # SuperAdmin puede ver todos los clientes
-            clientes = Cliente.query.all()
+
+        if claims["perfilid"] == 0:
+            clientes = (
+                Cliente.query
+                .order_by(Cliente.idcliente.asc())
+                .all()
+            )
         else:
-            # Un usuario normal solo puede ver su propio cliente
-            clientes = Cliente.query.filter_by(idcliente=claims["idcliente"]).all()
-        return jsonify([c.as_dict() for c in clientes])
+            clientes = (
+                Cliente.query
+                .filter_by(idcliente=claims["idcliente"])
+                .order_by(Cliente.idcliente.asc())
+                .all()
+            )
+
+        return jsonify([_cliente_as_dict_con_paquete(c) for c in clientes]), 200
+
 
     @app.route("/clientes", methods=["POST"])
     @jwt_required()
