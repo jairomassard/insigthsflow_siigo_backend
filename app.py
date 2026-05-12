@@ -2056,6 +2056,253 @@ def _finalizar_log_sync_modulo(
         db.session.rollback()
 
 
+# Helpers para cambio de pauete a clienets en la pagina del clienets del superadmin
+def _paquete_base_actual_cliente(idcliente):
+    """
+    Retorna el paquete base activo actual del cliente.
+    No considera módulos adicionales.
+    """
+    row = (
+        db.session.query(ClientePaquete, PaqueteInsightflow)
+        .join(PaqueteInsightflow, PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete)
+        .filter(
+            ClientePaquete.idcliente == idcliente,
+            ClientePaquete.activo.is_(True),
+            PaqueteInsightflow.activo.is_(True),
+            PaqueteInsightflow.es_modulo_adicional.is_(False),
+        )
+        .order_by(ClientePaquete.created_at.desc())
+        .first()
+    )
+
+    if not row:
+        return None, None
+
+    cliente_paquete, paquete = row
+    return cliente_paquete, paquete
+
+
+def _cliente_as_dict_con_paquete(cliente):
+    """
+    Extiende Cliente.as_dict() agregando paquete activo actual.
+    """
+    data = cliente.as_dict()
+
+    cliente_paquete, paquete = _paquete_base_actual_cliente(cliente.idcliente)
+
+    data["paquete_actual"] = None
+    data["paquete_codigo"] = None
+    data["paquete_nombre"] = None
+    data["idpaquete"] = None
+
+    if paquete:
+        data["paquete_actual"] = {
+            "idcliente_paquete": cliente_paquete.id if cliente_paquete else None,
+            "idpaquete": paquete.idpaquete,
+            "codigo": paquete.codigo,
+            "nombre": paquete.nombre,
+            "descripcion": paquete.descripcion,
+            "activo": paquete.activo,
+        }
+        data["paquete_codigo"] = paquete.codigo
+        data["paquete_nombre"] = paquete.nombre
+        data["idpaquete"] = paquete.idpaquete
+
+    return data
+
+
+def _obtener_codigos_paquete(idpaquete):
+    """
+    Obtiene los códigos de permisos activos configurados para un paquete.
+    """
+    rows = (
+        PaquetePermiso.query
+        .filter(
+            PaquetePermiso.idpaquete == idpaquete,
+            PaquetePermiso.activo.is_(True),
+        )
+        .all()
+    )
+
+    codigos = sorted({
+        str(r.codigo_permiso).strip()
+        for r in rows
+        if r.codigo_permiso and str(r.codigo_permiso).strip()
+    })
+
+    return codigos
+
+
+def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
+    """
+    Sincroniza permisos del paquete hacia el cliente.
+
+    Política segura:
+    - Clona permisos base faltantes desde cliente 1.
+    - Reactiva permisos existentes si estaban inactivos.
+    - Asigna todos los permisos del paquete al perfil Administrador.
+    - NO elimina permisos anteriores.
+    - NO revoca permisos de otros perfiles.
+    
+    Esto es ideal para upgrades, por ejemplo Financiero -> Completo.
+    Para downgrades, el before_request ya bloquea por paquete contratado.
+    """
+    from sqlalchemy import func
+
+    codigos_permitidos = _obtener_codigos_paquete(paquete.idpaquete)
+
+    if not codigos_permitidos:
+        return {
+            "ok": False,
+            "error": "El paquete seleccionado no tiene permisos activos configurados.",
+            "codigos_permitidos": [],
+        }
+
+    permisos_base = (
+        Permiso.query
+        .filter(
+            Permiso.idcliente == 1,
+            Permiso.codigo.in_(codigos_permitidos),
+            Permiso.activo.is_(True),
+        )
+        .all()
+    )
+
+    if not permisos_base:
+        return {
+            "ok": False,
+            "error": "No se encontraron permisos base en el cliente 1 para los códigos del paquete.",
+            "codigos_permitidos": codigos_permitidos,
+        }
+
+    permisos_base_por_codigo = {p.codigo: p for p in permisos_base}
+
+    codigos_sin_base = [
+        codigo for codigo in codigos_permitidos
+        if codigo not in permisos_base_por_codigo
+    ]
+
+    permisos_creados = 0
+    permisos_reactivados = 0
+    permisos_existentes = 0
+
+    permisos_cliente = []
+
+    for codigo in codigos_permitidos:
+        base = permisos_base_por_codigo.get(codigo)
+        if not base:
+            continue
+
+        permiso_cliente = (
+            Permiso.query
+            .filter_by(idcliente=idcliente, codigo=codigo)
+            .first()
+        )
+
+        if not permiso_cliente:
+            permiso_cliente = Permiso(
+                idcliente=idcliente,
+                nombre=base.nombre,
+                codigo=base.codigo,
+                descripcion=base.descripcion,
+                activo=True,
+            )
+            db.session.add(permiso_cliente)
+            db.session.flush()
+            permisos_creados += 1
+        else:
+            permisos_existentes += 1
+
+            cambio = False
+            if not permiso_cliente.activo:
+                permiso_cliente.activo = True
+                permisos_reactivados += 1
+                cambio = True
+
+            # Mantener nombres/descripciones alineados con el permiso base.
+            if permiso_cliente.nombre != base.nombre:
+                permiso_cliente.nombre = base.nombre
+                cambio = True
+            if permiso_cliente.descripcion != base.descripcion:
+                permiso_cliente.descripcion = base.descripcion
+                cambio = True
+
+            if cambio:
+                db.session.add(permiso_cliente)
+
+        permisos_cliente.append(permiso_cliente)
+
+    perfil_admin = (
+        Perfil.query
+        .filter(
+            Perfil.idcliente == idcliente,
+            func.lower(Perfil.nombre) == "administrador",
+        )
+        .first()
+    )
+
+    if not perfil_admin:
+        perfil_admin = Perfil(
+            idcliente=idcliente,
+            nombre="Administrador",
+            descripcion="Perfil administrador del cliente",
+        )
+        db.session.add(perfil_admin)
+        db.session.flush()
+
+    asignaciones_creadas = 0
+    asignaciones_reactivadas = 0
+    asignaciones_existentes = 0
+
+    for permiso in permisos_cliente:
+        rel = (
+            PerfilPermiso.query
+            .filter_by(
+                idcliente=idcliente,
+                idperfil=perfil_admin.idperfil,
+                idpermiso=permiso.idpermiso,
+            )
+            .first()
+        )
+
+        if not rel:
+            rel = PerfilPermiso(
+                idcliente=idcliente,
+                idperfil=perfil_admin.idperfil,
+                idpermiso=permiso.idpermiso,
+                permitido=True,
+            )
+            db.session.add(rel)
+            asignaciones_creadas += 1
+        else:
+            asignaciones_existentes += 1
+            if not rel.permitido:
+                rel.permitido = True
+                db.session.add(rel)
+                asignaciones_reactivadas += 1
+
+    return {
+        "ok": True,
+        "codigos_permitidos": codigos_permitidos,
+        "codigos_sin_permiso_base": codigos_sin_base,
+        "perfil_admin": {
+            "idperfil": perfil_admin.idperfil,
+            "nombre": perfil_admin.nombre,
+        },
+        "permisos_cliente": {
+            "creados": permisos_creados,
+            "existentes": permisos_existentes,
+            "reactivados": permisos_reactivados,
+            "total_sincronizados": len(permisos_cliente),
+        },
+        "asignaciones_admin": {
+            "creadas": asignaciones_creadas,
+            "existentes": asignaciones_existentes,
+            "reactivadas": asignaciones_reactivadas,
+        },
+    }
+
+
 def _cliente_as_dict_con_paquete(cliente):
     """
     Extiende Cliente.as_dict() agregando el paquete base activo actual.
@@ -2345,6 +2592,158 @@ def create_app():
 
         db.session.commit()
         return jsonify(cliente.as_dict())
+
+
+    @app.route("/clientes/<int:idcliente>/paquete", methods=["PUT", "OPTIONS"])
+    @jwt_required()
+    @cross_origin()
+    def cambiar_paquete_cliente(idcliente):
+        """
+        Cambia el paquete base contratado de un cliente.
+
+        Uso:
+        PUT /clientes/9/paquete
+        {
+            "paquete": "completo"
+        }
+
+        Solo SuperAdmin.
+        """
+        from datetime import date
+        from sqlalchemy import func
+
+        claims = get_jwt()
+
+        if claims.get("perfilid") != 0:
+            return jsonify({"error": "No autorizado"}), 403
+
+        cliente = Cliente.query.get(idcliente)
+
+        if not cliente:
+            return jsonify({
+                "error": "Cliente no encontrado",
+                "idcliente": idcliente,
+            }), 404
+
+        data = request.get_json() or {}
+
+        paquete_codigo = (
+            data.get("paquete")
+            or data.get("codigo")
+            or data.get("paquete_codigo")
+        )
+
+        idpaquete = data.get("idpaquete")
+
+        if not paquete_codigo and not idpaquete:
+            return jsonify({
+                "error": "Debes enviar 'paquete' o 'idpaquete'.",
+                "ejemplo": {"paquete": "completo"},
+            }), 400
+
+        q = PaqueteInsightflow.query.filter(
+            PaqueteInsightflow.activo.is_(True),
+            PaqueteInsightflow.es_modulo_adicional.is_(False),
+        )
+
+        if idpaquete:
+            paquete = q.filter(PaqueteInsightflow.idpaquete == int(idpaquete)).first()
+        else:
+            paquete_codigo = str(paquete_codigo).strip().lower()
+            paquete = q.filter(func.lower(PaqueteInsightflow.codigo) == paquete_codigo).first()
+
+        if not paquete:
+            return jsonify({
+                "error": "Paquete no encontrado o inactivo.",
+                "paquete": paquete_codigo,
+                "idpaquete": idpaquete,
+            }), 404
+
+        try:
+            paquete_anterior_rel, paquete_anterior = _paquete_base_actual_cliente(idcliente)
+
+            paquetes_base_activos = (
+                db.session.query(ClientePaquete)
+                .join(PaqueteInsightflow, PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete)
+                .filter(
+                    ClientePaquete.idcliente == idcliente,
+                    ClientePaquete.activo.is_(True),
+                    PaqueteInsightflow.es_modulo_adicional.is_(False),
+                )
+                .all()
+            )
+
+            for rel in paquetes_base_activos:
+                if rel.idpaquete != paquete.idpaquete:
+                    rel.activo = False
+                    rel.fecha_fin = date.today()
+                    db.session.add(rel)
+
+            rel_nuevo = (
+                ClientePaquete.query
+                .filter_by(
+                    idcliente=idcliente,
+                    idpaquete=paquete.idpaquete,
+                )
+                .first()
+            )
+
+            if rel_nuevo:
+                rel_nuevo.activo = True
+                rel_nuevo.fecha_inicio = rel_nuevo.fecha_inicio or date.today()
+                rel_nuevo.fecha_fin = None
+            else:
+                rel_nuevo = ClientePaquete(
+                    idcliente=idcliente,
+                    idpaquete=paquete.idpaquete,
+                    activo=True,
+                    fecha_inicio=date.today(),
+                    fecha_fin=None,
+                )
+
+            db.session.add(rel_nuevo)
+            db.session.flush()
+
+            sync_result = _sincronizar_permisos_paquete_cliente(
+                idcliente=idcliente,
+                paquete=paquete,
+            )
+
+            if not sync_result.get("ok"):
+                db.session.rollback()
+                return jsonify(sync_result), 400
+
+            db.session.commit()
+
+            return jsonify({
+                "message": "Paquete actualizado correctamente.",
+                "cliente": _cliente_as_dict_con_paquete(cliente),
+                "paquete_anterior": {
+                    "idpaquete": paquete_anterior.idpaquete,
+                    "codigo": paquete_anterior.codigo,
+                    "nombre": paquete_anterior.nombre,
+                } if paquete_anterior else None,
+                "paquete_nuevo": {
+                    "idpaquete": paquete.idpaquete,
+                    "codigo": paquete.codigo,
+                    "nombre": paquete.nombre,
+                },
+                "permisos": sync_result,
+                "politica": (
+                    "Cambio seguro: se agregaron/reactivaron permisos del nuevo paquete "
+                    "y se asignaron al perfil Administrador. No se eliminaron permisos antiguos."
+                ),
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No se pudo cambiar el paquete del cliente.",
+                "detalle": str(e),
+                "idcliente": idcliente,
+                "paquete": paquete_codigo,
+            }), 500
+
 
 
     @app.route("/clientes/<int:idcliente>", methods=["DELETE"])
