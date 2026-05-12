@@ -6105,6 +6105,7 @@ def create_app():
                 FROM facturas_enriquecidas f
                 LEFT JOIN siigo_centros_costo cc
                     ON f.cost_center = cc.id
+                    AND cc.idcliente = f.idcliente
                 WHERE {where_clause}
                 GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
                 ORDER BY ventas_netas DESC
@@ -6218,10 +6219,11 @@ def create_app():
                             PARTITION BY f.cliente_nombre
                             ORDER BY f.fecha DESC, f.idfactura DESC
                         ) AS rn
-                    FROM facturas_enriquecidas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON f.cost_center = cc.id
-                    WHERE {where_clause}
+                        FROM facturas_enriquecidas f
+                        LEFT JOIN siigo_centros_costo cc
+                            ON f.cost_center = cc.id
+                            AND cc.idcliente = f.idcliente
+                        WHERE {where_clause}
                 )
                 SELECT *
                 FROM ranked
@@ -6401,10 +6403,11 @@ def create_app():
                 SELECT DISTINCT
                     f.cost_center AS id,
                     COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
-                FROM facturas_enriquecidas f
-                LEFT JOIN siigo_centros_costo cc
-                    ON f.cost_center = cc.id
-                WHERE {where_catalogos}
+                    FROM facturas_enriquecidas f
+                    LEFT JOIN siigo_centros_costo cc
+                        ON f.cost_center = cc.id
+                        AND cc.idcliente = f.idcliente
+                    WHERE {where_catalogos}
                 AND f.cost_center IS NOT NULL
                 ORDER BY nombre
             """)
