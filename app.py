@@ -9152,14 +9152,15 @@ def create_app():
 
                 sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
+            LEFT JOIN siigo_centros_costo sc
+                ON c.cost_center = sc.id
+            AND sc.idcliente = c.idcliente
             WHERE {where_sql}
-            ORDER BY c.fecha DESC
+            ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
         """)
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify(rows)
-
 
 
     # --- ENDPOINT 5: Detalle de facturas por proveedor ---
@@ -9179,15 +9180,23 @@ def create_app():
         centro_costos = request.args.get("centro_costos")
         tipo_documento = request.args.get("tipo_documento", "todos")
 
-        condiciones = ["c.idcliente = :idcliente", "c.proveedor_nombre = :proveedor"]
+        if not proveedor:
+            return jsonify({"error": "Proveedor requerido"}), 400
+
+        condiciones = [
+            "c.idcliente = :idcliente",
+            "c.proveedor_nombre = :proveedor"
+        ]
         params = {"idcliente": idcliente, "proveedor": proveedor}
 
         if desde:
             condiciones.append("c.fecha >= :desde")
             params["desde"] = desde
+
         if hasta:
             condiciones.append("c.fecha <= :hasta")
             params["hasta"] = hasta
+
         if centro_costos:
             condiciones.append("c.cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
@@ -9201,7 +9210,8 @@ def create_app():
 
         sql = text(f"""
             SELECT 
-                c.idcompra AS id,
+                c.id,
+                c.idcompra AS idcompra,
                 c.proveedor_nombre,
                 c.idcompra AS factura,
                 c.factura_proveedor,
@@ -9231,15 +9241,15 @@ def create_app():
 
                 sc.nombre AS centro_costo_nombre
             FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo sc ON c.cost_center = sc.id
+            LEFT JOIN siigo_centros_costo sc
+                ON c.cost_center = sc.id
+                AND sc.idcliente = c.idcliente
             WHERE {where_sql}
-            ORDER BY c.fecha DESC
+            ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
         """)
 
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify(rows)
-
-
 
 
     # Endpoint para llamar Centros de costos enunciados en la BD de Siigo Compras
