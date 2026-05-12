@@ -5427,10 +5427,17 @@ def create_app():
                     f.seller_id,
                     v.nombre AS vendedor_nombre
                 FROM siigo_facturas f
-                LEFT JOIN siigo_vendedores   v  ON f.seller_id   = v.id
-                LEFT JOIN siigo_centros_costo cc ON f.cost_center = cc.id
-                LEFT JOIN siigo_customers     c  ON f.customer_id = c.id
-                                                AND f.idcliente   = c.idcliente
+                LEFT JOIN siigo_vendedores v
+                    ON f.seller_id = v.id
+                AND v.idcliente = f.idcliente
+
+                LEFT JOIN siigo_centros_costo cc
+                    ON f.cost_center = cc.id
+                AND cc.idcliente = f.idcliente
+
+                LEFT JOIN siigo_customers c
+                    ON f.customer_id = c.id
+                AND f.idcliente = c.idcliente
                 WHERE {where_clause}
                 ORDER BY f.id DESC
                 LIMIT :limit
@@ -5619,8 +5626,12 @@ def create_app():
                 f.estado,
                 f.estado_pago
             FROM facturas_enriquecidas f
-            LEFT JOIN siigo_centros_costo cc ON cc.id = f.cost_center
-            LEFT JOIN siigo_vendedores v ON v.id = f.seller_id
+            LEFT JOIN siigo_centros_costo cc
+                ON cc.id = f.cost_center
+                AND cc.idcliente = f.idcliente
+            LEFT JOIN siigo_vendedores v
+                ON v.id = f.seller_id
+                AND v.idcliente = f.idcliente
             WHERE {where_clause}
             ORDER BY f.fecha DESC
         """)
@@ -5689,8 +5700,12 @@ def create_app():
                 v.nombre AS vendedor_nombre,
                 f.public_url
             FROM facturas_enriquecidas f
-            LEFT JOIN siigo_centros_costo cc ON cc.id = f.cost_center
-            LEFT JOIN siigo_vendedores v ON v.id = f.seller_id
+            LEFT JOIN siigo_centros_costo cc
+                ON cc.id = f.cost_center
+                AND cc.idcliente = f.idcliente
+            LEFT JOIN siigo_vendedores v
+                ON v.id = f.seller_id
+                AND v.idcliente = f.idcliente       
             WHERE { " AND ".join(wh) }
             ORDER BY f.fecha DESC
         """)
@@ -5759,6 +5774,7 @@ def create_app():
         cte = f"""
             WITH base AS (
                 SELECT
+                    f.idcliente,
                     f.idfactura,
                     f.fecha,
                     f.vencimiento,
@@ -5811,8 +5827,12 @@ def create_app():
                 COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                 v.nombre AS vendedor_nombre
             FROM calc c
-            LEFT JOIN siigo_centros_costo cc ON cc.id = c.cost_center
-            LEFT JOIN siigo_vendedores   v  ON v.id = c.seller_id
+            LEFT JOIN siigo_centros_costo cc
+                ON cc.id = c.cost_center
+            AND cc.idcliente = c.idcliente
+            LEFT JOIN siigo_vendedores v
+                ON v.id = c.seller_id
+            AND v.idcliente = c.idcliente
             WHERE {filtro_estado}
             ORDER BY c.fecha DESC
         """)
