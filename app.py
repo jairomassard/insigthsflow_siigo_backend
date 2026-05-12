@@ -2064,7 +2064,10 @@ def _paquete_base_actual_cliente(idcliente):
     """
     row = (
         db.session.query(ClientePaquete, PaqueteInsightflow)
-        .join(PaqueteInsightflow, PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete)
+        .join(
+            PaqueteInsightflow,
+            PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete
+        )
         .filter(
             ClientePaquete.idcliente == idcliente,
             ClientePaquete.activo.is_(True),
@@ -2084,7 +2087,7 @@ def _paquete_base_actual_cliente(idcliente):
 
 def _cliente_as_dict_con_paquete(cliente):
     """
-    Extiende Cliente.as_dict() agregando paquete activo actual.
+    Extiende Cliente.as_dict() agregando el paquete base activo actual.
     """
     data = cliente.as_dict()
 
@@ -2114,6 +2117,7 @@ def _cliente_as_dict_con_paquete(cliente):
 def _obtener_codigos_paquete(idpaquete):
     """
     Obtiene los códigos de permisos activos configurados para un paquete.
+    La fuente de verdad es paquete_permisos.
     """
     rows = (
         PaquetePermiso.query
@@ -2124,28 +2128,38 @@ def _obtener_codigos_paquete(idpaquete):
         .all()
     )
 
-    codigos = sorted({
+    return sorted({
         str(r.codigo_permiso).strip()
         for r in rows
         if r.codigo_permiso and str(r.codigo_permiso).strip()
     })
 
-    return codigos
+
+def _humanizar_codigo_permiso(codigo):
+    """
+    Convierte un código técnico en nombre legible.
+    Ejemplo:
+    ver_reporte_balance_general -> Ver Reporte Balance General
+    """
+    if not codigo:
+        return ""
+
+    partes = str(codigo).replace("-", "_").split("_")
+    return " ".join(p.capitalize() for p in partes if p)
 
 
 def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
     """
     Sincroniza permisos del paquete hacia el cliente.
 
-    Política segura:
-    - Clona permisos base faltantes desde cliente 1.
+    Política:
+    - Toma los códigos directamente desde paquete_permisos.
+    - Crea en permisos los códigos que falten para el cliente.
     - Reactiva permisos existentes si estaban inactivos.
-    - Asigna todos los permisos del paquete al perfil Administrador.
-    - NO elimina permisos anteriores.
-    - NO revoca permisos de otros perfiles.
-    
-    Esto es ideal para upgrades, por ejemplo Financiero -> Completo.
-    Para downgrades, el before_request ya bloquea por paquete contratado.
+    - Asigna los permisos al perfil Administrador.
+    - No depende de ningún cliente plantilla.
+    - No elimina permisos antiguos.
+    - No revoca permisos de otros perfiles.
     """
     from sqlalchemy import func
 
@@ -2158,39 +2172,17 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
             "codigos_permitidos": [],
         }
 
-    permisos_base = (
-        Permiso.query
-        .filter(
-            Permiso.idcliente == 1,
-            Permiso.codigo.in_(codigos_permitidos),
-            Permiso.activo.is_(True),
-        )
-        .all()
-    )
-
-    if not permisos_base:
-        return {
-            "ok": False,
-            "error": "No se encontraron permisos base en el cliente 1 para los códigos del paquete.",
-            "codigos_permitidos": codigos_permitidos,
-        }
-
-    permisos_base_por_codigo = {p.codigo: p for p in permisos_base}
-
-    codigos_sin_base = [
-        codigo for codigo in codigos_permitidos
-        if codigo not in permisos_base_por_codigo
-    ]
-
     permisos_creados = 0
-    permisos_reactivados = 0
     permisos_existentes = 0
+    permisos_reactivados = 0
+    permisos_actualizados = 0
 
     permisos_cliente = []
 
     for codigo in codigos_permitidos:
-        base = permisos_base_por_codigo.get(codigo)
-        if not base:
+        codigo = str(codigo).strip()
+
+        if not codigo:
             continue
 
         permiso_cliente = (
@@ -2199,36 +2191,41 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
             .first()
         )
 
+        nombre_generado = _humanizar_codigo_permiso(codigo)
+        descripcion_generada = f"Permiso generado automáticamente para {codigo}"
+
         if not permiso_cliente:
             permiso_cliente = Permiso(
                 idcliente=idcliente,
-                nombre=base.nombre,
-                codigo=base.codigo,
-                descripcion=base.descripcion,
+                nombre=nombre_generado,
+                codigo=codigo,
+                descripcion=descripcion_generada,
                 activo=True,
             )
             db.session.add(permiso_cliente)
             db.session.flush()
             permisos_creados += 1
+
         else:
             permisos_existentes += 1
-
             cambio = False
+
             if not permiso_cliente.activo:
                 permiso_cliente.activo = True
                 permisos_reactivados += 1
                 cambio = True
 
-            # Mantener nombres/descripciones alineados con el permiso base.
-            if permiso_cliente.nombre != base.nombre:
-                permiso_cliente.nombre = base.nombre
+            if not permiso_cliente.nombre:
+                permiso_cliente.nombre = nombre_generado
                 cambio = True
-            if permiso_cliente.descripcion != base.descripcion:
-                permiso_cliente.descripcion = base.descripcion
+
+            if not permiso_cliente.descripcion:
+                permiso_cliente.descripcion = descripcion_generada
                 cambio = True
 
             if cambio:
                 db.session.add(permiso_cliente)
+                permisos_actualizados += 1
 
         permisos_cliente.append(permiso_cliente)
 
@@ -2251,8 +2248,8 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
         db.session.flush()
 
     asignaciones_creadas = 0
-    asignaciones_reactivadas = 0
     asignaciones_existentes = 0
+    asignaciones_reactivadas = 0
 
     for permiso in permisos_cliente:
         rel = (
@@ -2274,8 +2271,10 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
             )
             db.session.add(rel)
             asignaciones_creadas += 1
+
         else:
             asignaciones_existentes += 1
+
             if not rel.permitido:
                 rel.permitido = True
                 db.session.add(rel)
@@ -2284,7 +2283,6 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
     return {
         "ok": True,
         "codigos_permitidos": codigos_permitidos,
-        "codigos_sin_permiso_base": codigos_sin_base,
         "perfil_admin": {
             "idperfil": perfil_admin.idperfil,
             "nombre": perfil_admin.nombre,
@@ -2293,6 +2291,7 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
             "creados": permisos_creados,
             "existentes": permisos_existentes,
             "reactivados": permisos_reactivados,
+            "actualizados": permisos_actualizados,
             "total_sincronizados": len(permisos_cliente),
         },
         "asignaciones_admin": {
@@ -2302,51 +2301,6 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
         },
     }
 
-
-def _cliente_as_dict_con_paquete(cliente):
-    """
-    Extiende Cliente.as_dict() agregando el paquete base activo actual.
-    """
-    data = cliente.as_dict()
-
-    row = (
-        db.session.query(ClientePaquete, PaqueteInsightflow)
-        .join(
-            PaqueteInsightflow,
-            PaqueteInsightflow.idpaquete == ClientePaquete.idpaquete
-        )
-        .filter(
-            ClientePaquete.idcliente == cliente.idcliente,
-            ClientePaquete.activo.is_(True),
-            PaqueteInsightflow.activo.is_(True),
-            PaqueteInsightflow.es_modulo_adicional.is_(False),
-        )
-        .order_by(ClientePaquete.created_at.desc())
-        .first()
-    )
-
-    data["paquete_actual"] = None
-    data["paquete_codigo"] = None
-    data["paquete_nombre"] = None
-    data["idpaquete"] = None
-
-    if row:
-        cliente_paquete, paquete = row
-
-        data["paquete_actual"] = {
-            "idcliente_paquete": cliente_paquete.id,
-            "idpaquete": paquete.idpaquete,
-            "codigo": paquete.codigo,
-            "nombre": paquete.nombre,
-            "descripcion": paquete.descripcion,
-            "activo": paquete.activo,
-        }
-
-        data["paquete_codigo"] = paquete.codigo
-        data["paquete_nombre"] = paquete.nombre
-        data["idpaquete"] = paquete.idpaquete
-
-    return data
 
 
 #---------------------------------------------------------------------------------------------------------
