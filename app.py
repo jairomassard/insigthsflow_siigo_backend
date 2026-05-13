@@ -5551,9 +5551,21 @@ def create_app():
             sql_kpis = text(cte_common + """
                 SELECT
                     COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
-                    COALESCE(SUM(impuestos_b), 0) AS impuestos,
+
+                    -- Impuesto neto real del reporte comercial:
+                    -- ventas con impuesto - ventas sin impuesto
+                    COALESCE(SUM(total_b) - SUM(subtotal_b), 0) AS impuestos,
+
                     COALESCE(SUM(autorretencion), 0) AS autorretencion,
-                    COALESCE(SUM(total_b), 0) AS total_facturado,
+
+                    -- Facturas emitidas antes de notas crédito
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS total_facturado,
+
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN subtotal_b ELSE 0 END), 0) AS facturas_emitidas_sin_impuesto,
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS facturas_emitidas_con_impuesto,
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'NOTA_CREDITO' THEN subtotal_b ELSE 0 END), 0) AS notas_credito_sin_impuesto,
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'NOTA_CREDITO' THEN total_b ELSE 0 END), 0) AS notas_credito_con_impuesto,
+
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
                     COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
                     COALESCE(SUM(pagado_b), 0) AS pagado,
@@ -5570,9 +5582,15 @@ def create_app():
                     mes::text AS periodo,
                     TO_CHAR(mes, 'Mon YYYY') AS label,
                     COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
-                    COALESCE(SUM(impuestos_b), 0) AS impuestos,
+
+                    -- Impuesto neto real del mes
+                    COALESCE(SUM(total_b) - SUM(subtotal_b), 0) AS impuestos,
+
                     COALESCE(SUM(autorretencion), 0) AS autorretencion,
-                    COALESCE(SUM(total_b), 0) AS total_facturado,
+
+                    -- Facturas emitidas antes de notas crédito
+                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS total_facturado,
+
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
                     COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
                     COALESCE(SUM(pagado_b), 0) AS pagado,
