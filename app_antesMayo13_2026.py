@@ -5359,12 +5359,9 @@ def create_app():
 
     # Endpoint reporte Financiero (con KPIs + series)
 
-    # Endpoint reporte Financiero Ventas
     @app.route("/reportes/facturas_enriquecidas", methods=["GET"])
     @jwt_required()
     def get_facturas_enriquecidas():
-        from sqlalchemy.sql import text
-
         claims = get_jwt()
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
@@ -5383,41 +5380,28 @@ def create_app():
         cliente     = request.args.get("cliente")
         limit       = request.args.get("limit", type=int) or 5000
 
-        incluye_impuesto = str(request.args.get("incluye_impuesto", "1")).lower() in ["1", "true", "si", "sí", "yes"]
-        incluye_nota_credito = str(request.args.get("incluye_nota_credito", "1")).lower() in ["1", "true", "si", "sí", "yes"]
-
         try:
-            # ============================================================
-            # 1) Filtros para detalle de facturas
-            # ============================================================
-            wh_rows = ["f.idcliente = :idcliente"]
-            params = {
-                "idcliente": idcliente,
-                "limit": limit,
-            }
-
+            wh = ["f.idcliente = :idcliente"]
+            params = {"idcliente": idcliente, "limit": limit}
             if desde:
-                wh_rows.append("f.fecha >= :desde")
+                wh.append("f.fecha >= :desde")
                 params["desde"] = desde
-
             if hasta:
-                wh_rows.append("f.fecha <= :hasta")
+                wh.append("f.fecha <= :hasta")
                 params["hasta"] = hasta
-
             if seller_id:
-                wh_rows.append("f.seller_id = :seller_id")
+                wh.append("f.seller_id = :seller_id")
                 params["seller_id"] = seller_id
-
             if cost_center:
-                wh_rows.append("f.cost_center = :cost_center")
+                wh.append("f.cost_center = :cost_center")
                 params["cost_center"] = cost_center
-
             if cliente:
-                wh_rows.append("f.cliente_nombre = :cliente")
+                wh.append("f.cliente_nombre = :cliente")
                 params["cliente"] = cliente
 
-            where_rows = " AND ".join(wh_rows)
+            where_clause = " AND ".join(wh)
 
+            # ---- Rows
             sql_rows = text(f"""
                 SELECT DISTINCT ON (f.id)
                     f.id              AS factura_id,
@@ -5428,12 +5412,12 @@ def create_app():
                     f.cliente_nombre  AS cliente_nombre,
                     f.estado,
                     f.estado_pago,
-                    COALESCE(f.subtotal, 0) AS subtotal,
-                    COALESCE(f.impuestos_total, 0) AS impuestos_total,
-                    COALESCE(f.total, 0) AS total,
-                    COALESCE(f.pagos_total, 0) AS pagos_total,
-                    COALESCE(f.saldo, 0) AS saldo,
-                    COALESCE(f.saldo_calculado, f.saldo, 0) AS saldo_calculado,
+                    f.subtotal,
+                    f.impuestos_total,
+                    f.total,
+                    f.pagos_total,
+                    f.saldo,
+                    f.saldo_calculado,
                     f.medio_pago,
                     f.observaciones,
                     f.public_url,
@@ -5444,167 +5428,116 @@ def create_app():
                     v.nombre AS vendedor_nombre
                 FROM siigo_facturas f
                 LEFT JOIN siigo_vendedores v
-                    ON v.id = f.seller_id
+                    ON f.seller_id = v.id
                 AND v.idcliente = f.idcliente
+
                 LEFT JOIN siigo_centros_costo cc
-                    ON cc.id = f.cost_center
+                    ON f.cost_center = cc.id
                 AND cc.idcliente = f.idcliente
+
                 LEFT JOIN siigo_customers c
-                    ON c.id::text = f.customer_id::text
-                AND c.idcliente = f.idcliente
-                WHERE {where_rows}
+                    ON f.customer_id = c.id
+                AND f.idcliente = c.idcliente
+                WHERE {where_clause}
                 ORDER BY f.id DESC
                 LIMIT :limit
             """)
-
             rows = [dict(r) for r in db.session.execute(sql_rows, params).mappings().all()]
 
-            # ============================================================
-            # 2) Filtros para movimientos comerciales tipo Siigo
-            # ============================================================
-            wh_mov = ["m.idcliente = :idcliente"]
-
-            if desde:
-                wh_mov.append("m.fecha >= :desde")
-
-            if hasta:
-                wh_mov.append("m.fecha <= :hasta")
-
-            if seller_id:
-                wh_mov.append("m.seller_id = :seller_id")
-
-            if cost_center:
-                wh_mov.append("m.cost_center = :cost_center")
-
-            if cliente:
-                wh_mov.append("m.cliente_nombre = :cliente")
-
-            if not incluye_nota_credito:
-                wh_mov.append("m.tipo_movimiento = 'FACTURA'")
-
-            where_mov = " AND ".join(wh_mov)
-
-            # Valor principal igual a Siigo:
-            # - incluye_impuesto = true  => total
-            # - incluye_impuesto = false => subtotal
-            campo_valor = "total" if incluye_impuesto else "subtotal"
-
+            # ---------- KPIs / series ----------
             cte_common = f"""
                 WITH comp AS (
                     SELECT
-                        m.*,
-
+                        f.*,
+                        -- Autorretención
                         COALESCE((
                             SELECT SUM((elem->>'value')::numeric)
-                            FROM jsonb_array_elements(m.retenciones) elem
-                            WHERE jsonb_typeof(m.retenciones) = 'array'
+                            FROM jsonb_array_elements(f.retenciones) elem
+                            WHERE jsonb_typeof(f.retenciones) = 'array'
                             AND LOWER(elem->>'type') LIKE '%autorretencion%'
                         ), 0) AS autorretencion,
-
+                        -- Retenciones sin autorretención
                         COALESCE((
                             SELECT SUM((elem->>'value')::numeric)
-                            FROM jsonb_array_elements(m.retenciones) elem
-                            WHERE jsonb_typeof(m.retenciones) = 'array'
+                            FROM jsonb_array_elements(f.retenciones) elem
+                            WHERE jsonb_typeof(f.retenciones) = 'array'
                             AND (elem->>'type') IS NOT NULL
                             AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
                         ), 0) AS retenciones_sin_auto,
-
-                        COALESCE(m.subtotal, 0) AS subtotal_b,
-                        COALESCE(m.impuestos_total, 0) AS impuestos_b,
-                        COALESCE(m.total, 0) AS total_b,
-                        COALESCE(m.{campo_valor}, 0) AS valor_siigo_b,
-                        COALESCE(m.saldo, 0) AS saldo_b
-
-                    FROM ventas_movimientos_enriquecidos m
-                    WHERE {where_mov}
+                        COALESCE(f.total, 0) AS total_b,
+                        COALESCE(f.saldo, 0) AS saldo_b
+                    FROM facturas_enriquecidas f
+                    WHERE {where_clause}
                 ),
                 ajuste AS (
                     SELECT
-                        date_trunc('month', fecha)::date AS mes,
-                        tipo_movimiento,
-                        subtotal_b,
-                        impuestos_b,
-                        total_b,
-                        valor_siigo_b,
+                        date_trunc('month', fecha) AS mes,
+                        subtotal,
+                        impuestos_total,
                         autorretencion,
                         retenciones_sin_auto,
-
-                        CASE
-                            WHEN tipo_movimiento = 'FACTURA' THEN saldo_b
-                            ELSE 0
-                        END AS saldo_b,
-
-                        CASE
-                            WHEN tipo_movimiento = 'FACTURA' THEN GREATEST(total_b - saldo_b, 0)
-                            ELSE 0
-                        END AS pagado_b,
-
-                        CASE
-                            WHEN tipo_movimiento = 'FACTURA' THEN GREATEST(saldo_b, 0)
-                            ELSE 0
-                        END AS pendiente_b
-
+                        total_b,
+                        saldo_b,
+                        total_b AS total_facturado,
+                        (total_b - (autorretencion + retenciones_sin_auto)) AS total_utilizable,
+                        (total_b - saldo_b) AS pagado,
+                        saldo_b AS pendiente
                     FROM comp
                 )
             """
 
+            # KPIs
             sql_kpis = text(cte_common + """
                 SELECT
-                    COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
-                    COALESCE(SUM(impuestos_b), 0) AS impuestos,
-                    COALESCE(SUM(autorretencion), 0) AS autorretencion,
-                    COALESCE(SUM(total_b), 0) AS total_facturado,
-                    COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
-                    COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
-                    COALESCE(SUM(pagado_b), 0) AS pagado,
-                    COALESCE(SUM(pendiente_b), 0) AS pendiente,
-                    COALESCE(SUM(subtotal_b), 0) AS ventas_sin_impuesto,
-                    COALESCE(SUM(total_b), 0) AS ventas_con_impuesto
+                    COALESCE(SUM(subtotal), 0)              AS subtotal,
+                    COALESCE(SUM(impuestos_total), 0)       AS impuestos,
+                    COALESCE(SUM(autorretencion), 0)        AS autorretencion,
+                    COALESCE(SUM(total_facturado), 0)       AS total_facturado,
+                    COALESCE(SUM(retenciones_sin_auto), 0)  AS retenciones,
+                    COALESCE(SUM(total_utilizable), 0)      AS total_utilizable,
+                    COALESCE(SUM(pagado), 0)                AS pagado,
+                    COALESCE(SUM(pendiente), 0)             AS pendiente
                 FROM ajuste
             """)
-
             kpis = dict(db.session.execute(sql_kpis, params).mappings().first() or {})
 
+            # Series
             sql_series = text(cte_common + """
                 SELECT
-                    mes::text AS periodo,
-                    TO_CHAR(mes, 'Mon YYYY') AS label,
-                    COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
-                    COALESCE(SUM(impuestos_b), 0) AS impuestos,
-                    COALESCE(SUM(autorretencion), 0) AS autorretencion,
-                    COALESCE(SUM(total_b), 0) AS total_facturado,
-                    COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
-                    COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
-                    COALESCE(SUM(pagado_b), 0) AS pagado,
-                    COALESCE(SUM(pendiente_b), 0) AS pendiente,
-                    COALESCE(SUM(subtotal_b), 0) AS ventas_sin_impuesto,
-                    COALESCE(SUM(total_b), 0) AS ventas_con_impuesto
+                    TO_CHAR(mes, 'Mon YYYY')                 AS label,
+                    COALESCE(SUM(subtotal), 0)              AS subtotal,
+                    COALESCE(SUM(impuestos_total), 0)       AS impuestos,
+                    COALESCE(SUM(autorretencion), 0)        AS autorretencion,
+                    COALESCE(SUM(total_facturado), 0)       AS total_facturado,
+                    COALESCE(SUM(retenciones_sin_auto), 0)  AS retenciones,
+                    COALESCE(SUM(total_utilizable), 0)      AS total_utilizable,
+                    COALESCE(SUM(pagado), 0)                AS pagado,
+                    COALESCE(SUM(pendiente), 0)             AS pendiente
                 FROM ajuste
                 GROUP BY mes
-                ORDER BY mes
+                ORDER BY MIN(mes)
             """)
-
             series = [dict(r) for r in db.session.execute(sql_series, params).mappings().all()]
 
+            # Estados (pie)
             sql_estados = text(cte_common + """
-                SELECT 'Pagado' AS estado, COALESCE(SUM(pagado_b), 0) AS valor FROM ajuste
+                SELECT 'Pagado' AS estado,   COALESCE(SUM(pagado), 0)    AS valor FROM ajuste
                 UNION ALL
-                SELECT 'Pendiente', COALESCE(SUM(pendiente_b), 0) AS valor FROM ajuste
+                SELECT 'Pendiente',          COALESCE(SUM(pendiente), 0) AS valor FROM ajuste
             """)
-
             estados = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
 
+            # Top clientes
             sql_top_clientes = text(f"""
-                SELECT
-                    m.cliente_nombre AS cliente,
-                    COALESCE(SUM(m.{campo_valor}), 0) AS total
-                FROM ventas_movimientos_enriquecidos m
-                WHERE {where_mov}
-                GROUP BY m.cliente_nombre
+                SELECT 
+                    f.cliente_nombre AS cliente,
+                    COALESCE(SUM(f.total), 0) AS total
+                FROM facturas_enriquecidas f
+                WHERE {where_clause}
+                GROUP BY f.cliente_nombre
                 ORDER BY total DESC
                 LIMIT 5
             """)
-
             top_clientes = [dict(r) for r in db.session.execute(sql_top_clientes, params).mappings().all()]
 
             return jsonify({
@@ -5613,14 +5546,7 @@ def create_app():
                 "series": series,
                 "estados": estados,
                 "top_clientes": top_clientes,
-                "count": len(rows),
-                "config": {
-                    "incluye_impuesto": incluye_impuesto,
-                    "incluye_nota_credito": incluye_nota_credito,
-                    "campo_valor": campo_valor,
-                    "fuente_kpis": "ventas_movimientos_enriquecidos",
-                    "fuente_rows": "siigo_facturas"
-                }
+                "count": len(rows)
             })
 
         except Exception as e:
