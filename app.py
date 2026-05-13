@@ -6960,9 +6960,9 @@ def create_app():
 
 
     # --- ENDPOINT: Facturas por cliente/centro de costo (paginadas) ---
-    @app.route("/reportes/facturas_cliente", methods=["GET"])
+    @app.route("/reportes/facturas_cliente_cartera", methods=["GET"])
     @jwt_required()
-    def get_facturas_cliente():
+    def get_facturas_cliente_cartera():
         claims = get_jwt()
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
@@ -10194,6 +10194,8 @@ def create_app():
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
         centro_costos = request.args.get("centro_costos", type=int)
+        if not centro_costos:
+            centro_costos = request.args.get("cost_center", type=int)
         limit = request.args.get("limit", type=int) or 10000
 
         def validar_fecha(fecha_str):
