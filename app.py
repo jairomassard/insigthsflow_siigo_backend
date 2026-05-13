@@ -9817,7 +9817,11 @@ def create_app():
 
 
     # --- ENDPOINT: Reporte Financiero Consolidado ---
-    # --- ENDPOINT: Reporte Financiero Consolidado (con Nómina) ---
+    # ============================================================
+    # ENDPOINT: Reporte Financiero Consolidado
+    # Ingresos corregidos con ventas_movimientos_enriquecidos
+    # ============================================================
+
     @app.route("/reportes/financiero/consolidado", methods=["GET"])
     @jwt_required()
     def reporte_financiero_consolidado():
@@ -9825,7 +9829,13 @@ def create_app():
         from datetime import datetime
 
         claims = get_jwt()
+        perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
         if not idcliente:
             return jsonify({"error": "Token sin cliente"}), 403
 
@@ -9834,63 +9844,118 @@ def create_app():
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos", type=int)
 
-        params = {"idcliente": idcliente}
-        condiciones = ["idcliente = :idcliente"]
-
         def validar_fecha(fecha_str):
             try:
                 return datetime.strptime(fecha_str, "%Y-%m-%d").date()
-            except:
+            except Exception:
                 return None
 
-        fecha_desde_val = validar_fecha(desde)
-        fecha_hasta_val = validar_fecha(hasta)
+        fecha_desde_val = validar_fecha(desde) if desde else None
+        fecha_hasta_val = validar_fecha(hasta) if hasta else None
+
+        # ============================================================
+        # 1) Ingresos comerciales tipo Siigo
+        # Fuente: ventas_movimientos_enriquecidos
+        # Regla: ingresos = facturas emitidas - notas crédito, CON impuesto
+        # ============================================================
+
+        condiciones_ing = ["m.idcliente = :idcliente"]
+        params_ing = {"idcliente": idcliente}
 
         if fecha_desde_val:
-            condiciones.append("fecha >= :desde")
-            params["desde"] = fecha_desde_val
+            condiciones_ing.append("m.fecha >= :desde")
+            params_ing["desde"] = fecha_desde_val
+
         if fecha_hasta_val:
-            condiciones.append("fecha <= :hasta")
-            params["hasta"] = fecha_hasta_val
+            condiciones_ing.append("m.fecha <= :hasta")
+            params_ing["hasta"] = fecha_hasta_val
+
         if centro_costos:
-            # misma columna en facturas_enriquecidas y siigo_compras
-            condiciones.append("cost_center = :centro_costos")
-            params["centro_costos"] = centro_costos
+            condiciones_ing.append("m.cost_center = :centro_costos")
+            params_ing["centro_costos"] = centro_costos
 
-        where_sql = " AND ".join(condiciones)
+        where_ing = " AND ".join(condiciones_ing)
 
-        # ---------------- Ingresos (ventas) ----------------
         sql_ingresos = text(f"""
             SELECT
-                date_trunc('month', fecha) AS mes,
-                SUM(COALESCE(total,0)) AS ingresos,
-                SUM(COALESCE(subtotal,0)) AS ingresos_netos,
-                COUNT(*) AS facturas_venta
-            FROM facturas_enriquecidas
-            WHERE {where_sql}
-            GROUP BY mes
-        """)
-        ingresos_rows = db.session.execute(sql_ingresos, params).mappings().all()
+                date_trunc('month', m.fecha)::date AS mes,
 
-        # ---------------- Egresos (compras/gastos) ----------------
+                -- Ingresos netos con impuesto, igual a Siigo con "Incluye impuesto"
+                COALESCE(SUM(m.total), 0) AS ingresos,
+
+                -- Base sin impuesto, útil para auditoría
+                COALESCE(SUM(m.subtotal), 0) AS ingresos_sin_impuesto,
+
+                -- Impuesto neto comercial
+                COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos_netos,
+
+                -- Facturas emitidas antes de notas crédito
+                COALESCE(SUM(
+                    CASE WHEN m.tipo_movimiento = 'FACTURA'
+                    THEN m.total ELSE 0 END
+                ), 0) AS facturas_emitidas,
+
+                -- Notas crédito del periodo en positivo
+                ABS(COALESCE(SUM(
+                    CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                    THEN m.total ELSE 0 END
+                ), 0)) AS notas_credito,
+
+                COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS facturas_venta,
+                COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS notas_credito_count
+
+            FROM ventas_movimientos_enriquecidos m
+            WHERE {where_ing}
+            GROUP BY date_trunc('month', m.fecha)::date
+        """)
+
+        ingresos_rows = db.session.execute(sql_ingresos, params_ing).mappings().all()
+
+        # ============================================================
+        # 2) Egresos compras/gastos
+        # Fuente: siigo_compras, como viene actualmente
+        # ============================================================
+
+        condiciones_egr = ["c.idcliente = :idcliente"]
+        params_egr = {"idcliente": idcliente}
+
+        if fecha_desde_val:
+            condiciones_egr.append("c.fecha >= :desde")
+            params_egr["desde"] = fecha_desde_val
+
+        if fecha_hasta_val:
+            condiciones_egr.append("c.fecha <= :hasta")
+            params_egr["hasta"] = fecha_hasta_val
+
+        if centro_costos:
+            condiciones_egr.append("c.cost_center = :centro_costos")
+            params_egr["centro_costos"] = centro_costos
+
+        where_egr = " AND ".join(condiciones_egr)
+
         sql_egresos = text(f"""
             SELECT
-                date_trunc('month', fecha) AS mes,
-                SUM(COALESCE(total,0)) AS egresos,
+                date_trunc('month', c.fecha)::date AS mes,
+                COALESCE(SUM(c.total), 0) AS egresos,
                 COUNT(*) AS facturas_compra
-            FROM siigo_compras
-            WHERE {where_sql}
-            GROUP BY mes
+            FROM siigo_compras c
+            WHERE {where_egr}
+            GROUP BY date_trunc('month', c.fecha)::date
         """)
-        egresos_rows = db.session.execute(sql_egresos, params).mappings().all()
 
-        # ---------------- Costos de Nómina ----------------
+        egresos_rows = db.session.execute(sql_egresos, params_egr).mappings().all()
+
+        # ============================================================
+        # 3) Nómina
+        # ============================================================
+
         condiciones_nomina = ["idcliente = :idcliente"]
         params_nomina = {"idcliente": idcliente}
 
         if fecha_desde_val:
             condiciones_nomina.append("periodo >= :desde_nomina")
             params_nomina["desde_nomina"] = fecha_desde_val
+
         if fecha_hasta_val:
             condiciones_nomina.append("periodo <= :hasta_nomina")
             params_nomina["hasta_nomina"] = fecha_hasta_val
@@ -9899,36 +9964,72 @@ def create_app():
 
         sql_nomina = text(f"""
             SELECT
-                date_trunc('month', periodo) AS mes,
-                SUM(COALESCE(total_ingresos,0)) AS nomina
+                date_trunc('month', periodo)::date AS mes,
+                COALESCE(SUM(total_ingresos), 0) AS nomina
             FROM siigo_nomina
             WHERE {where_nomina}
-            GROUP BY mes
+            GROUP BY date_trunc('month', periodo)::date
         """)
+
         nomina_rows = db.session.execute(sql_nomina, params_nomina).mappings().all()
 
-        # Convertir a dict para fácil merge
+        # ============================================================
+        # 4) Merge mensual
+        # ============================================================
+
         ingresos_dict = {str(r["mes"]): dict(r) for r in ingresos_rows}
         egresos_dict = {str(r["mes"]): dict(r) for r in egresos_rows}
         nomina_dict = {str(r["mes"]): dict(r) for r in nomina_rows}
 
-        meses = sorted(set(ingresos_dict.keys()) | set(egresos_dict.keys()) | set(nomina_dict.keys()))
+        meses = sorted(
+            set(ingresos_dict.keys())
+            | set(egresos_dict.keys())
+            | set(nomina_dict.keys())
+        )
 
-        # ---------------- Evolución combinada ----------------
         evolucion = []
-        total_ingresos = total_egresos = facturas_venta = facturas_compra = 0
+
+        total_ingresos = 0
+        total_ingresos_sin_impuesto = 0
+        total_impuestos_netos = 0
+        total_facturas_emitidas = 0
+        total_notas_credito = 0
+        total_egresos = 0
         total_nomina = 0
+        facturas_venta = 0
+        facturas_compra = 0
+        notas_credito_count = 0
         utilidad_acumulada = 0
 
         for mes in meses:
-            ing = ingresos_dict.get(mes, {"ingresos": 0, "facturas_venta": 0})
-            egr = egresos_dict.get(mes, {"egresos": 0, "facturas_compra": 0})
-            nom = nomina_dict.get(mes, {"nomina": 0})
+            ing = ingresos_dict.get(mes, {
+                "ingresos": 0,
+                "ingresos_sin_impuesto": 0,
+                "impuestos_netos": 0,
+                "facturas_emitidas": 0,
+                "notas_credito": 0,
+                "facturas_venta": 0,
+                "notas_credito_count": 0,
+            })
+
+            egr = egresos_dict.get(mes, {
+                "egresos": 0,
+                "facturas_compra": 0,
+            })
+
+            nom = nomina_dict.get(mes, {
+                "nomina": 0,
+            })
 
             ingresos = ing["ingresos"] or 0
-            ingresos_netos = ing.get("ingresos_netos", 0) or 0
-            egresos = (egr["egresos"] or 0) + (nom["nomina"] or 0)
+            ingresos_sin_impuesto = ing["ingresos_sin_impuesto"] or 0
+            impuestos_netos = ing["impuestos_netos"] or 0
+            facturas_emitidas = ing["facturas_emitidas"] or 0
+            notas_credito = ing["notas_credito"] or 0
+
+            egresos_base = egr["egresos"] or 0
             nomina_mes = nom["nomina"] or 0
+            egresos = egresos_base + nomina_mes
 
             utilidad = ingresos - egresos
             margen = (utilidad / ingresos * 100) if ingresos > 0 else 0
@@ -9937,76 +10038,141 @@ def create_app():
 
             evolucion.append({
                 "mes": mes,
+
+                # Para mantener compatibilidad con la página:
                 "ingresos": ingresos,
+                "ingresos_netos": ingresos,
+
+                # Nuevos campos claros:
+                "ingresos_con_impuesto": ingresos,
+                "ingresos_sin_impuesto": ingresos_sin_impuesto,
+                "impuestos_netos": impuestos_netos,
+                "facturas_emitidas": facturas_emitidas,
+                "notas_credito": notas_credito,
+
                 "egresos": egresos,
+                "egresos_base": egresos_base,
                 "nomina": nomina_mes,
+
                 "utilidad": utilidad,
                 "margen": round(margen, 2),
                 "utilidad_acumulada": utilidad_acumulada,
-                "ingresos_netos": ingresos_netos,
+
+                "facturas_venta": ing["facturas_venta"] or 0,
+                "notas_credito_count": ing["notas_credito_count"] or 0,
+                "facturas_compra": egr["facturas_compra"] or 0,
             })
 
             total_ingresos += ingresos
-            total_ingresos_netos = total_ingresos_netos + ingresos_netos if 'total_ingresos_netos' in locals() else ingresos_netos
+            total_ingresos_sin_impuesto += ingresos_sin_impuesto
+            total_impuestos_netos += impuestos_netos
+            total_facturas_emitidas += facturas_emitidas
+            total_notas_credito += notas_credito
             total_egresos += egresos
             total_nomina += nomina_mes
-            facturas_venta += ing["facturas_venta"]
-            facturas_compra += egr["facturas_compra"]
+            facturas_venta += ing["facturas_venta"] or 0
+            notas_credito_count += ing["notas_credito_count"] or 0
+            facturas_compra += egr["facturas_compra"] or 0
 
-        # ---------------- KPIs globales ----------------
+        # ============================================================
+        # 5) KPIs globales
+        # ============================================================
+
         utilidad_total = total_ingresos - total_egresos
         margen_total = (utilidad_total / total_ingresos * 100) if total_ingresos > 0 else 0
 
         kpis = {
+            # Compatibilidad con la página actual:
             "ingresos": total_ingresos,
-            "ingresos_netos": total_ingresos_netos,
+            "ingresos_netos": total_ingresos,
+
+            # Nuevos campos claros:
+            "ingresos_con_impuesto": total_ingresos,
+            "ingresos_sin_impuesto": total_ingresos_sin_impuesto,
+            "impuestos_netos": total_impuestos_netos,
+            "facturas_emitidas": total_facturas_emitidas,
+            "notas_credito": total_notas_credito,
+
             "egresos": total_egresos,
             "nomina": total_nomina,
             "utilidad": utilidad_total,
             "margen": round(margen_total, 2),
             "facturas_venta": facturas_venta,
-            "facturas_compra": facturas_compra
+            "notas_credito_count": notas_credito_count,
+            "facturas_compra": facturas_compra,
         }
 
-        # ---------------- Top Clientes ----------------
-        sql_top_clientes = text(f"""
-            SELECT 
-                cliente_nombre AS nombre,
-                COALESCE(SUM(total),0) AS total
-            FROM facturas_enriquecidas
-            WHERE {where_sql}
-            GROUP BY cliente_nombre
-            ORDER BY total DESC
-            LIMIT 10
-        """)
-        top_clientes = [dict(r) for r in db.session.execute(sql_top_clientes, params).mappings().all()]
+        # ============================================================
+        # 6) Top clientes
+        # Fuente: movimientos comerciales con impuesto
+        # ============================================================
 
-        # ---------------- Top Proveedores ----------------
-        sql_top_proveedores = text(f"""
-            SELECT 
-                COALESCE(proveedor_nombre, 'Sin proveedor') AS nombre,
-                COALESCE(SUM(total),0) AS total
-            FROM siigo_compras
-            WHERE {where_sql}
-            GROUP BY COALESCE(proveedor_nombre, 'Sin proveedor')
+        sql_top_clientes = text(f"""
+            SELECT
+                m.cliente_nombre AS nombre,
+
+                -- Venta neta con impuesto
+                COALESCE(SUM(m.total), 0) AS total,
+
+                COALESCE(SUM(
+                    CASE WHEN m.tipo_movimiento = 'FACTURA'
+                    THEN m.total ELSE 0 END
+                ), 0) AS facturas_emitidas,
+
+                ABS(COALESCE(SUM(
+                    CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                    THEN m.total ELSE 0 END
+                ), 0)) AS notas_credito
+
+            FROM ventas_movimientos_enriquecidos m
+            WHERE {where_ing}
+            GROUP BY m.cliente_nombre
             ORDER BY total DESC
             LIMIT 10
         """)
-        top_proveedores = [dict(r) for r in db.session.execute(sql_top_proveedores, params).mappings().all()]
+
+        top_clientes = [
+            dict(r) for r in db.session.execute(sql_top_clientes, params_ing).mappings().all()
+        ]
+
+        # ============================================================
+        # 7) Top proveedores
+        # ============================================================
+
+        sql_top_proveedores = text(f"""
+            SELECT
+                COALESCE(c.proveedor_nombre, 'Sin proveedor') AS nombre,
+                COALESCE(SUM(c.total), 0) AS total
+            FROM siigo_compras c
+            WHERE {where_egr}
+            GROUP BY COALESCE(c.proveedor_nombre, 'Sin proveedor')
+            ORDER BY total DESC
+            LIMIT 10
+        """)
+
+        top_proveedores = [
+            dict(r) for r in db.session.execute(sql_top_proveedores, params_egr).mappings().all()
+        ]
 
         return jsonify({
             "kpis": kpis,
             "evolucion": evolucion,
             "top_clientes": top_clientes,
-            "top_proveedores": top_proveedores
+            "top_proveedores": top_proveedores,
+            "config": {
+                "fuente_ingresos": "ventas_movimientos_enriquecidos",
+                "fuente_egresos": "siigo_compras",
+                "ingresos": "ventas_netas_con_impuesto",
+                "logica": "ingresos = facturas_emitidas - notas_credito"
+            }
         })
 
 
+    # ============================================================
+    # ENDPOINT: Detalle de ingresos / clientes para consolidado
+    # Ahora devuelve movimientos comerciales: FACTURA y NOTA_CREDITO
+    # ============================================================
 
-
-
-
-    # Para obtener factruas de cliente en el grafico de top 10 clientes pagina Consolidado
     @app.route("/reportes/facturas_cliente", methods=["GET"])
     @jwt_required()
     def facturas_por_cliente():
@@ -10014,57 +10180,124 @@ def create_app():
         from datetime import datetime
 
         claims = get_jwt()
+        perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
         if not idcliente:
             return jsonify({"error": "Token sin cliente"}), 403
 
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
-        centro_costos = request.args.get("centro_costos", type=int)  # 👈 opcional pero mejor
-
-
-        condiciones = ["idcliente = :idcliente"]
-        params = {"idcliente": idcliente}
+        centro_costos = request.args.get("centro_costos", type=int)
+        limit = request.args.get("limit", type=int) or 10000
 
         def validar_fecha(fecha_str):
             try:
                 return datetime.strptime(fecha_str, "%Y-%m-%d").date()
-            except:
+            except Exception:
                 return None
 
-        if desde and validar_fecha(desde):
-            condiciones.append("fecha >= :desde")
-            params["desde"] = desde
-        if hasta and validar_fecha(hasta):
-            # incluir TODO el día final (hasta las 23:59:59)
-            condiciones.append("fecha < (:hasta::date + INTERVAL '1 day')")
-            params["hasta"] = hasta
-        if cliente:
-            condiciones.append("cliente_nombre = :cliente")
-            params["cliente"] = cliente
-        if centro_costos:
-            # condiciones.append("(cost_center = :centro_costos OR cost_center IS NULL)")
-            # 👇 QUITA el OR cost_center IS NULL
-            condiciones.append("cost_center = :centro_costos")
-            params["centro_costos"] = centro_costos
+        condiciones = ["m.idcliente = :idcliente"]
+        params = {
+            "idcliente": idcliente,
+            "limit": limit,
+        }
 
+        if desde and validar_fecha(desde):
+            condiciones.append("m.fecha >= :desde")
+            params["desde"] = desde
+
+        if hasta and validar_fecha(hasta):
+            condiciones.append("m.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        if cliente:
+            condiciones.append("m.cliente_nombre = :cliente")
+            params["cliente"] = cliente
+
+        if centro_costos:
+            condiciones.append("m.cost_center = :centro_costos")
+            params["centro_costos"] = centro_costos
 
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
-            SELECT *
-            FROM facturas_enriquecidas
+            SELECT
+                m.movimiento_id,
+                m.documento AS idfactura,
+                m.documento,
+                m.tipo_movimiento,
+                m.fecha,
+                m.vencimiento,
+                m.cliente_nombre,
+                m.estado,
+                m.estado_pago,
+                m.subtotal,
+                m.impuestos_total,
+                m.total,
+                m.pagos_total AS pagado,
+                m.saldo,
+                m.cost_center,
+                m.centro_costo_nombre,
+                m.centro_costo_codigo,
+                m.seller_id,
+                m.vendedor_nombre,
+                m.public_url,
+                m.documento_afectado,
+
+                CASE
+                    WHEN m.tipo_movimiento = 'FACTURA'
+                    THEN GREATEST(COALESCE(m.total, 0) - COALESCE(m.saldo, 0), 0)
+                    ELSE 0
+                END AS valor_pagado,
+
+                CASE
+                    WHEN m.tipo_movimiento = 'FACTURA'
+                    THEN GREATEST(COALESCE(m.saldo, 0), 0)
+                    ELSE 0
+                END AS valor_pendiente
+
+            FROM ventas_movimientos_enriquecidos m
             WHERE {where_sql}
-            ORDER BY fecha DESC
+            ORDER BY m.fecha DESC, m.tipo_movimiento ASC, m.documento DESC
+            LIMIT :limit
         """)
 
-        rows = db.session.execute(sql, params).mappings().all()
-        return jsonify({"rows": [dict(r) for r in rows]})
+        rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
+
+        sql_resumen = text(f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN m.tipo_movimiento = 'FACTURA' THEN m.total ELSE 0 END), 0) AS facturas_emitidas,
+                ABS(COALESCE(SUM(CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO' THEN m.total ELSE 0 END), 0)) AS notas_credito,
+                COALESCE(SUM(m.total), 0) AS ventas_netas,
+                COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS total_facturas,
+                COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS total_notas_credito,
+                COUNT(*) AS total_movimientos
+            FROM ventas_movimientos_enriquecidos m
+            WHERE {where_sql}
+        """)
+
+        resumen = dict(db.session.execute(sql_resumen, params).mappings().first() or {})
+
+        return jsonify({
+            "rows": rows,
+            "resumen": resumen,
+            "total": len(rows),
+            "idcliente": idcliente,
+            "fuente": "ventas_movimientos_enriquecidos"
+        })
 
 
-    # Para obtener factruas de proveedor en el grafico de top 10 proveedores pagina Consolidado
-    # --- ENDPOINT: Facturas de proveedor (para modal) ---
+    # ============================================================
+    # ENDPOINT: Facturas de proveedor para modal consolidado
+    # Se mantiene sobre siigo_compras
+    # ============================================================
+
     @app.route("/reportes/facturas_proveedor", methods=["GET"])
     @jwt_required()
     def facturas_por_proveedor():
@@ -10075,7 +10308,6 @@ def create_app():
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
 
-        # Permitir que SuperAdmin consulte un cliente específico si manda ?idcliente=9
         q_idcliente = request.args.get("idcliente", type=int)
 
         if perfilid == 0:
@@ -10091,9 +10323,13 @@ def create_app():
         hasta = request.args.get("hasta")
         proveedor = request.args.get("proveedor")
         centro_costos = request.args.get("centro_costos", type=int)
+        limit = request.args.get("limit", type=int) or 10000
 
         condiciones = ["c.idcliente = :idcliente"]
-        params = {"idcliente": idcliente}
+        params = {
+            "idcliente": idcliente,
+            "limit": limit,
+        }
 
         def validar_fecha(fecha_str):
             try:
@@ -10125,7 +10361,7 @@ def create_app():
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
-            SELECT 
+            SELECT
                 c.id,
                 c.idcompra,
                 c.proveedor_nombre,
@@ -10134,66 +10370,109 @@ def create_app():
                 c.vencimiento,
                 c.total,
                 c.saldo,
+                c.cost_center,
                 cc.nombre AS centro_costo_nombre,
-                CASE 
+                CASE
                     WHEN LOWER(COALESCE(c.estado, '')) = 'pagado' THEN 'Pagada'
                     ELSE 'No Pagada'
                 END AS estado
             FROM siigo_compras c
             LEFT JOIN siigo_centros_costo cc
-                ON c.cost_center = cc.id
+                ON cc.id = c.cost_center
             AND cc.idcliente = c.idcliente
             WHERE {where_sql}
             ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
+            LIMIT :limit
         """)
 
-        rows = db.session.execute(sql, params).mappings().all()
+        rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
 
         return jsonify({
-            "rows": [dict(r) for r in rows],
+            "rows": rows,
             "total": len(rows),
             "idcliente": idcliente
         }), 200
 
 
+    # ============================================================
+    # ENDPOINT: Catálogo de centros de costo para consolidado
+    # Toma centros usados en ingresos y egresos
+    # ============================================================
 
-   # --- ENDPOINT: Catálogo de centros de costo para reporte consolidado ---
     @app.route("/catalogos/centros-costo-consolidado", methods=["GET"])
     @jwt_required()
     def catalogo_centros_costo_consolidado():
+        from sqlalchemy.sql import text
+        from datetime import datetime
+
         claims = get_jwt()
+        perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
-
-        params = {"idcliente": idcliente}
-        wh = ["f.idcliente = :idcliente"]
 
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
 
-        if desde:
-            wh.append("f.fecha >= :desde")
-            params["desde"] = desde
-        if hasta:
-            wh.append("f.fecha <= :hasta")
-            params["hasta"] = hasta
+        def validar_fecha(fecha_str):
+            try:
+                return datetime.strptime(fecha_str, "%Y-%m-%d").date()
+            except Exception:
+                return None
 
-        where_clause = " AND ".join(wh)
+        fecha_desde_val = validar_fecha(desde) if desde else None
+        fecha_hasta_val = validar_fecha(hasta) if hasta else None
+
+        params = {"idcliente": idcliente}
+
+        wh_mov = ["m.idcliente = :idcliente", "m.cost_center IS NOT NULL"]
+        wh_comp = ["c.idcliente = :idcliente", "c.cost_center IS NOT NULL"]
+
+        if fecha_desde_val:
+            wh_mov.append("m.fecha >= :desde")
+            wh_comp.append("c.fecha >= :desde")
+            params["desde"] = fecha_desde_val
+
+        if fecha_hasta_val:
+            wh_mov.append("m.fecha <= :hasta")
+            wh_comp.append("c.fecha <= :hasta")
+            params["hasta"] = fecha_hasta_val
+
+        where_mov = " AND ".join(wh_mov)
+        where_comp = " AND ".join(wh_comp)
 
         sql = text(f"""
-            SELECT DISTINCT
-                f.cost_center AS id,
-                COALESCE(f.centro_costo_nombre, 'Sin centro de costo') AS nombre
-            FROM facturas_enriquecidas f
-            WHERE {where_clause}
-            AND f.cost_center IS NOT NULL
+            WITH centros AS (
+                SELECT DISTINCT
+                    m.cost_center AS id,
+                    COALESCE(m.centro_costo_nombre, 'Sin centro de costo') AS nombre
+                FROM ventas_movimientos_enriquecidos m
+                WHERE {where_mov}
+
+                UNION
+
+                SELECT DISTINCT
+                    c.cost_center AS id,
+                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                FROM siigo_compras c
+                LEFT JOIN siigo_centros_costo cc
+                    ON cc.id = c.cost_center
+                AND cc.idcliente = c.idcliente
+                WHERE {where_comp}
+            )
+            SELECT id, nombre
+            FROM centros
+            WHERE id IS NOT NULL
             ORDER BY nombre
         """)
+
         rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
         return jsonify(rows)
-
-
 
 
 
