@@ -5357,9 +5357,11 @@ def create_app():
     # ==========================
 
 
-    # Endpoint reporte Financiero (con KPIs + series)
-
+    # ============================================================
     # Endpoint reporte Financiero Ventas
+    # Fuente comercial: ventas_movimientos_enriquecidos
+    # ============================================================
+
     @app.route("/reportes/facturas_enriquecidas", methods=["GET"])
     @jwt_required()
     def get_facturas_enriquecidas():
@@ -5383,12 +5385,18 @@ def create_app():
         cliente     = request.args.get("cliente")
         limit       = request.args.get("limit", type=int) or 5000
 
-        incluye_impuesto = str(request.args.get("incluye_impuesto", "1")).lower() in ["1", "true", "si", "sí", "yes"]
-        incluye_nota_credito = str(request.args.get("incluye_nota_credito", "1")).lower() in ["1", "true", "si", "sí", "yes"]
+        incluye_impuesto = str(request.args.get("incluye_impuesto", "1")).lower() in [
+            "1", "true", "si", "sí", "yes"
+        ]
+
+        incluye_nota_credito = str(request.args.get("incluye_nota_credito", "1")).lower() in [
+            "1", "true", "si", "sí", "yes"
+        ]
 
         try:
             # ============================================================
-            # 1) Filtros para detalle de facturas
+            # 1) Detalle de facturas reales
+            #    Se mantiene desde siigo_facturas para no romper modales antiguos.
             # ============================================================
             wh_rows = ["f.idcliente = :idcliente"]
             params = {
@@ -5460,7 +5468,8 @@ def create_app():
             rows = [dict(r) for r in db.session.execute(sql_rows, params).mappings().all()]
 
             # ============================================================
-            # 2) Filtros para movimientos comerciales tipo Siigo
+            # 2) KPIs / series / top clientes
+            #    Fuente oficial para reporte comercial: ventas_movimientos_enriquecidos
             # ============================================================
             wh_mov = ["m.idcliente = :idcliente"]
 
@@ -5484,7 +5493,7 @@ def create_app():
 
             where_mov = " AND ".join(wh_mov)
 
-            # Valor principal igual a Siigo:
+            # Campo principal igual a Siigo:
             # - incluye_impuesto = true  => total
             # - incluye_impuesto = false => subtotal
             campo_valor = "total" if incluye_impuesto else "subtotal"
@@ -5548,28 +5557,114 @@ def create_app():
                 )
             """
 
+            # ============================================================
+            # KPIs principales
+            # ============================================================
             sql_kpis = text(cte_common + """
                 SELECT
+                    -- Valor principal de ventas netas según modo Siigo
                     COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
 
-                    -- Impuesto neto real del reporte comercial:
+                    -- Impuesto neto comercial:
                     -- ventas con impuesto - ventas sin impuesto
                     COALESCE(SUM(total_b) - SUM(subtotal_b), 0) AS impuestos,
 
                     COALESCE(SUM(autorretencion), 0) AS autorretencion,
 
-                    -- Facturas emitidas antes de notas crédito
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS total_facturado,
+                    -- Facturas emitidas según modo actual:
+                    -- con impuesto => total
+                    -- sin impuesto => subtotal
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN valor_siigo_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS total_facturado,
 
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN subtotal_b ELSE 0 END), 0) AS facturas_emitidas_sin_impuesto,
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS facturas_emitidas_con_impuesto,
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'NOTA_CREDITO' THEN subtotal_b ELSE 0 END), 0) AS notas_credito_sin_impuesto,
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'NOTA_CREDITO' THEN total_b ELSE 0 END), 0) AS notas_credito_con_impuesto,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN subtotal_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS facturas_emitidas_sin_impuesto,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN total_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS facturas_emitidas_con_impuesto,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                THEN subtotal_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS notas_credito_sin_impuesto,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                THEN total_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS notas_credito_con_impuesto,
+
+                    -- Nota crédito según modo actual, se devuelve negativa para auditoría
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                THEN valor_siigo_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS notas_credito,
+
+                    -- Nota crédito positiva para mostrar en frontend
+                    ABS(
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                    THEN valor_siigo_b
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                    ) AS notas_credito_abs,
 
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
-                    COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
+
+                    COALESCE(
+                        SUM(total_b - (autorretencion + retenciones_sin_auto)),
+                        0
+                    ) AS total_utilizable,
+
                     COALESCE(SUM(pagado_b), 0) AS pagado,
                     COALESCE(SUM(pendiente_b), 0) AS pendiente,
+
                     COALESCE(SUM(subtotal_b), 0) AS ventas_sin_impuesto,
                     COALESCE(SUM(total_b), 0) AS ventas_con_impuesto
                 FROM ajuste
@@ -5577,10 +5672,15 @@ def create_app():
 
             kpis = dict(db.session.execute(sql_kpis, params).mappings().first() or {})
 
+            # ============================================================
+            # Series mensuales
+            # ============================================================
             sql_series = text(cte_common + """
                 SELECT
                     mes::text AS periodo,
                     TO_CHAR(mes, 'Mon YYYY') AS label,
+
+                    -- Ventas netas según modo Siigo
                     COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
 
                     -- Impuesto neto real del mes
@@ -5588,13 +5688,54 @@ def create_app():
 
                     COALESCE(SUM(autorretencion), 0) AS autorretencion,
 
-                    -- Facturas emitidas antes de notas crédito
-                    COALESCE(SUM(CASE WHEN tipo_movimiento = 'FACTURA' THEN total_b ELSE 0 END), 0) AS total_facturado,
+                    -- Facturas emitidas según modo actual
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN valor_siigo_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS total_facturado,
+
+                    -- Notas crédito según modo actual, positiva para tooltip/gráfica
+                    ABS(
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                    THEN valor_siigo_b
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                    ) AS notas_credito,
+
+                    -- Notas crédito negativa para auditoría
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                THEN valor_siigo_b
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS notas_credito_neto,
 
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
-                    COALESCE(SUM(total_b - (autorretencion + retenciones_sin_auto)), 0) AS total_utilizable,
+
+                    COALESCE(
+                        SUM(total_b - (autorretencion + retenciones_sin_auto)),
+                        0
+                    ) AS total_utilizable,
+
                     COALESCE(SUM(pagado_b), 0) AS pagado,
                     COALESCE(SUM(pendiente_b), 0) AS pendiente,
+
                     COALESCE(SUM(subtotal_b), 0) AS ventas_sin_impuesto,
                     COALESCE(SUM(total_b), 0) AS ventas_con_impuesto
                 FROM ajuste
@@ -5604,6 +5745,9 @@ def create_app():
 
             series = [dict(r) for r in db.session.execute(sql_series, params).mappings().all()]
 
+            # ============================================================
+            # Estados pagado / pendiente
+            # ============================================================
             sql_estados = text(cte_common + """
                 SELECT 'Pagado' AS estado, COALESCE(SUM(pagado_b), 0) AS valor FROM ajuste
                 UNION ALL
@@ -5612,10 +5756,38 @@ def create_app():
 
             estados = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
 
+            # ============================================================
+            # Top clientes según modo Siigo actual
+            # ============================================================
             sql_top_clientes = text(f"""
                 SELECT
                     m.cliente_nombre AS cliente,
-                    COALESCE(SUM(m.{campo_valor}), 0) AS total
+                    COALESCE(SUM(m.{campo_valor}), 0) AS total,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN m.tipo_movimiento = 'FACTURA'
+                                THEN m.{campo_valor}
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS facturas_emitidas,
+
+                    ABS(
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                                    THEN m.{campo_valor}
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                    ) AS notas_credito
+
                 FROM ventas_movimientos_enriquecidos m
                 WHERE {where_mov}
                 GROUP BY m.cliente_nombre
@@ -5637,13 +5809,229 @@ def create_app():
                     "incluye_nota_credito": incluye_nota_credito,
                     "campo_valor": campo_valor,
                     "fuente_kpis": "ventas_movimientos_enriquecidos",
-                    "fuente_rows": "siigo_facturas"
+                    "fuente_rows": "siigo_facturas",
+                    "logica": "ventas_netas = facturas_emitidas - notas_credito"
                 }
             })
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+
+    # ============================================================
+    # Endpoint detalle de movimientos comerciales
+    # Para modales de barras, clientes y conciliación contra Siigo
+    # Fuente: ventas_movimientos_enriquecidos
+    # ============================================================
+
+    @app.route("/reportes/ventas_movimientos_detalle", methods=["GET"])
+    @jwt_required()
+    def ventas_movimientos_detalle():
+        from sqlalchemy.sql import text
+
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        desde       = request.args.get("desde")
+        hasta       = request.args.get("hasta")
+        seller_id   = request.args.get("seller_id", type=int)
+        cost_center = request.args.get("cost_center", type=int)
+        cliente     = request.args.get("cliente")
+        tipo        = request.args.get("tipo")  # FACTURA / NOTA_CREDITO opcional
+        limit       = request.args.get("limit", type=int) or 10000
+
+        incluye_impuesto = str(request.args.get("incluye_impuesto", "1")).lower() in [
+            "1", "true", "si", "sí", "yes"
+        ]
+
+        incluye_nota_credito = str(request.args.get("incluye_nota_credito", "1")).lower() in [
+            "1", "true", "si", "sí", "yes"
+        ]
+
+        campo_valor = "total" if incluye_impuesto else "subtotal"
+
+        try:
+            wh = ["m.idcliente = :idcliente"]
+            params = {
+                "idcliente": idcliente,
+                "limit": limit,
+            }
+
+            if desde:
+                wh.append("m.fecha >= :desde")
+                params["desde"] = desde
+
+            if hasta:
+                wh.append("m.fecha <= :hasta")
+                params["hasta"] = hasta
+
+            if seller_id:
+                wh.append("m.seller_id = :seller_id")
+                params["seller_id"] = seller_id
+
+            if cost_center:
+                wh.append("m.cost_center = :cost_center")
+                params["cost_center"] = cost_center
+
+            if cliente:
+                wh.append("m.cliente_nombre = :cliente")
+                params["cliente"] = cliente
+
+            if tipo:
+                wh.append("m.tipo_movimiento = :tipo")
+                params["tipo"] = tipo
+
+            if not incluye_nota_credito:
+                wh.append("m.tipo_movimiento = 'FACTURA'")
+
+            where_clause = " AND ".join(wh)
+
+            sql = text(f"""
+                WITH base AS (
+                    SELECT
+                        m.movimiento_id,
+                        m.idcliente,
+                        m.documento,
+                        m.tipo_movimiento,
+                        m.fecha,
+                        m.vencimiento,
+                        m.cliente_nombre,
+                        m.estado,
+                        m.estado_pago,
+                        COALESCE(m.subtotal, 0) AS subtotal,
+                        COALESCE(m.impuestos_total, 0) AS impuestos_total,
+                        COALESCE(m.total, 0) AS total,
+                        COALESCE(m.{campo_valor}, 0) AS valor,
+                        COALESCE(m.pagos_total, 0) AS pagos_total,
+                        COALESCE(m.saldo, 0) AS saldo,
+                        m.cost_center,
+                        m.centro_costo_nombre,
+                        m.centro_costo_codigo,
+                        m.seller_id,
+                        m.vendedor_nombre,
+                        m.public_url,
+                        m.documento_afectado,
+
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA'
+                            THEN GREATEST(COALESCE(m.total, 0) - COALESCE(m.saldo, 0), 0)
+                            ELSE 0
+                        END AS pagado,
+
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA'
+                            THEN GREATEST(COALESCE(m.saldo, 0), 0)
+                            ELSE 0
+                        END AS pendiente
+
+                    FROM ventas_movimientos_enriquecidos m
+                    WHERE {where_clause}
+                )
+                SELECT
+                    *
+                FROM base
+                ORDER BY fecha DESC, tipo_movimiento ASC, documento DESC
+                LIMIT :limit
+            """)
+
+            rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
+
+            sql_resumen = text(f"""
+                WITH base AS (
+                    SELECT
+                        m.tipo_movimiento,
+                        COALESCE(m.subtotal, 0) AS subtotal,
+                        COALESCE(m.total, 0) AS total,
+                        COALESCE(m.{campo_valor}, 0) AS valor,
+                        COALESCE(m.saldo, 0) AS saldo
+                    FROM ventas_movimientos_enriquecidos m
+                    WHERE {where_clause}
+                )
+                SELECT
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN valor
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS facturas_emitidas,
+
+                    ABS(
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN tipo_movimiento = 'NOTA_CREDITO'
+                                    THEN valor
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                    ) AS notas_credito,
+
+                    COALESCE(SUM(valor), 0) AS ventas_netas,
+
+                    COALESCE(SUM(total), 0) AS ventas_con_impuesto,
+                    COALESCE(SUM(subtotal), 0) AS ventas_sin_impuesto,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN GREATEST(total - saldo, 0)
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS pagado,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN tipo_movimiento = 'FACTURA'
+                                THEN GREATEST(saldo, 0)
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS pendiente,
+
+                    COUNT(*) AS total_movimientos,
+
+                    COUNT(*) FILTER (WHERE tipo_movimiento = 'FACTURA') AS total_facturas,
+                    COUNT(*) FILTER (WHERE tipo_movimiento = 'NOTA_CREDITO') AS total_notas_credito
+
+                FROM base
+            """)
+
+            resumen = dict(db.session.execute(sql_resumen, params).mappings().first() or {})
+
+            return jsonify({
+                "rows": rows,
+                "resumen": resumen,
+                "count": len(rows),
+                "config": {
+                    "incluye_impuesto": incluye_impuesto,
+                    "incluye_nota_credito": incluye_nota_credito,
+                    "campo_valor": campo_valor,
+                    "fuente": "ventas_movimientos_enriquecidos",
+                    "logica": "ventas_netas = facturas_emitidas - notas_credito"
+                }
+            })
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     # ================================
     # ENDPOINT: Facturas por mes (para modal del dashboard)
