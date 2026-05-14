@@ -6529,7 +6529,7 @@ def create_app():
                                 NULLIF(TRIM(BOTH '"' FROM c.name), ''),
                                 'Desconocido'
                             ),
-                            '[\\{\\}\\[\\]\\"]',
+                            '[\\{{\\}}\\[\\]\\"]',
                             '',
                             'g'
                         ) AS cliente_nombre_ok,
@@ -6932,7 +6932,7 @@ def create_app():
                                 NULLIF(TRIM(BOTH '"' FROM c.name), ''),
                                 'Desconocido'
                             ),
-                            '[\\{\\}\\[\\]\\"]',
+                            '[\\{{\\}}\\[\\]\\"]',
                             '',
                             'g'
                         ) AS cliente_nombre_ok,
@@ -7181,7 +7181,7 @@ def create_app():
                                 NULLIF(TRIM(BOTH '"' FROM c.name), ''),
                                 'Desconocido'
                             ),
-                            '[\\{\\}\\[\\]\\"]',
+                            '[\\{{\\}}\\[\\]\\"]',
                             '',
                             'g'
                         ) AS cliente_nombre_ok
