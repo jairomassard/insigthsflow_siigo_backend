@@ -6377,6 +6377,13 @@ def create_app():
 
 
     # --- ENDPOINT: Clientes Insights (optimizado, enriquecido y alineado con Ingresos por Ventas) ---
+    # ============================================================
+    # ENDPOINT: Clientes Insights
+    # Alineado con Ingresos por Ventas:
+    # - Ventas comerciales: ventas_movimientos_enriquecidos
+    # - Cartera / pagos / vencimientos: siigo_facturas
+    # ============================================================
+
     @app.route("/reportes/analisis_clientes", methods=["GET"])
     @jwt_required()
     def get_clientes_insights():
@@ -6430,93 +6437,181 @@ def create_app():
         if limit_facturas > 30:
             limit_facturas = 30
 
+        fecha_desde_val = validar_fecha(desde) if desde else None
+        fecha_hasta_val = validar_fecha(hasta) if hasta else None
+
         try:
-            wh = ["f.idcliente = :idcliente"]
-            params = {
-                "idcliente": idcliente,
-                "limit_facturas": limit_facturas,
-            }
+            # ============================================================
+            # 1) Filtros comerciales: ventas_movimientos_enriquecidos
+            # ============================================================
+            wh_mov = ["m.idcliente = :idcliente"]
+            params_mov = {"idcliente": idcliente}
 
-            if desde and validar_fecha(desde):
-                wh.append("f.fecha >= :desde")
-                params["desde"] = desde
+            if fecha_desde_val:
+                wh_mov.append("m.fecha >= :desde")
+                params_mov["desde"] = fecha_desde_val
 
-            if hasta and validar_fecha(hasta):
-                wh.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
-                params["hasta"] = hasta
+            if fecha_hasta_val:
+                wh_mov.append("m.fecha < (:hasta::date + INTERVAL '1 day')")
+                params_mov["hasta"] = fecha_hasta_val
 
             if cliente:
-                wh.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
-                params["cliente"] = cliente
+                wh_mov.append("LOWER(TRIM(m.cliente_nombre)) = LOWER(TRIM(:cliente))")
+                params_mov["cliente"] = cliente
 
             if cost_center:
-                wh.append("f.cost_center = :cost_center")
-                params["cost_center"] = cost_center
+                wh_mov.append("m.cost_center = :cost_center")
+                params_mov["cost_center"] = cost_center
 
+            where_mov = " AND ".join(wh_mov)
+
+            # ============================================================
+            # 2) Filtros cartera: siigo_facturas
+            # ============================================================
             estado_sql = """
                 CASE
                     WHEN ROUND(COALESCE(f.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
-                    WHEN f.vencimiento IS NOT NULL AND f.vencimiento < CURRENT_DATE THEN 'vencido'
+                    WHEN f.vencimiento IS NOT NULL
+                        AND f.vencimiento < CURRENT_DATE
+                        AND COALESCE(f.saldo, 0) > 0 THEN 'vencido'
                     WHEN f.vencimiento IS NOT NULL
                         AND f.vencimiento >= CURRENT_DATE
-                        AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days' THEN 'alerta'
+                        AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days'
+                        AND COALESCE(f.saldo, 0) > 0 THEN 'alerta'
                     ELSE 'sano'
                 END
             """
 
+            wh_fac = ["f.idcliente = :idcliente"]
+            params_fac = {
+                "idcliente": idcliente,
+                "limit_facturas": limit_facturas,
+            }
+
+            if fecha_desde_val:
+                wh_fac.append("f.fecha >= :desde")
+                params_fac["desde"] = fecha_desde_val
+
+            if fecha_hasta_val:
+                wh_fac.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                params_fac["hasta"] = fecha_hasta_val
+
+            if cliente:
+                wh_fac.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
+                params_fac["cliente"] = cliente
+
+            if cost_center:
+                wh_fac.append("f.cost_center = :cost_center")
+                params_fac["cost_center"] = cost_center
+
+            filtro_estado_normalizado = None
             if filtro_estado:
-                filtro_estado = filtro_estado.lower().strip()
-                if filtro_estado in ["pagado", "vencido", "alerta", "sano"]:
-                    wh.append(f"({estado_sql}) = :estado")
-                    params["estado"] = filtro_estado
+                filtro_estado_normalizado = filtro_estado.lower().strip()
+                if filtro_estado_normalizado in ["pagado", "vencido", "alerta", "sano"]:
+                    wh_fac.append(f"({estado_sql}) = :estado")
+                    params_fac["estado"] = filtro_estado_normalizado
+                else:
+                    filtro_estado_normalizado = None
 
-            where_clause = " AND ".join(wh)
+            where_fac = " AND ".join(wh_fac)
 
-            # ---------------------------------------------------------------------
-            # 1. Resumen global
-            # ---------------------------------------------------------------------
-            sql_resumen = text(f"""
+            # ============================================================
+            # 3) Resumen comercial global
+            # ============================================================
+            sql_resumen_comercial = text(f"""
                 SELECT
-                    COUNT(DISTINCT f.cliente_nombre) AS clientes_facturados,
-                    COUNT(*) AS cantidad_facturas,
+                    COUNT(DISTINCT m.cliente_nombre) AS clientes_facturados,
 
-                    -- Conceptos alineados con reporte Ingresos por Ventas
-                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
-                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
-                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS cantidad_facturas,
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS cantidad_notas_credito,
 
-                    -- Cartera
-                    COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer
-                FROM facturas_enriquecidas f
-                WHERE {where_clause}
+                    -- Ventas netas con impuesto: facturas menos notas crédito
+                    COALESCE(SUM(m.total), 0) AS ventas_netas,
+
+                    -- Ventas netas sin impuesto
+                    COALESCE(SUM(m.subtotal), 0) AS ventas_sin_impuesto,
+
+                    -- Impuesto neto comercial
+                    COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
+
+                    -- Total de facturas emitidas antes de descontar notas crédito
+                    COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'FACTURA'
+                        THEN m.total ELSE 0 END
+                    ), 0) AS total_facturado_siigo,
+
+                    -- Notas crédito en positivo
+                    ABS(COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                        THEN m.total ELSE 0 END
+                    ), 0)) AS notas_credito
+
+                FROM ventas_movimientos_enriquecidos m
+                WHERE {where_mov}
             """)
 
-            resumen_row = db.session.execute(sql_resumen, params).mappings().first() or {}
+            resumen_comercial = dict(
+                db.session.execute(sql_resumen_comercial, params_mov).mappings().first() or {}
+            )
 
-            ventas_netas = money_float(resumen_row.get("ventas_netas"))
-            impuestos = money_float(resumen_row.get("impuestos"))
-            total_facturado_siigo = money_float(resumen_row.get("total_facturado_siigo"))
-            total_pagado = money_float(resumen_row.get("total_pagado"))
-            saldo_pendiente = money_float(resumen_row.get("saldo_pendiente"))
-            saldo_vencido = money_float(resumen_row.get("saldo_vencido"))
-            saldo_por_vencer = money_float(resumen_row.get("saldo_por_vencer"))
+            # ============================================================
+            # 4) Resumen cartera global
+            # ============================================================
+            sql_resumen_cartera = text(f"""
+                SELECT
+                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(f.saldo, 0) > 0
+                                AND f.vencimiento < CURRENT_DATE
+                            THEN f.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_vencido,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(f.saldo, 0) > 0
+                                AND (f.vencimiento IS NULL OR f.vencimiento >= CURRENT_DATE)
+                            THEN f.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_por_vencer,
+
+                    COUNT(*) AS cantidad_facturas_cartera
+
+                FROM siigo_facturas f
+                WHERE {where_fac}
+            """)
+
+            resumen_cartera = dict(
+                db.session.execute(sql_resumen_cartera, params_fac).mappings().first() or {}
+            )
+
+            ventas_netas = money_float(resumen_comercial.get("ventas_netas"))
+            ventas_sin_impuesto = money_float(resumen_comercial.get("ventas_sin_impuesto"))
+            impuestos = money_float(resumen_comercial.get("impuestos"))
+            total_facturado_siigo = money_float(resumen_comercial.get("total_facturado_siigo"))
+            notas_credito = money_float(resumen_comercial.get("notas_credito"))
+
+            total_pagado = money_float(resumen_cartera.get("total_pagado"))
+            saldo_pendiente = money_float(resumen_cartera.get("saldo_pendiente"))
+            saldo_vencido = money_float(resumen_cartera.get("saldo_vencido"))
+            saldo_por_vencer = money_float(resumen_cartera.get("saldo_por_vencer"))
 
             pct_pagado = (total_pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
             pct_vencido = (saldo_vencido / saldo_pendiente * 100) if saldo_pendiente else 0
 
             resumen = {
-                "clientes_facturados": int(resumen_row.get("clientes_facturados") or 0),
-                "cantidad_facturas": int(resumen_row.get("cantidad_facturas") or 0),
+                "clientes_facturados": int(resumen_comercial.get("clientes_facturados") or 0),
+                "cantidad_facturas": int(resumen_comercial.get("cantidad_facturas") or 0),
+                "cantidad_notas_credito": int(resumen_comercial.get("cantidad_notas_credito") or 0),
 
                 "ventas_netas": ventas_netas,
+                "ventas_sin_impuesto": ventas_sin_impuesto,
                 "impuestos": impuestos,
                 "total_facturado_siigo": total_facturado_siigo,
+                "notas_credito": notas_credito,
 
                 # Compatibilidad con frontend anterior:
-                # total_facturado ahora representa Ventas netas para esta página.
                 "total_facturado": ventas_netas,
 
                 "total_pagado": total_pagado,
@@ -6528,8 +6623,10 @@ def create_app():
                 "pct_vencido": round(pct_vencido, 2),
 
                 "ventas_netas_str": money_fmt(ventas_netas),
+                "ventas_sin_impuesto_str": money_fmt(ventas_sin_impuesto),
                 "impuestos_str": money_fmt(impuestos),
                 "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+                "notas_credito_str": money_fmt(notas_credito),
 
                 # Compatibilidad con frontend anterior:
                 "total_facturado_str": money_fmt(ventas_netas),
@@ -6540,111 +6637,220 @@ def create_app():
                 "saldo_por_vencer_str": money_fmt(saldo_por_vencer),
             }
 
-            # ---------------------------------------------------------------------
-            # 2. Clientes principales
-            # ---------------------------------------------------------------------
-            sql_clientes = text(f"""
+            # ============================================================
+            # 5) Clientes comerciales
+            # ============================================================
+            sql_clientes_comercial = text(f"""
+                SELECT
+                    m.cliente_nombre AS cliente,
+
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS cantidad_facturas,
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS cantidad_notas_credito,
+                    COUNT(DISTINCT m.cost_center) AS cantidad_centros_costo,
+
+                    COALESCE(SUM(m.total), 0) AS ventas_netas,
+                    COALESCE(SUM(m.subtotal), 0) AS ventas_sin_impuesto,
+                    COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
+
+                    COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'FACTURA'
+                        THEN m.total ELSE 0 END
+                    ), 0) AS total_facturado_siigo,
+
+                    ABS(COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                        THEN m.total ELSE 0 END
+                    ), 0)) AS notas_credito,
+
+                    MAX(m.fecha) AS ultima_factura
+
+                FROM ventas_movimientos_enriquecidos m
+                WHERE {where_mov}
+                GROUP BY m.cliente_nombre
+            """)
+
+            clientes_comercial_rows = [
+                dict(r) for r in db.session.execute(sql_clientes_comercial, params_mov).mappings().all()
+            ]
+
+            clientes_comercial = {}
+            for r in clientes_comercial_rows:
+                key = normalizar_cliente(r.get("cliente"))
+                clientes_comercial[key] = r
+
+            # ============================================================
+            # 6) Clientes cartera
+            # ============================================================
+            sql_clientes_cartera = text(f"""
                 SELECT
                     f.cliente_nombre AS cliente,
-                    COUNT(*) AS cantidad_facturas,
-                    COUNT(DISTINCT f.cost_center) AS cantidad_centros_costo,
 
-                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
-                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
-                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(f.saldo, 0) > 0
+                                AND f.vencimiento < CURRENT_DATE
+                            THEN f.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_vencido,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(f.saldo, 0) > 0
+                                AND (f.vencimiento IS NULL OR f.vencimiento >= CURRENT_DATE)
+                            THEN f.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_por_vencer
 
-                    COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento < CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_vencido,
-                    COALESCE(SUM(CASE WHEN f.saldo > 0 AND f.vencimiento >= CURRENT_DATE THEN f.saldo ELSE 0 END), 0) AS saldo_por_vencer,
-                    MAX(f.fecha) AS ultima_factura
-                FROM facturas_enriquecidas f
-                WHERE {where_clause}
+                FROM siigo_facturas f
+                WHERE {where_fac}
                 GROUP BY f.cliente_nombre
+            """)
+
+            clientes_cartera_rows = [
+                dict(r) for r in db.session.execute(sql_clientes_cartera, params_fac).mappings().all()
+            ]
+
+            clientes_cartera = {}
+            for r in clientes_cartera_rows:
+                key = normalizar_cliente(r.get("cliente"))
+                clientes_cartera[key] = r
+
+            # ============================================================
+            # 7) Centros de costo comerciales por cliente
+            # ============================================================
+            sql_cc_comercial = text(f"""
+                SELECT
+                    m.cliente_nombre,
+                    COALESCE(m.centro_costo_nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                    m.cost_center,
+
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS cantidad_facturas,
+                    COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS cantidad_notas_credito,
+
+                    COALESCE(SUM(m.total), 0) AS ventas_netas,
+                    COALESCE(SUM(m.subtotal), 0) AS ventas_sin_impuesto,
+                    COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
+
+                    COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'FACTURA'
+                        THEN m.total ELSE 0 END
+                    ), 0) AS total_facturado_siigo,
+
+                    ABS(COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                        THEN m.total ELSE 0 END
+                    ), 0)) AS notas_credito
+
+                FROM ventas_movimientos_enriquecidos m
+                WHERE {where_mov}
+                GROUP BY m.cliente_nombre, m.cost_center, m.centro_costo_nombre
                 ORDER BY ventas_netas DESC
             """)
 
-            clientes_rows = [dict(r) for r in db.session.execute(sql_clientes, params).mappings().all()]
+            centros_comercial_rows = [
+                dict(r) for r in db.session.execute(sql_cc_comercial, params_mov).mappings().all()
+            ]
 
-            # ---------------------------------------------------------------------
-            # 3. Centros de costo por cliente
-            # ---------------------------------------------------------------------
-            sql_cc = text(f"""
+            # ============================================================
+            # 8) Centros de costo cartera por cliente
+            # ============================================================
+            sql_cc_cartera = text(f"""
                 SELECT
                     f.cliente_nombre,
                     COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
                     f.cost_center,
-                    COUNT(*) AS cantidad_facturas,
 
-                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
-                    COALESCE(SUM(f.impuestos_total), 0) AS impuestos,
-                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
+                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente
 
-                    COALESCE(SUM(f.total - f.saldo), 0) AS total_pagado,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
-                FROM facturas_enriquecidas f
+                FROM siigo_facturas f
                 LEFT JOIN siigo_centros_costo cc
-                    ON f.cost_center = cc.id
-                    AND cc.idcliente = f.idcliente
-                WHERE {where_clause}
+                    ON cc.id = f.cost_center
+                AND cc.idcliente = f.idcliente
+                WHERE {where_fac}
                 GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
-                ORDER BY ventas_netas DESC
             """)
 
-            centros_rows = [dict(r) for r in db.session.execute(sql_cc, params).mappings().all()]
+            centros_cartera_rows = [
+                dict(r) for r in db.session.execute(sql_cc_cartera, params_fac).mappings().all()
+            ]
 
-            centros_por_cliente = defaultdict(list)
-            for r in centros_rows:
+            centros_merge = {}
+
+            for r in centros_comercial_rows:
                 cliente_key = normalizar_cliente(r.get("cliente_nombre"))
-
-                ventas_netas_cc = money_float(r.get("ventas_netas"))
-                impuestos_cc = money_float(r.get("impuestos"))
-                total_siigo_cc = money_float(r.get("total_facturado_siigo"))
-                saldo_cc = money_float(r.get("saldo_pendiente"))
-                pagado_cc = money_float(r.get("total_pagado"))
-
-                centros_por_cliente[cliente_key].append({
+                cc_key = f"{cliente_key}::{r.get('cost_center')}::{r.get('centro_costo_nombre')}"
+                centros_merge[cc_key] = {
+                    "cliente_key": cliente_key,
                     "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
                     "cost_center": r.get("cost_center"),
                     "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
+                    "cantidad_notas_credito": int(r.get("cantidad_notas_credito") or 0),
 
-                    "ventas_netas": ventas_netas_cc,
-                    "impuestos": impuestos_cc,
-                    "total_facturado_siigo": total_siigo_cc,
+                    "ventas_netas": money_float(r.get("ventas_netas")),
+                    "ventas_sin_impuesto": money_float(r.get("ventas_sin_impuesto")),
+                    "impuestos": money_float(r.get("impuestos")),
+                    "total_facturado_siigo": money_float(r.get("total_facturado_siigo")),
+                    "notas_credito": money_float(r.get("notas_credito")),
 
-                    # Compatibilidad:
-                    "total_facturado": ventas_netas_cc,
+                    "total_pagado": 0,
+                    "saldo_pendiente": 0,
+                }
 
-                    "total_pagado": pagado_cc,
-                    "saldo_pendiente": saldo_cc,
+            for r in centros_cartera_rows:
+                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+                cc_key = f"{cliente_key}::{r.get('cost_center')}::{r.get('centro_costo_nombre')}"
+                if cc_key not in centros_merge:
+                    centros_merge[cc_key] = {
+                        "cliente_key": cliente_key,
+                        "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
+                        "cost_center": r.get("cost_center"),
+                        "cantidad_facturas": 0,
+                        "cantidad_notas_credito": 0,
+                        "ventas_netas": 0,
+                        "ventas_sin_impuesto": 0,
+                        "impuestos": 0,
+                        "total_facturado_siigo": 0,
+                        "notas_credito": 0,
+                        "total_pagado": 0,
+                        "saldo_pendiente": 0,
+                    }
 
-                    "ventas_netas_str": money_fmt(ventas_netas_cc),
-                    "impuestos_str": money_fmt(impuestos_cc),
-                    "total_facturado_siigo_str": money_fmt(total_siigo_cc),
+                centros_merge[cc_key]["total_pagado"] = money_float(r.get("total_pagado"))
+                centros_merge[cc_key]["saldo_pendiente"] = money_float(r.get("saldo_pendiente"))
 
-                    # Compatibilidad:
-                    "total_facturado_str": money_fmt(ventas_netas_cc),
+            centros_por_cliente = defaultdict(list)
+            for item in centros_merge.values():
+                item["total_facturado"] = item["ventas_netas"]
 
-                    "saldo_pendiente_str": money_fmt(saldo_cc),
-                })
+                item["ventas_netas_str"] = money_fmt(item["ventas_netas"])
+                item["ventas_sin_impuesto_str"] = money_fmt(item["ventas_sin_impuesto"])
+                item["impuestos_str"] = money_fmt(item["impuestos"])
+                item["total_facturado_siigo_str"] = money_fmt(item["total_facturado_siigo"])
+                item["notas_credito_str"] = money_fmt(item["notas_credito"])
+                item["total_facturado_str"] = money_fmt(item["ventas_netas"])
+                item["saldo_pendiente_str"] = money_fmt(item["saldo_pendiente"])
 
-            # ---------------------------------------------------------------------
-            # 4. Estados por cliente
-            # ---------------------------------------------------------------------
+                centros_por_cliente[item["cliente_key"]].append(item)
+
+            # ============================================================
+            # 9) Estados por cliente desde siigo_facturas
+            # ============================================================
             sql_estados = text(f"""
                 SELECT
                     f.cliente_nombre,
                     ({estado_sql}) AS estado_cartera,
                     COUNT(*) AS cantidad,
-                    COALESCE(SUM(f.subtotal), 0) AS ventas_netas,
-                    COALESCE(SUM(f.total), 0) AS total_facturado_siigo,
                     COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
-                FROM facturas_enriquecidas f
-                WHERE {where_clause}
+                FROM siigo_facturas f
+                WHERE {where_fac}
                 GROUP BY f.cliente_nombre, estado_cartera
             """)
 
-            estados_rows = [dict(r) for r in db.session.execute(sql_estados, params).mappings().all()]
+            estados_rows = [
+                dict(r) for r in db.session.execute(sql_estados, params_fac).mappings().all()
+            ]
 
             estados_por_cliente = defaultdict(lambda: {
                 "pagado": 0,
@@ -6669,9 +6875,9 @@ def create_app():
                 estados_por_cliente[cliente_key][estado] = cantidad
                 estados_saldo_por_cliente[cliente_key][estado] = saldo_estado
 
-            # ---------------------------------------------------------------------
-            # 5. Facturas recientes por cliente
-            # ---------------------------------------------------------------------
+            # ============================================================
+            # 10) Facturas recientes reales desde siigo_facturas
+            # ============================================================
             sql_facturas = text(f"""
                 WITH ranked AS (
                     SELECT
@@ -6679,31 +6885,36 @@ def create_app():
                         f.fecha,
                         f.vencimiento,
 
-                        f.subtotal AS ventas_netas,
-                        f.impuestos_total AS impuestos,
-                        f.total AS total_facturado_siigo,
+                        COALESCE(f.subtotal, 0) AS ventas_netas,
+                        COALESCE(f.impuestos_total, 0) AS impuestos,
+                        COALESCE(f.total, 0) AS total_facturado_siigo,
 
-                        f.total,
-                        (f.total - f.saldo) AS pagado,
-                        f.saldo AS pendiente,
+                        COALESCE(f.total, 0) AS total,
+                        COALESCE(f.total, 0) - COALESCE(f.saldo, 0) AS pagado,
+                        COALESCE(f.saldo, 0) AS pendiente,
+
                         f.public_url,
                         f.cliente_nombre,
                         f.cost_center,
                         COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+
                         ({estado_sql}) AS estado_cartera,
+
                         CASE
                             WHEN f.vencimiento IS NULL THEN NULL
                             ELSE (f.vencimiento - CURRENT_DATE)
                         END AS dias_vencimiento,
+
                         ROW_NUMBER() OVER (
                             PARTITION BY f.cliente_nombre
                             ORDER BY f.fecha DESC, f.idfactura DESC
                         ) AS rn
-                        FROM facturas_enriquecidas f
-                        LEFT JOIN siigo_centros_costo cc
-                            ON f.cost_center = cc.id
-                            AND cc.idcliente = f.idcliente
-                        WHERE {where_clause}
+
+                    FROM siigo_facturas f
+                    LEFT JOIN siigo_centros_costo cc
+                        ON cc.id = f.cost_center
+                    AND cc.idcliente = f.idcliente
+                    WHERE {where_fac}
                 )
                 SELECT *
                 FROM ranked
@@ -6711,7 +6922,9 @@ def create_app():
                 ORDER BY cliente_nombre, fecha DESC
             """)
 
-            facturas_rows = [dict(r) for r in db.session.execute(sql_facturas, params).mappings().all()]
+            facturas_rows = [
+                dict(r) for r in db.session.execute(sql_facturas, params_fac).mappings().all()
+            ]
 
             facturas_por_cliente = defaultdict(list)
 
@@ -6723,21 +6936,22 @@ def create_app():
                 ventas_netas_f = money_float(r.get("ventas_netas"))
                 impuestos_f = money_float(r.get("impuestos"))
                 total_siigo_f = money_float(r.get("total_facturado_siigo"))
-
                 total = money_float(r.get("total"))
                 pagado = money_float(r.get("pagado"))
                 pendiente = money_float(r.get("pendiente"))
                 dias_vencimiento = r.get("dias_vencimiento")
 
-                if fecha:
-                    fecha_str = fecha.strftime("%d/%m/%Y") if hasattr(fecha, "strftime") else str(fecha)
-                else:
-                    fecha_str = None
+                fecha_str = (
+                    fecha.strftime("%d/%m/%Y")
+                    if fecha and hasattr(fecha, "strftime")
+                    else str(fecha) if fecha else None
+                )
 
-                if vencimiento:
-                    vencimiento_str = vencimiento.strftime("%d/%m/%Y") if hasattr(vencimiento, "strftime") else str(vencimiento)
-                else:
-                    vencimiento_str = None
+                vencimiento_str = (
+                    vencimiento.strftime("%d/%m/%Y")
+                    if vencimiento and hasattr(vencimiento, "strftime")
+                    else str(vencimiento) if vencimiento else None
+                )
 
                 facturas_por_cliente[cliente_key].append({
                     "idfactura": r.get("idfactura"),
@@ -6752,7 +6966,6 @@ def create_app():
                     "impuestos_str": money_fmt(impuestos_f),
                     "total_facturado_siigo_str": money_fmt(total_siigo_f),
 
-                    # Compatibilidad:
                     "total": total,
                     "total_str": money_fmt(total),
 
@@ -6760,6 +6973,7 @@ def create_app():
                     "pendiente": pendiente,
                     "pagado_str": money_fmt(pagado),
                     "pendiente_str": money_fmt(pendiente),
+
                     "public_url": r.get("public_url"),
                     "cliente_nombre": r.get("cliente_nombre"),
                     "cliente_key": cliente_key,
@@ -6769,29 +6983,47 @@ def create_app():
                     "dias_vencimiento": int(dias_vencimiento) if dias_vencimiento is not None else None,
                 })
 
-            # ---------------------------------------------------------------------
-            # 6. Armar clientes enriquecidos
-            # ---------------------------------------------------------------------
+            # ============================================================
+            # 11) Armar clientes enriquecidos
+            # ============================================================
+            if filtro_estado_normalizado:
+                # Si se filtra por estado, priorizamos clientes con facturas en ese estado.
+                all_keys = set(clientes_cartera.keys())
+            else:
+                all_keys = set(clientes_comercial.keys()) | set(clientes_cartera.keys())
+
             clientes = []
 
-            for r in clientes_rows:
-                cliente_nombre = r.get("cliente") or "Sin cliente"
-                cliente_key = normalizar_cliente(cliente_nombre)
+            for cliente_key in sorted(all_keys):
+                comercial = clientes_comercial.get(cliente_key, {})
+                cartera = clientes_cartera.get(cliente_key, {})
 
-                ventas_netas = money_float(r.get("ventas_netas"))
-                impuestos = money_float(r.get("impuestos"))
-                total_facturado_siigo = money_float(r.get("total_facturado_siigo"))
+                cliente_nombre = (
+                    comercial.get("cliente")
+                    or cartera.get("cliente")
+                    or "Sin cliente"
+                )
 
-                pagado = money_float(r.get("total_pagado"))
-                pendiente = money_float(r.get("saldo_pendiente"))
-                vencido = money_float(r.get("saldo_vencido"))
-                saldo_por_vencer_cliente = money_float(r.get("saldo_por_vencer"))
+                ventas_netas = money_float(comercial.get("ventas_netas"))
+                ventas_sin_impuesto = money_float(comercial.get("ventas_sin_impuesto"))
+                impuestos = money_float(comercial.get("impuestos"))
+                total_facturado_siigo = money_float(comercial.get("total_facturado_siigo"))
+                notas_credito = money_float(comercial.get("notas_credito"))
+
+                cantidad_facturas = int(comercial.get("cantidad_facturas") or 0)
+                cantidad_notas_credito = int(comercial.get("cantidad_notas_credito") or 0)
+                cantidad_centros_costo = int(comercial.get("cantidad_centros_costo") or 0)
+
+                pagado = money_float(cartera.get("total_pagado"))
+                pendiente = money_float(cartera.get("saldo_pendiente"))
+                vencido = money_float(cartera.get("saldo_vencido"))
+                saldo_por_vencer_cliente = money_float(cartera.get("saldo_por_vencer"))
 
                 pct_cliente_pagado = (pagado / total_facturado_siigo * 100) if total_facturado_siigo else 0
                 pct_cliente_pendiente = (pendiente / total_facturado_siigo * 100) if total_facturado_siigo else 0
                 pct_cliente_vencido = (vencido / pendiente * 100) if pendiente else 0
 
-                ultima_factura = r.get("ultima_factura")
+                ultima_factura = comercial.get("ultima_factura")
                 ultima_factura_str = (
                     ultima_factura.strftime("%d/%m/%Y")
                     if ultima_factura and hasattr(ultima_factura, "strftime")
@@ -6801,14 +7033,18 @@ def create_app():
                 clientes.append({
                     "cliente": cliente_nombre,
                     "cliente_key": cliente_key,
-                    "cantidad_facturas": int(r.get("cantidad_facturas") or 0),
-                    "cantidad_centros_costo": int(r.get("cantidad_centros_costo") or 0),
+
+                    "cantidad_facturas": cantidad_facturas,
+                    "cantidad_notas_credito": cantidad_notas_credito,
+                    "cantidad_centros_costo": cantidad_centros_costo,
 
                     "ventas_netas": ventas_netas,
+                    "ventas_sin_impuesto": ventas_sin_impuesto,
                     "impuestos": impuestos,
                     "total_facturado_siigo": total_facturado_siigo,
+                    "notas_credito": notas_credito,
 
-                    # Compatibilidad con frontend anterior:
+                    # Compatibilidad:
                     "total_facturado": ventas_netas,
 
                     "total_pagado": pagado,
@@ -6817,10 +7053,12 @@ def create_app():
                     "saldo_por_vencer": saldo_por_vencer_cliente,
 
                     "ventas_netas_str": money_fmt(ventas_netas),
+                    "ventas_sin_impuesto_str": money_fmt(ventas_sin_impuesto),
                     "impuestos_str": money_fmt(impuestos),
                     "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
+                    "notas_credito_str": money_fmt(notas_credito),
 
-                    # Compatibilidad con frontend anterior:
+                    # Compatibilidad:
                     "total_facturado_str": money_fmt(ventas_netas),
 
                     "total_pagado_str": money_fmt(pagado),
@@ -6849,56 +7087,86 @@ def create_app():
                     }),
                 })
 
-            # ---------------------------------------------------------------------
-            # 7. Catálogos para filtros
-            # ---------------------------------------------------------------------
-            wh_catalogos = ["f.idcliente = :idcliente"]
-            params_catalogos = {"idcliente": idcliente}
+            # ============================================================
+            # 12) Catálogos para filtros
+            # ============================================================
+            wh_cat_mov = ["m.idcliente = :idcliente"]
+            wh_cat_fac = ["f.idcliente = :idcliente"]
+            params_cat = {"idcliente": idcliente}
 
-            if desde and validar_fecha(desde):
-                wh_catalogos.append("f.fecha >= :desde")
-                params_catalogos["desde"] = desde
+            if fecha_desde_val:
+                wh_cat_mov.append("m.fecha >= :desde")
+                wh_cat_fac.append("f.fecha >= :desde")
+                params_cat["desde"] = fecha_desde_val
 
-            if hasta and validar_fecha(hasta):
-                wh_catalogos.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
-                params_catalogos["hasta"] = hasta
+            if fecha_hasta_val:
+                wh_cat_mov.append("m.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh_cat_fac.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                params_cat["hasta"] = fecha_hasta_val
 
-            where_catalogos = " AND ".join(wh_catalogos)
+            where_cat_mov = " AND ".join(wh_cat_mov)
+            where_cat_fac = " AND ".join(wh_cat_fac)
 
             sql_catalogo_clientes = text(f"""
-                SELECT DISTINCT
-                    f.cliente_nombre AS id,
-                    f.cliente_nombre AS nombre
-                FROM facturas_enriquecidas f
-                WHERE {where_catalogos}
-                AND TRIM(COALESCE(f.cliente_nombre, '')) <> ''
+                WITH clientes AS (
+                    SELECT DISTINCT
+                        m.cliente_nombre AS id,
+                        m.cliente_nombre AS nombre
+                    FROM ventas_movimientos_enriquecidos m
+                    WHERE {where_cat_mov}
+                    AND TRIM(COALESCE(m.cliente_nombre, '')) <> ''
+
+                    UNION
+
+                    SELECT DISTINCT
+                        f.cliente_nombre AS id,
+                        f.cliente_nombre AS nombre
+                    FROM siigo_facturas f
+                    WHERE {where_cat_fac}
+                    AND TRIM(COALESCE(f.cliente_nombre, '')) <> ''
+                )
+                SELECT id, nombre
+                FROM clientes
                 ORDER BY nombre
             """)
 
             catalogo_clientes = [
-                dict(r) for r in db.session.execute(sql_catalogo_clientes, params_catalogos).mappings().all()
+                dict(r) for r in db.session.execute(sql_catalogo_clientes, params_cat).mappings().all()
             ]
 
             sql_catalogo_cc = text(f"""
-                SELECT DISTINCT
-                    f.cost_center AS id,
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
-                    FROM facturas_enriquecidas f
+                WITH centros AS (
+                    SELECT DISTINCT
+                        m.cost_center AS id,
+                        COALESCE(m.centro_costo_nombre, 'Sin centro de costo') AS nombre
+                    FROM ventas_movimientos_enriquecidos m
+                    WHERE {where_cat_mov}
+                    AND m.cost_center IS NOT NULL
+
+                    UNION
+
+                    SELECT DISTINCT
+                        f.cost_center AS id,
+                        COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                    FROM siigo_facturas f
                     LEFT JOIN siigo_centros_costo cc
-                        ON f.cost_center = cc.id
-                        AND cc.idcliente = f.idcliente
-                    WHERE {where_catalogos}
-                AND f.cost_center IS NOT NULL
+                        ON cc.id = f.cost_center
+                    AND cc.idcliente = f.idcliente
+                    WHERE {where_cat_fac}
+                    AND f.cost_center IS NOT NULL
+                )
+                SELECT id, nombre
+                FROM centros
                 ORDER BY nombre
             """)
 
             catalogo_centros_costo = [
-                dict(r) for r in db.session.execute(sql_catalogo_cc, params_catalogos).mappings().all()
+                dict(r) for r in db.session.execute(sql_catalogo_cc, params_cat).mappings().all()
             ]
 
-            # ---------------------------------------------------------------------
-            # 8. Top charts
-            # ---------------------------------------------------------------------
+            # ============================================================
+            # 13) Top charts
+            # ============================================================
             top_facturacion = sorted(
                 clientes,
                 key=lambda x: x["ventas_netas"],
@@ -6929,8 +7197,10 @@ def create_app():
                         {
                             "cliente": c["cliente"],
                             "ventas_netas": c["ventas_netas"],
+                            "ventas_sin_impuesto": c["ventas_sin_impuesto"],
                             "total_facturado": c["ventas_netas"],
                             "total_facturado_siigo": c["total_facturado_siigo"],
+                            "notas_credito": c["notas_credito"],
                             "saldo_pendiente": c["saldo_pendiente"],
                         }
                         for c in top_facturacion
@@ -6953,11 +7223,17 @@ def create_app():
                     "estado": filtro_estado,
                     "limit_facturas": limit_facturas,
                 },
+                "config": {
+                    "fuente_ventas": "ventas_movimientos_enriquecidos",
+                    "fuente_cartera": "siigo_facturas",
+                    "logica_ventas": "ventas_netas = facturas_emitidas - notas_credito",
+                    "ventas_netas": "con impuesto",
+                }
             })
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-
+        
 
     # --- ENDPOINT: Facturas por cliente/centro de costo (paginadas) ---
     @app.route("/reportes/facturas_cliente_cartera", methods=["GET"])
