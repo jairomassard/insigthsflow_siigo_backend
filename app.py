@@ -6442,7 +6442,9 @@ def create_app():
 
         try:
             # ============================================================
-            # 1) Filtros comerciales: ventas_movimientos_enriquecidos
+            # 1) Filtros comerciales
+            # Fuente: ventas_movimientos_enriquecidos
+            # Aquí viven ventas netas, facturas emitidas y notas crédito.
             # ============================================================
             wh_mov = ["m.idcliente = :idcliente"]
             params_mov = {"idcliente": idcliente}
@@ -6466,42 +6468,44 @@ def create_app():
             where_mov = " AND ".join(wh_mov)
 
             # ============================================================
-            # 2) Filtros cartera: siigo_facturas
+            # 2) Filtros de cartera
+            # Fuente: siigo_facturas, pero enriqueciendo cliente y centro.
+            # Aquí viven saldos, vencimientos, pagos y facturas recientes.
             # ============================================================
             estado_sql = """
                 CASE
-                    WHEN ROUND(COALESCE(f.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
-                    WHEN f.vencimiento IS NOT NULL
-                        AND f.vencimiento < CURRENT_DATE
-                        AND COALESCE(f.saldo, 0) > 0 THEN 'vencido'
-                    WHEN f.vencimiento IS NOT NULL
-                        AND f.vencimiento >= CURRENT_DATE
-                        AND f.vencimiento <= CURRENT_DATE + INTERVAL '5 days'
-                        AND COALESCE(f.saldo, 0) > 0 THEN 'alerta'
+                    WHEN ROUND(COALESCE(fb.saldo, 0)::numeric, 2) = 0 THEN 'pagado'
+                    WHEN fb.vencimiento IS NOT NULL
+                        AND fb.vencimiento < CURRENT_DATE
+                        AND COALESCE(fb.saldo, 0) > 0 THEN 'vencido'
+                    WHEN fb.vencimiento IS NOT NULL
+                        AND fb.vencimiento >= CURRENT_DATE
+                        AND fb.vencimiento <= CURRENT_DATE + INTERVAL '5 days'
+                        AND COALESCE(fb.saldo, 0) > 0 THEN 'alerta'
                     ELSE 'sano'
                 END
             """
 
-            wh_fac = ["f.idcliente = :idcliente"]
+            wh_fac = ["fb.idcliente = :idcliente"]
             params_fac = {
                 "idcliente": idcliente,
                 "limit_facturas": limit_facturas,
             }
 
             if fecha_desde_val:
-                wh_fac.append("f.fecha >= :desde")
+                wh_fac.append("fb.fecha >= :desde")
                 params_fac["desde"] = fecha_desde_val
 
             if fecha_hasta_val:
-                wh_fac.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
+                wh_fac.append("fb.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_fac["hasta"] = fecha_hasta_val
 
             if cliente:
-                wh_fac.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
+                wh_fac.append("LOWER(TRIM(fb.cliente_nombre_ok)) = LOWER(TRIM(:cliente))")
                 params_fac["cliente"] = cliente
 
             if cost_center:
-                wh_fac.append("f.cost_center = :cost_center")
+                wh_fac.append("fb.cost_center = :cost_center")
                 params_fac["cost_center"] = cost_center
 
             filtro_estado_normalizado = None
@@ -6515,6 +6519,31 @@ def create_app():
 
             where_fac = " AND ".join(wh_fac)
 
+            facturas_base_cte = """
+                WITH facturas_base AS (
+                    SELECT
+                        f.*,
+                        regexp_replace(
+                            COALESCE(
+                                NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
+                                NULLIF(TRIM(BOTH '"' FROM c.name), ''),
+                                'Desconocido'
+                            ),
+                            '[\\{\\}\\[\\]\\"]',
+                            '',
+                            'g'
+                        ) AS cliente_nombre_ok,
+                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
+                    FROM siigo_facturas f
+                    LEFT JOIN siigo_customers c
+                        ON c.id::text = f.customer_id::text
+                    AND c.idcliente = f.idcliente
+                    LEFT JOIN siigo_centros_costo cc
+                        ON cc.id = f.cost_center
+                    AND cc.idcliente = f.idcliente
+                )
+            """
+
             # ============================================================
             # 3) Resumen comercial global
             # ============================================================
@@ -6525,25 +6554,22 @@ def create_app():
                     COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') AS cantidad_facturas,
                     COUNT(*) FILTER (WHERE m.tipo_movimiento = 'NOTA_CREDITO') AS cantidad_notas_credito,
 
-                    -- Ventas netas con impuesto: facturas menos notas crédito
                     COALESCE(SUM(m.total), 0) AS ventas_netas,
-
-                    -- Ventas netas sin impuesto
                     COALESCE(SUM(m.subtotal), 0) AS ventas_sin_impuesto,
-
-                    -- Impuesto neto comercial
                     COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
 
-                    -- Total de facturas emitidas antes de descontar notas crédito
                     COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'FACTURA'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA' THEN m.total
+                            ELSE 0
+                        END
                     ), 0) AS total_facturado_siigo,
 
-                    -- Notas crédito en positivo
                     ABS(COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'NOTA_CREDITO' THEN m.total
+                            ELSE 0
+                        END
                     ), 0)) AS notas_credito
 
                 FROM ventas_movimientos_enriquecidos m
@@ -6557,28 +6583,32 @@ def create_app():
             # ============================================================
             # 4) Resumen cartera global
             # ============================================================
-            sql_resumen_cartera = text(f"""
+            sql_resumen_cartera = text(facturas_base_cte + f"""
                 SELECT
-                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
-                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente,
+                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente,
+
                     COALESCE(SUM(
                         CASE
-                            WHEN COALESCE(f.saldo, 0) > 0
-                                AND f.vencimiento < CURRENT_DATE
-                            THEN f.saldo ELSE 0
+                            WHEN COALESCE(fb.saldo, 0) > 0
+                                AND fb.vencimiento < CURRENT_DATE
+                            THEN fb.saldo
+                            ELSE 0
                         END
                     ), 0) AS saldo_vencido,
+
                     COALESCE(SUM(
                         CASE
-                            WHEN COALESCE(f.saldo, 0) > 0
-                                AND (f.vencimiento IS NULL OR f.vencimiento >= CURRENT_DATE)
-                            THEN f.saldo ELSE 0
+                            WHEN COALESCE(fb.saldo, 0) > 0
+                                AND (fb.vencimiento IS NULL OR fb.vencimiento >= CURRENT_DATE)
+                            THEN fb.saldo
+                            ELSE 0
                         END
                     ), 0) AS saldo_por_vencer,
 
                     COUNT(*) AS cantidad_facturas_cartera
 
-                FROM siigo_facturas f
+                FROM facturas_base fb
                 WHERE {where_fac}
             """)
 
@@ -6611,7 +6641,7 @@ def create_app():
                 "total_facturado_siigo": total_facturado_siigo,
                 "notas_credito": notas_credito,
 
-                # Compatibilidad con frontend anterior:
+                # Compatibilidad con frontend anterior.
                 "total_facturado": ventas_netas,
 
                 "total_pagado": total_pagado,
@@ -6628,7 +6658,7 @@ def create_app():
                 "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
                 "notas_credito_str": money_fmt(notas_credito),
 
-                # Compatibilidad con frontend anterior:
+                # Compatibilidad con frontend anterior.
                 "total_facturado_str": money_fmt(ventas_netas),
 
                 "total_pagado_str": money_fmt(total_pagado),
@@ -6653,13 +6683,17 @@ def create_app():
                     COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
 
                     COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'FACTURA'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA' THEN m.total
+                            ELSE 0
+                        END
                     ), 0) AS total_facturado_siigo,
 
                     ABS(COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'NOTA_CREDITO' THEN m.total
+                            ELSE 0
+                        END
                     ), 0)) AS notas_credito,
 
                     MAX(m.fecha) AS ultima_factura
@@ -6681,30 +6715,34 @@ def create_app():
             # ============================================================
             # 6) Clientes cartera
             # ============================================================
-            sql_clientes_cartera = text(f"""
+            sql_clientes_cartera = text(facturas_base_cte + f"""
                 SELECT
-                    f.cliente_nombre AS cliente,
+                    fb.cliente_nombre_ok AS cliente,
 
-                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
-                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente,
+                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente,
+
                     COALESCE(SUM(
                         CASE
-                            WHEN COALESCE(f.saldo, 0) > 0
-                                AND f.vencimiento < CURRENT_DATE
-                            THEN f.saldo ELSE 0
+                            WHEN COALESCE(fb.saldo, 0) > 0
+                                AND fb.vencimiento < CURRENT_DATE
+                            THEN fb.saldo
+                            ELSE 0
                         END
                     ), 0) AS saldo_vencido,
+
                     COALESCE(SUM(
                         CASE
-                            WHEN COALESCE(f.saldo, 0) > 0
-                                AND (f.vencimiento IS NULL OR f.vencimiento >= CURRENT_DATE)
-                            THEN f.saldo ELSE 0
+                            WHEN COALESCE(fb.saldo, 0) > 0
+                                AND (fb.vencimiento IS NULL OR fb.vencimiento >= CURRENT_DATE)
+                            THEN fb.saldo
+                            ELSE 0
                         END
                     ), 0) AS saldo_por_vencer
 
-                FROM siigo_facturas f
+                FROM facturas_base fb
                 WHERE {where_fac}
-                GROUP BY f.cliente_nombre
+                GROUP BY fb.cliente_nombre_ok
             """)
 
             clientes_cartera_rows = [
@@ -6733,13 +6771,17 @@ def create_app():
                     COALESCE(SUM(m.total) - SUM(m.subtotal), 0) AS impuestos,
 
                     COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'FACTURA'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA' THEN m.total
+                            ELSE 0
+                        END
                     ), 0) AS total_facturado_siigo,
 
                     ABS(COALESCE(SUM(
-                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
-                        THEN m.total ELSE 0 END
+                        CASE
+                            WHEN m.tipo_movimiento = 'NOTA_CREDITO' THEN m.total
+                            ELSE 0
+                        END
                     ), 0)) AS notas_credito
 
                 FROM ventas_movimientos_enriquecidos m
@@ -6755,21 +6797,18 @@ def create_app():
             # ============================================================
             # 8) Centros de costo cartera por cliente
             # ============================================================
-            sql_cc_cartera = text(f"""
+            sql_cc_cartera = text(facturas_base_cte + f"""
                 SELECT
-                    f.cliente_nombre,
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                    f.cost_center,
+                    fb.cliente_nombre_ok AS cliente_nombre,
+                    fb.centro_costo_nombre_ok AS centro_costo_nombre,
+                    fb.cost_center,
 
-                    COALESCE(SUM(COALESCE(f.total, 0) - COALESCE(f.saldo, 0)), 0) AS total_pagado,
-                    COALESCE(SUM(COALESCE(f.saldo, 0)), 0) AS saldo_pendiente
+                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente
 
-                FROM siigo_facturas f
-                LEFT JOIN siigo_centros_costo cc
-                    ON cc.id = f.cost_center
-                AND cc.idcliente = f.idcliente
+                FROM facturas_base fb
                 WHERE {where_fac}
-                GROUP BY f.cliente_nombre, f.cost_center, cc.nombre
+                GROUP BY fb.cliente_nombre_ok, fb.cost_center, fb.centro_costo_nombre_ok
             """)
 
             centros_cartera_rows = [
@@ -6781,6 +6820,7 @@ def create_app():
             for r in centros_comercial_rows:
                 cliente_key = normalizar_cliente(r.get("cliente_nombre"))
                 cc_key = f"{cliente_key}::{r.get('cost_center')}::{r.get('centro_costo_nombre')}"
+
                 centros_merge[cc_key] = {
                     "cliente_key": cliente_key,
                     "centro_costo_nombre": r.get("centro_costo_nombre") or "Sin centro de costo",
@@ -6801,6 +6841,7 @@ def create_app():
             for r in centros_cartera_rows:
                 cliente_key = normalizar_cliente(r.get("cliente_nombre"))
                 cc_key = f"{cliente_key}::{r.get('cost_center')}::{r.get('centro_costo_nombre')}"
+
                 if cc_key not in centros_merge:
                     centros_merge[cc_key] = {
                         "cliente_key": cliente_key,
@@ -6808,11 +6849,13 @@ def create_app():
                         "cost_center": r.get("cost_center"),
                         "cantidad_facturas": 0,
                         "cantidad_notas_credito": 0,
+
                         "ventas_netas": 0,
                         "ventas_sin_impuesto": 0,
                         "impuestos": 0,
                         "total_facturado_siigo": 0,
                         "notas_credito": 0,
+
                         "total_pagado": 0,
                         "saldo_pendiente": 0,
                     }
@@ -6821,6 +6864,7 @@ def create_app():
                 centros_merge[cc_key]["saldo_pendiente"] = money_float(r.get("saldo_pendiente"))
 
             centros_por_cliente = defaultdict(list)
+
             for item in centros_merge.values():
                 item["total_facturado"] = item["ventas_netas"]
 
@@ -6835,17 +6879,17 @@ def create_app():
                 centros_por_cliente[item["cliente_key"]].append(item)
 
             # ============================================================
-            # 9) Estados por cliente desde siigo_facturas
+            # 9) Estados por cliente desde facturas_base
             # ============================================================
-            sql_estados = text(f"""
+            sql_estados = text(facturas_base_cte + f"""
                 SELECT
-                    f.cliente_nombre,
+                    fb.cliente_nombre_ok AS cliente_nombre,
                     ({estado_sql}) AS estado_cartera,
                     COUNT(*) AS cantidad,
-                    COALESCE(SUM(f.saldo), 0) AS saldo_pendiente
-                FROM siigo_facturas f
+                    COALESCE(SUM(fb.saldo), 0) AS saldo_pendiente
+                FROM facturas_base fb
                 WHERE {where_fac}
-                GROUP BY f.cliente_nombre, estado_cartera
+                GROUP BY fb.cliente_nombre_ok, estado_cartera
             """)
 
             estados_rows = [
@@ -6876,44 +6920,63 @@ def create_app():
                 estados_saldo_por_cliente[cliente_key][estado] = saldo_estado
 
             # ============================================================
-            # 10) Facturas recientes reales desde siigo_facturas
+            # 10) Facturas recientes reales desde facturas_base
             # ============================================================
             sql_facturas = text(f"""
-                WITH ranked AS (
+                WITH facturas_base AS (
                     SELECT
-                        f.idfactura,
-                        f.fecha,
-                        f.vencimiento,
+                        f.*,
+                        regexp_replace(
+                            COALESCE(
+                                NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
+                                NULLIF(TRIM(BOTH '"' FROM c.name), ''),
+                                'Desconocido'
+                            ),
+                            '[\\{\\}\\[\\]\\"]',
+                            '',
+                            'g'
+                        ) AS cliente_nombre_ok,
+                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
+                    FROM siigo_facturas f
+                    LEFT JOIN siigo_customers c
+                        ON c.id::text = f.customer_id::text
+                    AND c.idcliente = f.idcliente
+                    LEFT JOIN siigo_centros_costo cc
+                        ON cc.id = f.cost_center
+                    AND cc.idcliente = f.idcliente
+                ),
+                ranked AS (
+                    SELECT
+                        fb.idfactura,
+                        fb.fecha,
+                        fb.vencimiento,
 
-                        COALESCE(f.subtotal, 0) AS ventas_netas,
-                        COALESCE(f.impuestos_total, 0) AS impuestos,
-                        COALESCE(f.total, 0) AS total_facturado_siigo,
+                        COALESCE(fb.subtotal, 0) AS ventas_netas,
+                        COALESCE(fb.impuestos_total, 0) AS impuestos,
+                        COALESCE(fb.total, 0) AS total_facturado_siigo,
 
-                        COALESCE(f.total, 0) AS total,
-                        COALESCE(f.total, 0) - COALESCE(f.saldo, 0) AS pagado,
-                        COALESCE(f.saldo, 0) AS pendiente,
+                        COALESCE(fb.total, 0) AS total,
+                        COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0) AS pagado,
+                        COALESCE(fb.saldo, 0) AS pendiente,
 
-                        f.public_url,
-                        f.cliente_nombre,
-                        f.cost_center,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                        fb.public_url,
+                        fb.cliente_nombre_ok AS cliente_nombre,
+                        fb.cost_center,
+                        fb.centro_costo_nombre_ok AS centro_costo_nombre,
 
                         ({estado_sql}) AS estado_cartera,
 
                         CASE
-                            WHEN f.vencimiento IS NULL THEN NULL
-                            ELSE (f.vencimiento - CURRENT_DATE)
+                            WHEN fb.vencimiento IS NULL THEN NULL
+                            ELSE (fb.vencimiento - CURRENT_DATE)
                         END AS dias_vencimiento,
 
                         ROW_NUMBER() OVER (
-                            PARTITION BY f.cliente_nombre
-                            ORDER BY f.fecha DESC, f.idfactura DESC
+                            PARTITION BY fb.cliente_nombre_ok
+                            ORDER BY fb.fecha DESC, fb.idfactura DESC
                         ) AS rn
 
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON cc.id = f.cost_center
-                    AND cc.idcliente = f.idcliente
+                    FROM facturas_base fb
                     WHERE {where_fac}
                 )
                 SELECT *
@@ -6987,7 +7050,7 @@ def create_app():
             # 11) Armar clientes enriquecidos
             # ============================================================
             if filtro_estado_normalizado:
-                # Si se filtra por estado, priorizamos clientes con facturas en ese estado.
+                # Cuando se filtra por estado, mostramos clientes que tienen facturas en ese estado.
                 all_keys = set(clientes_cartera.keys())
             else:
                 all_keys = set(clientes_comercial.keys()) | set(clientes_cartera.keys())
@@ -7012,7 +7075,8 @@ def create_app():
 
                 cantidad_facturas = int(comercial.get("cantidad_facturas") or 0)
                 cantidad_notas_credito = int(comercial.get("cantidad_notas_credito") or 0)
-                cantidad_centros_costo = int(comercial.get("cantidad_centros_costo") or 0)
+
+                cantidad_centros_costo = len(centros_por_cliente.get(cliente_key, []))
 
                 pagado = money_float(cartera.get("total_pagado"))
                 pendiente = money_float(cartera.get("saldo_pendiente"))
@@ -7044,7 +7108,7 @@ def create_app():
                     "total_facturado_siigo": total_facturado_siigo,
                     "notas_credito": notas_credito,
 
-                    # Compatibilidad:
+                    # Compatibilidad.
                     "total_facturado": ventas_netas,
 
                     "total_pagado": pagado,
@@ -7058,7 +7122,7 @@ def create_app():
                     "total_facturado_siigo_str": money_fmt(total_facturado_siigo),
                     "notas_credito_str": money_fmt(notas_credito),
 
-                    # Compatibilidad:
+                    # Compatibilidad.
                     "total_facturado_str": money_fmt(ventas_netas),
 
                     "total_pagado_str": money_fmt(pagado),
@@ -7091,24 +7155,42 @@ def create_app():
             # 12) Catálogos para filtros
             # ============================================================
             wh_cat_mov = ["m.idcliente = :idcliente"]
-            wh_cat_fac = ["f.idcliente = :idcliente"]
+            wh_cat_fac = ["fb.idcliente = :idcliente"]
             params_cat = {"idcliente": idcliente}
 
             if fecha_desde_val:
                 wh_cat_mov.append("m.fecha >= :desde")
-                wh_cat_fac.append("f.fecha >= :desde")
+                wh_cat_fac.append("fb.fecha >= :desde")
                 params_cat["desde"] = fecha_desde_val
 
             if fecha_hasta_val:
                 wh_cat_mov.append("m.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
-                wh_cat_fac.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
+                wh_cat_fac.append("fb.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_cat["hasta"] = fecha_hasta_val
 
             where_cat_mov = " AND ".join(wh_cat_mov)
-            where_cat_fac = " AND ".join(wh_cat_fac) 
+            where_cat_fac = " AND ".join(wh_cat_fac)
 
             sql_catalogo_clientes = text(f"""
-                WITH clientes AS (
+                WITH facturas_base AS (
+                    SELECT
+                        f.*,
+                        regexp_replace(
+                            COALESCE(
+                                NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
+                                NULLIF(TRIM(BOTH '"' FROM c.name), ''),
+                                'Desconocido'
+                            ),
+                            '[\\{\\}\\[\\]\\"]',
+                            '',
+                            'g'
+                        ) AS cliente_nombre_ok
+                    FROM siigo_facturas f
+                    LEFT JOIN siigo_customers c
+                        ON c.id::text = f.customer_id::text
+                    AND c.idcliente = f.idcliente
+                ),
+                clientes AS (
                     SELECT DISTINCT
                         m.cliente_nombre AS id,
                         m.cliente_nombre AS nombre
@@ -7119,11 +7201,11 @@ def create_app():
                     UNION
 
                     SELECT DISTINCT
-                        f.cliente_nombre AS id,
-                        f.cliente_nombre AS nombre
-                    FROM siigo_facturas f
+                        fb.cliente_nombre_ok AS id,
+                        fb.cliente_nombre_ok AS nombre
+                    FROM facturas_base fb
                     WHERE {where_cat_fac}
-                    AND TRIM(COALESCE(f.cliente_nombre, '')) <> ''
+                    AND TRIM(COALESCE(fb.cliente_nombre_ok, '')) <> ''
                 )
                 SELECT id, nombre
                 FROM clientes
@@ -7135,7 +7217,16 @@ def create_app():
             ]
 
             sql_catalogo_cc = text(f"""
-                WITH centros AS (
+                WITH facturas_base AS (
+                    SELECT
+                        f.*,
+                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
+                    FROM siigo_facturas f
+                    LEFT JOIN siigo_centros_costo cc
+                        ON cc.id = f.cost_center
+                    AND cc.idcliente = f.idcliente
+                ),
+                centros AS (
                     SELECT DISTINCT
                         m.cost_center AS id,
                         COALESCE(m.centro_costo_nombre, 'Sin centro de costo') AS nombre
@@ -7146,14 +7237,11 @@ def create_app():
                     UNION
 
                     SELECT DISTINCT
-                        f.cost_center AS id,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON cc.id = f.cost_center
-                    AND cc.idcliente = f.idcliente
+                        fb.cost_center AS id,
+                        fb.centro_costo_nombre_ok AS nombre
+                    FROM facturas_base fb
                     WHERE {where_cat_fac}
-                    AND f.cost_center IS NOT NULL
+                    AND fb.cost_center IS NOT NULL
                 )
                 SELECT id, nombre
                 FROM centros
@@ -7225,7 +7313,7 @@ def create_app():
                 },
                 "config": {
                     "fuente_ventas": "ventas_movimientos_enriquecidos",
-                    "fuente_cartera": "siigo_facturas",
+                    "fuente_cartera": "siigo_facturas_enriquecida_con_cliente",
                     "logica_ventas": "ventas_netas = facturas_emitidas - notas_credito",
                     "ventas_netas": "con impuesto",
                 }
@@ -7233,7 +7321,9 @@ def create_app():
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-        
+
+
+
 
     # --- ENDPOINT: Facturas por cliente/centro de costo (paginadas) ---
     @app.route("/reportes/facturas_cliente_cartera", methods=["GET"])
