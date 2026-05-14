@@ -8077,21 +8077,20 @@ def create_app():
     @jwt_required()
     def cuentas_por_cobrar():
         """
-        Reporte Aging (Cuentas por Cobrar).
+        Reporte Aging / Cuentas por Cobrar.
 
-        Devuelve:
-        - resumen_global
-        - consolidado por cliente fusionado por nombre limpio
-        - detalle de facturas si ?detalle=1
-        - proyeccion_por_fecha con facturas asociadas a cada vencimiento
+        Fuente principal:
+        - siigo_facturas
 
-        Mejora importante:
-        - Incluye cliente_key en consolidado, detalle y proyección para que el frontend
-        pueda relacionar correctamente facturas con clientes aunque existan diferencias
-        menores en puntos, comas, espacios o escritura.
+        Regla:
+        - Solo se consideran facturas con saldo > 0.
+        - No usa facturas_enriquecidas para evitar efectos de notas crédito comerciales
+        sobre la cartera.
         """
 
+        from sqlalchemy.sql import text
         from collections import defaultdict
+        from datetime import datetime
         import re
 
         def normalizar_cliente(nombre: str) -> str:
@@ -8100,9 +8099,21 @@ def create_app():
             nombre = re.sub(r"\s+", " ", nombre)
             return nombre
 
+        def money_float(valor):
+            try:
+                return float(valor or 0)
+            except Exception:
+                return 0.0
+
         def money_fmt(valor, decimales=2):
-            valor = float(valor or 0)
+            valor = money_float(valor)
             return f"$ {valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        def validar_fecha(fecha_str):
+            try:
+                return datetime.strptime(fecha_str, "%Y-%m-%d").date()
+            except Exception:
+                return None
 
         def calcular_bucket(dias_vencidos):
             dias = int(dias_vencidos or 0)
@@ -8121,7 +8132,6 @@ def create_app():
         perfilid = claims.get("perfilid")
         idcliente = claims.get("idcliente")
 
-        # Superadmin puede inspeccionar otro cliente
         q_idcliente = request.args.get("idcliente", type=int)
         if perfilid == 0 and q_idcliente:
             idcliente = q_idcliente
@@ -8133,229 +8143,392 @@ def create_app():
         hasta = request.args.get("hasta")
         incluir_detalle = request.args.get("detalle", "0") == "1"
 
-        condiciones = ["idcliente = :idcliente", "saldo > 0"]
-        params = {"idcliente": idcliente}
+        fecha_desde_val = validar_fecha(desde) if desde else None
+        fecha_hasta_val = validar_fecha(hasta) if hasta else None
 
-        if desde:
-            condiciones.append("fecha >= :desde")
-            params["desde"] = desde
+        condiciones = [
+            "fb.idcliente = :idcliente",
+            "COALESCE(fb.saldo, 0) > 0",
+        ]
 
-        if hasta:
-            condiciones.append("fecha <= :hasta")
-            params["hasta"] = hasta
+        params = {
+            "idcliente": idcliente,
+        }
+
+        if fecha_desde_val:
+            condiciones.append("fb.fecha >= :desde")
+            params["desde"] = fecha_desde_val
+
+        if fecha_hasta_val:
+            condiciones.append("fb.fecha <= :hasta")
+            params["hasta"] = fecha_hasta_val
 
         where_sql = " AND ".join(condiciones)
 
-        # --- Query base consolidado ---
-        query_base = f"""
-            SELECT
-                cliente_nombre,
-                centro_costo_nombre,
-                vendedor_nombre,
-                COUNT(*) AS num_facturas,
-                SUM(saldo) AS saldo_total,
-                SUM(CASE WHEN CURRENT_DATE <= vencimiento THEN saldo ELSE 0 END) AS saldo_sano,
-                SUM(CASE WHEN CURRENT_DATE > vencimiento AND CURRENT_DATE - vencimiento <= 30 THEN saldo ELSE 0 END) AS saldo_1_30,
-                SUM(CASE WHEN CURRENT_DATE - vencimiento BETWEEN 31 AND 60 THEN saldo ELSE 0 END) AS saldo_31_60,
-                SUM(CASE WHEN CURRENT_DATE - vencimiento BETWEEN 61 AND 90 THEN saldo ELSE 0 END) AS saldo_61_90,
-                SUM(CASE WHEN CURRENT_DATE - vencimiento > 90 THEN saldo ELSE 0 END) AS saldo_mas_90
-            FROM facturas_enriquecidas
-            WHERE {where_sql}
-            GROUP BY cliente_nombre, centro_costo_nombre, vendedor_nombre
-            ORDER BY saldo_total DESC
+        facturas_base_cte = """
+            WITH facturas_base AS (
+                SELECT
+                    f.id,
+                    f.idcliente,
+                    f.idfactura,
+                    f.fecha,
+                    f.vencimiento,
+                    f.total,
+                    f.subtotal,
+                    f.impuestos_total,
+                    f.pagos_total,
+                    f.saldo,
+                    f.public_url,
+                    f.customer_id,
+                    f.cost_center,
+                    f.seller_id,
+
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    COALESCE(
+                                        NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
+                                        NULLIF(TRIM(BOTH '"' FROM c.name), ''),
+                                        'Sin cliente'
+                                    ),
+                                    '{', ''
+                                ),
+                                '}', ''
+                            ),
+                            '[', ''
+                        ),
+                        ']', ''
+                    ) AS cliente_nombre_ok,
+
+                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok,
+
+                    COALESCE(v.nombre, 'Sin vendedor') AS vendedor_nombre_ok
+
+                FROM siigo_facturas f
+                LEFT JOIN siigo_customers c
+                    ON c.id::text = f.customer_id::text
+                AND c.idcliente = f.idcliente
+                LEFT JOIN siigo_centros_costo cc
+                    ON cc.id = f.cost_center
+                AND cc.idcliente = f.idcliente
+                LEFT JOIN siigo_vendedores v
+                    ON v.id::text = f.seller_id::text
+                AND v.idcliente = f.idcliente
+            )
         """
 
-        result = db.session.execute(text(query_base), params).mappings().all()
-        rows_raw = [dict(r) for r in result]
+        try:
+            # ------------------------------------------------------------
+            # 1) Base consolidada por cliente / centro / vendedor
+            # ------------------------------------------------------------
+            query_base = text(facturas_base_cte + f"""
+                SELECT
+                    fb.cliente_nombre_ok AS cliente_nombre,
+                    fb.centro_costo_nombre_ok AS centro_costo_nombre,
+                    fb.vendedor_nombre_ok AS vendedor_nombre,
 
-        # --- Agrupar por nombre normalizado ---
-        agrupado = defaultdict(list)
-        nombre_visible_por_key = {}
+                    COUNT(*) AS num_facturas,
+                    COALESCE(SUM(fb.saldo), 0) AS saldo_total,
 
-        for r in rows_raw:
-            clave = normalizar_cliente(r.get("cliente_nombre"))
-            agrupado[clave].append(r)
+                    COALESCE(SUM(
+                        CASE
+                            WHEN fb.vencimiento IS NULL OR CURRENT_DATE <= fb.vencimiento
+                            THEN fb.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_sano,
 
-            if clave not in nombre_visible_por_key:
-                nombre_visible_por_key[clave] = r.get("cliente_nombre") or "Sin cliente"
+                    COALESCE(SUM(
+                        CASE
+                            WHEN fb.vencimiento IS NOT NULL
+                                AND CURRENT_DATE > fb.vencimiento
+                                AND CURRENT_DATE - fb.vencimiento <= 30
+                            THEN fb.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_1_30,
 
-        # --- Fusionar datos por cliente ---
-        consolidado = []
+                    COALESCE(SUM(
+                        CASE
+                            WHEN fb.vencimiento IS NOT NULL
+                                AND CURRENT_DATE - fb.vencimiento BETWEEN 31 AND 60
+                            THEN fb.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_31_60,
 
-        for cliente_key, grupo in agrupado.items():
-            base = {
-                "cliente_key": cliente_key,
-                "cliente_nombre": nombre_visible_por_key.get(cliente_key, "Sin cliente"),
-                "centro_costo_nombre": grupo[0].get("centro_costo_nombre"),
-                "vendedor_nombre": grupo[0].get("vendedor_nombre"),
-                "num_facturas": 0,
-                "aging": {
-                    "por_vencer": 0.0,
-                    "1_30": 0.0,
-                    "31_60": 0.0,
-                    "61_90": 0.0,
-                    "91_mas": 0.0,
-                },
-                "total": 0.0,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN fb.vencimiento IS NOT NULL
+                                AND CURRENT_DATE - fb.vencimiento BETWEEN 61 AND 90
+                            THEN fb.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_61_90,
+
+                    COALESCE(SUM(
+                        CASE
+                            WHEN fb.vencimiento IS NOT NULL
+                                AND CURRENT_DATE - fb.vencimiento > 90
+                            THEN fb.saldo ELSE 0
+                        END
+                    ), 0) AS saldo_mas_90
+
+                FROM facturas_base fb
+                WHERE {where_sql}
+                GROUP BY fb.cliente_nombre_ok, fb.centro_costo_nombre_ok, fb.vendedor_nombre_ok
+                ORDER BY saldo_total DESC
+            """)
+
+            result = db.session.execute(query_base, params).mappings().all()
+            rows_raw = [dict(r) for r in result]
+
+            # ------------------------------------------------------------
+            # 2) Agrupar por nombre normalizado
+            # ------------------------------------------------------------
+            agrupado = defaultdict(list)
+            nombre_visible_por_key = {}
+
+            for r in rows_raw:
+                clave = normalizar_cliente(r.get("cliente_nombre"))
+                agrupado[clave].append(r)
+
+                if clave not in nombre_visible_por_key:
+                    nombre_visible_por_key[clave] = r.get("cliente_nombre") or "Sin cliente"
+
+            # ------------------------------------------------------------
+            # 3) Consolidado por cliente
+            # ------------------------------------------------------------
+            consolidado = []
+
+            for cliente_key, grupo in agrupado.items():
+                base = {
+                    "cliente_key": cliente_key,
+                    "cliente_nombre": nombre_visible_por_key.get(cliente_key, "Sin cliente"),
+                    "centro_costo_nombre": grupo[0].get("centro_costo_nombre"),
+                    "vendedor_nombre": grupo[0].get("vendedor_nombre"),
+                    "num_facturas": 0,
+                    "aging": {
+                        "por_vencer": 0.0,
+                        "1_30": 0.0,
+                        "31_60": 0.0,
+                        "61_90": 0.0,
+                        "91_mas": 0.0,
+                    },
+                    "total": 0.0,
+                }
+
+                for r in grupo:
+                    base["total"] += money_float(r.get("saldo_total"))
+                    base["aging"]["por_vencer"] += money_float(r.get("saldo_sano"))
+                    base["aging"]["1_30"] += money_float(r.get("saldo_1_30"))
+                    base["aging"]["31_60"] += money_float(r.get("saldo_31_60"))
+                    base["aging"]["61_90"] += money_float(r.get("saldo_61_90"))
+                    base["aging"]["91_mas"] += money_float(r.get("saldo_mas_90"))
+                    base["num_facturas"] += int(r.get("num_facturas") or 0)
+
+                base["total_str"] = money_fmt(base["total"])
+                consolidado.append(base)
+
+            consolidado.sort(key=lambda x: x["total"], reverse=True)
+
+            # ------------------------------------------------------------
+            # 4) Resumen global
+            # ------------------------------------------------------------
+            total_global = sum(r["total"] for r in consolidado)
+            facturas_vivas = sum(r["num_facturas"] for r in consolidado)
+
+            total_por_vencer = sum(r["aging"]["por_vencer"] for r in consolidado)
+            total_1_30 = sum(r["aging"]["1_30"] for r in consolidado)
+            total_31_60 = sum(r["aging"]["31_60"] for r in consolidado)
+            total_61_90 = sum(r["aging"]["61_90"] for r in consolidado)
+            total_91_mas = sum(r["aging"]["91_mas"] for r in consolidado)
+
+            total_vencido = total_1_30 + total_31_60 + total_61_90 + total_91_mas
+            pct_vencido = (total_vencido / total_global * 100) if total_global else 0
+
+            resumen_global = {
+                "facturas_vivas": facturas_vivas,
+
+                "total_global": money_fmt(total_global, 1),
+                "total_por_vencer": money_fmt(total_por_vencer),
+                "total_vencido": money_fmt(total_vencido),
+
+                "pct_vencido": round(pct_vencido, 2),
+
+                "total_1_30": money_fmt(total_1_30),
+                "total_31_60": money_fmt(total_31_60),
+                "total_61_90": money_fmt(total_61_90),
+                "total_91_mas": money_fmt(total_91_mas),
+
+                # Valores numéricos adicionales por si el frontend los necesita.
+                "total_global_num": total_global,
+                "total_por_vencer_num": total_por_vencer,
+                "total_vencido_num": total_vencido,
+                "total_1_30_num": total_1_30,
+                "total_31_60_num": total_31_60,
+                "total_61_90_num": total_61_90,
+                "total_91_mas_num": total_91_mas,
             }
 
-            for r in grupo:
-                base["total"] += float(r.get("saldo_total", 0) or 0)
-                base["aging"]["por_vencer"] += float(r.get("saldo_sano", 0) or 0)
-                base["aging"]["1_30"] += float(r.get("saldo_1_30", 0) or 0)
-                base["aging"]["31_60"] += float(r.get("saldo_31_60", 0) or 0)
-                base["aging"]["61_90"] += float(r.get("saldo_61_90", 0) or 0)
-                base["aging"]["91_mas"] += float(r.get("saldo_mas_90", 0) or 0)
-                base["num_facturas"] += int(r.get("num_facturas", 0) or 0)
+            # ------------------------------------------------------------
+            # 5) Detalle de facturas
+            # ------------------------------------------------------------
+            detalle = []
 
-            base["total_str"] = money_fmt(base["total"])
-            consolidado.append(base)
+            if incluir_detalle:
+                query_detalle = text(facturas_base_cte + f"""
+                    SELECT
+                        fb.idfactura,
+                        fb.cliente_nombre_ok AS cliente_nombre,
+                        fb.centro_costo_nombre_ok AS centro_costo_nombre,
+                        fb.vendedor_nombre_ok AS vendedor_nombre,
 
-        consolidado.sort(key=lambda x: x["total"], reverse=True)
+                        TO_CHAR(fb.fecha, 'DD/MM/YYYY') AS fecha,
+                        TO_CHAR(fb.vencimiento, 'DD/MM/YYYY') AS vencimiento,
 
-        # --- Calcular resumen global ---
-        total_global = sum(r["total"] for r in consolidado)
-        facturas_vivas = sum(r["num_facturas"] for r in consolidado)
+                        CASE
+                            WHEN fb.vencimiento IS NULL THEN 0
+                            ELSE CURRENT_DATE - fb.vencimiento
+                        END AS dias_vencidos,
 
-        total_por_vencer = sum(r["aging"]["por_vencer"] for r in consolidado)
-        total_1_30 = sum(r["aging"]["1_30"] for r in consolidado)
-        total_31_60 = sum(r["aging"]["31_60"] for r in consolidado)
-        total_61_90 = sum(r["aging"]["61_90"] for r in consolidado)
-        total_91_mas = sum(r["aging"]["91_mas"] for r in consolidado)
+                        CASE
+                            WHEN fb.fecha IS NULL THEN 0
+                            ELSE CURRENT_DATE - fb.fecha
+                        END AS dias_transcurridos,
 
-        total_vencido = total_1_30 + total_31_60 + total_61_90 + total_91_mas
-        pct_vencido = (total_vencido / total_global * 100) if total_global else 0
+                        COALESCE(fb.total, 0) AS total,
+                        COALESCE(fb.pagos_total, COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)) AS pagos_total,
+                        COALESCE(fb.saldo, 0) AS saldo,
+                        fb.public_url
 
-        resumen_global = {
-            "facturas_vivas": facturas_vivas,
-            "total_global": money_fmt(total_global, 1),
-            "total_por_vencer": money_fmt(total_por_vencer),
-            "total_vencido": money_fmt(total_vencido),
-            "pct_vencido": round(pct_vencido, 2),
-            "total_1_30": money_fmt(total_1_30),
-            "total_31_60": money_fmt(total_31_60),
-            "total_61_90": money_fmt(total_61_90),
-            "total_91_mas": money_fmt(total_91_mas),
-        }
+                    FROM facturas_base fb
+                    WHERE {where_sql}
+                    ORDER BY fb.cliente_nombre_ok, fb.vencimiento, fb.fecha, fb.idfactura
+                """)
 
-        # --- Detalle de facturas ---
-        detalle = []
+                result_detalle = db.session.execute(query_detalle, params).mappings().all()
 
-        if incluir_detalle:
-            query_detalle = f"""
+                for row in result_detalle:
+                    r = dict(row)
+
+                    dias_vencidos = int(r.get("dias_vencidos") or 0)
+                    dias_transcurridos = int(r.get("dias_transcurridos") or 0)
+                    cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+
+                    saldo = money_float(r.get("saldo"))
+                    total = money_float(r.get("total"))
+                    pagos_total = money_float(r.get("pagos_total"))
+
+                    r["cliente_key"] = cliente_key
+                    r["aging_bucket"] = calcular_bucket(dias_vencidos)
+                    r["dias_vencidos"] = dias_vencidos
+                    r["dias_transcurridos"] = dias_transcurridos
+
+                    r["saldo"] = saldo
+                    r["total"] = total
+                    r["pagos_total"] = pagos_total
+
+                    r["saldo_str"] = money_fmt(saldo)
+                    r["total_str"] = money_fmt(total)
+                    r["pagos_total_str"] = money_fmt(pagos_total)
+
+                    detalle.append(r)
+
+            # ------------------------------------------------------------
+            # 6) Proyección por fecha
+            # ------------------------------------------------------------
+            query_proyeccion = text(facturas_base_cte + f"""
                 SELECT
-                    idfactura,
-                    cliente_nombre,
-                    centro_costo_nombre,
-                    vendedor_nombre,
-                    TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
-                    TO_CHAR(vencimiento, 'DD/MM/YYYY') AS vencimiento,
-                    (CURRENT_DATE - vencimiento) AS dias_vencidos,
-                    (CURRENT_DATE - fecha) AS dias_transcurridos,
-                    total,
-                    pagos_total,
-                    saldo,
-                    public_url
-                FROM facturas_enriquecidas
+                    fb.vencimiento::date AS fecha,
+                    COALESCE(SUM(fb.saldo), 0) AS total,
+                    CASE
+                        WHEN fb.vencimiento::date < CURRENT_DATE THEN true
+                        ELSE false
+                    END AS vencido,
+
+                    json_agg(
+                        json_build_object(
+                            'idfactura', fb.idfactura,
+                            'cliente_nombre', fb.cliente_nombre_ok,
+                            'fecha', TO_CHAR(fb.fecha, 'DD/MM/YYYY'),
+                            'vencimiento', TO_CHAR(fb.vencimiento, 'DD/MM/YYYY'),
+                            'saldo', fb.saldo,
+                            'public_url', fb.public_url,
+                            'dias_vencidos',
+                                CASE
+                                    WHEN fb.vencimiento IS NULL THEN 0
+                                    ELSE CURRENT_DATE - fb.vencimiento
+                                END,
+                            'dias_transcurridos',
+                                CASE
+                                    WHEN fb.fecha IS NULL THEN 0
+                                    ELSE CURRENT_DATE - fb.fecha
+                                END
+                        )
+                        ORDER BY fb.saldo DESC
+                    ) AS facturas
+
+                FROM facturas_base fb
                 WHERE {where_sql}
-                ORDER BY cliente_nombre, vencimiento, fecha
-            """
+                AND fb.vencimiento IS NOT NULL
+                GROUP BY fb.vencimiento::date
+                ORDER BY fecha
+            """)
 
-            result_detalle = db.session.execute(text(query_detalle), params).mappings().all()
+            result_proyeccion = db.session.execute(query_proyeccion, params).mappings().all()
+            proyeccion_por_fecha = []
 
-            for r in result_detalle:
-                r = dict(r)
+            for row in result_proyeccion:
+                r = dict(row)
 
-                dias_vencidos = int(r.get("dias_vencidos") or 0)
-                cliente_key = normalizar_cliente(r.get("cliente_nombre"))
+                facturas_json = []
+                for f in r.get("facturas") or []:
+                    cliente_key = normalizar_cliente(f.get("cliente_nombre"))
 
-                r["cliente_key"] = cliente_key
-                r["aging_bucket"] = calcular_bucket(dias_vencidos)
-                r["dias_vencidos"] = dias_vencidos
-                r["dias_transcurridos"] = int(r.get("dias_transcurridos") or 0)
-                r["saldo"] = float(r.get("saldo", 0) or 0)
-                r["total"] = float(r.get("total", 0) or 0)
-                r["pagos_total"] = float(r.get("pagos_total", 0) or 0)
-                r["saldo_str"] = money_fmt(r["saldo"])
-                r["total_str"] = money_fmt(r["total"])
+                    saldo = money_float(f.get("saldo"))
+                    dias_vencidos = int(f.get("dias_vencidos") or 0)
+                    dias_transcurridos = int(f.get("dias_transcurridos") or 0)
 
-                detalle.append(r)
+                    facturas_json.append({
+                        "idfactura": f.get("idfactura"),
+                        "cliente_nombre": f.get("cliente_nombre"),
+                        "cliente_key": cliente_key,
+                        "fecha": f.get("fecha"),
+                        "vencimiento": f.get("vencimiento"),
+                        "saldo": saldo,
+                        "saldo_str": money_fmt(saldo),
+                        "public_url": f.get("public_url"),
+                        "dias_vencidos": dias_vencidos,
+                        "dias_transcurridos": dias_transcurridos,
+                        "aging_bucket": calcular_bucket(dias_vencidos),
+                    })
 
-        # --- Proyección por fecha ---
-        query_proyeccion = f"""
-            SELECT
-                vencimiento::date AS fecha,
-                SUM(saldo) AS total,
-                (CASE WHEN vencimiento::date < CURRENT_DATE THEN true ELSE false END) AS vencido,
-                json_agg(
-                    json_build_object(
-                        'idfactura', idfactura,
-                        'cliente_nombre', cliente_nombre,
-                        'fecha', TO_CHAR(fecha, 'DD/MM/YYYY'),
-                        'vencimiento', TO_CHAR(vencimiento, 'DD/MM/YYYY'),
-                        'saldo', saldo,
-                        'public_url', public_url,
-                        'dias_vencidos', (CURRENT_DATE - vencimiento),
-                        'dias_transcurridos', (CURRENT_DATE - fecha)
-                    )
-                    ORDER BY saldo DESC
-                ) AS facturas
-            FROM facturas_enriquecidas
-            WHERE {where_sql}
-            GROUP BY vencimiento::date
-            ORDER BY fecha
-        """
+                fecha = r.get("fecha")
+                total_fecha = money_float(r.get("total"))
 
-        result_proyeccion = db.session.execute(text(query_proyeccion), params).mappings().all()
-        proyeccion_por_fecha = []
-
-        for r in result_proyeccion:
-            r = dict(r)
-
-            facturas_json = []
-            for f in r.get("facturas") or []:
-                cliente_key = normalizar_cliente(f.get("cliente_nombre"))
-
-                saldo = float(f.get("saldo", 0) or 0)
-                dias_vencidos = int(f.get("dias_vencidos") or 0)
-                dias_transcurridos = int(f.get("dias_transcurridos") or 0)
-
-                facturas_json.append({
-                    "idfactura": f.get("idfactura"),
-                    "cliente_nombre": f.get("cliente_nombre"),
-                    "cliente_key": cliente_key,
-                    "fecha": f.get("fecha"),
-                    "vencimiento": f.get("vencimiento"),
-                    "saldo": saldo,
-                    "saldo_str": money_fmt(saldo),
-                    "public_url": f.get("public_url"),
-                    "dias_vencidos": dias_vencidos,
-                    "dias_transcurridos": dias_transcurridos,
-                    "aging_bucket": calcular_bucket(dias_vencidos),
+                proyeccion_por_fecha.append({
+                    "fecha": fecha.strftime("%d/%m/%Y") if fecha and hasattr(fecha, "strftime") else str(fecha),
+                    "total": total_fecha,
+                    "total_str": money_fmt(total_fecha),
+                    "vencido": bool(r.get("vencido")),
+                    "facturas": facturas_json,
                 })
 
-            total_fecha = float(r.get("total", 0) or 0)
-
-            proyeccion_por_fecha.append({
-                "fecha": r["fecha"].strftime("%d/%m/%Y"),
-                "total": total_fecha,
-                "total_str": money_fmt(total_fecha),
-                "vencido": bool(r.get("vencido")),
-                "facturas": facturas_json,
+            return jsonify({
+                "resumen_global": resumen_global,
+                "consolidado": consolidado,
+                "detalle": detalle if incluir_detalle else None,
+                "proyeccion_por_fecha": proyeccion_por_fecha,
+                "params": {
+                    "idcliente": idcliente,
+                    "desde": desde,
+                    "hasta": hasta,
+                    "detalle": incluir_detalle,
+                    "fuente": "siigo_facturas",
+                    "solo_saldo_pendiente": True,
+                },
             })
 
-        return jsonify({
-            "resumen_global": resumen_global,
-            "consolidado": consolidado,
-            "detalle": detalle if incluir_detalle else None,
-            "proyeccion_por_fecha": proyeccion_por_fecha,
-            "params": {
-                "idcliente": idcliente,
-                "desde": desde,
-                "hasta": hasta,
-                "detalle": incluir_detalle,
-            },
-        })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
     @app.route("/siigo/sync-pagos-egresos", methods=["POST"])
