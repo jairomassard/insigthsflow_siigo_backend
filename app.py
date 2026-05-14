@@ -6430,12 +6430,25 @@ def create_app():
         cliente = request.args.get("cliente")
         cost_center = request.args.get("cost_center", type=int)
         filtro_estado = request.args.get("estado")
-        limit_facturas = request.args.get("limit_facturas", default=8, type=int)
+        limit_facturas_raw = request.args.get("limit_facturas", default="8")
 
-        if limit_facturas <= 0:
-            limit_facturas = 8
-        if limit_facturas > 30:
-            limit_facturas = 30
+        mostrar_todas_facturas = False
+
+        if str(limit_facturas_raw).lower().strip() in ["all", "todos", "todas", "0"]:
+            mostrar_todas_facturas = True
+            limit_facturas = 999999
+        else:
+            try:
+                limit_facturas = int(limit_facturas_raw)
+            except Exception:
+                limit_facturas = 8
+
+            if limit_facturas <= 0:
+                limit_facturas = 8
+
+            # Dejamos un límite de seguridad solo cuando NO se pide all.
+            if limit_facturas > 500:
+                limit_facturas = 500
 
         fecha_desde_val = validar_fecha(desde) if desde else None
         fecha_hasta_val = validar_fecha(hasta) if hasta else None
@@ -6490,6 +6503,7 @@ def create_app():
             params_fac = {
                 "idcliente": idcliente,
                 "limit_facturas": limit_facturas,
+                "mostrar_todas_facturas": mostrar_todas_facturas,
             }
 
             if fecha_desde_val:
@@ -6981,7 +6995,7 @@ def create_app():
                 )
                 SELECT *
                 FROM ranked
-                WHERE rn <= :limit_facturas
+                WHERE (:mostrar_todas_facturas = true OR rn <= :limit_facturas)
                 ORDER BY cliente_nombre, fecha DESC
             """)
 
@@ -7309,7 +7323,8 @@ def create_app():
                     "cliente": cliente,
                     "cost_center": cost_center,
                     "estado": filtro_estado,
-                    "limit_facturas": limit_facturas,
+                    "limit_facturas": "all" if mostrar_todas_facturas else limit_facturas,
+                    "mostrar_todas_facturas": mostrar_todas_facturas,
                 },
                 "config": {
                     "fuente_ventas": "ventas_movimientos_enriquecidos",
