@@ -583,11 +583,6 @@ def procesar_excel_auxiliar_v2(file_storage, idcliente):
             
     return registros
 
-# ==========================================================
-# BÚSQUEDA INTELIGENTE DE FACTURAS + EXPORTACIÓN A EXCEL
-# BASADO EN facturas_enriquecidas
-# ==========================================================
-
 def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
     from sqlalchemy import text
     from datetime import datetime, timedelta
@@ -610,7 +605,13 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
     estado_factura = (request.args.get("estado_factura") or request.args.get("estado") or "").strip().lower()
     limit = request.args.get("limit", type=int) or 5000
 
-    # incluir completo el día final
+    if limit <= 0:
+        limit = 5000
+
+    if limit > 20000:
+        limit = 20000
+
+    # Incluir completo el día final.
     hasta_dt = datetime.strptime(hasta, "%Y-%m-%d") + timedelta(days=1)
     hasta_sql = hasta_dt.strftime("%Y-%m-%d")
 
@@ -618,6 +619,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
         "zapier": ["zapier", "zappier"],
         "zappier": ["zapier", "zappier"],
     }
+
     terminos = aliases.get(q, [q] if q else [])
 
     params = {
@@ -628,27 +630,94 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
         "estado_pago": estado_pago,
     }
 
+    # ==========================================================
+    # Fuente corregida:
+    # - Antes: facturas_enriquecidas
+    # - Ahora: siigo_facturas enriquecida con cliente / centro / vendedor
+    # ==========================================================
+
+    facturas_base_cte = """
+        WITH facturas_base AS (
+            SELECT
+                f.id AS factura_id,
+                f.idcliente,
+                f.idfactura,
+                f.fecha,
+                f.vencimiento,
+                f.customer_id,
+                f.cost_center,
+                f.seller_id,
+
+                REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                COALESCE(
+                                    NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
+                                    NULLIF(TRIM(BOTH '"' FROM c.name), ''),
+                                    'Sin cliente'
+                                ),
+                                '{', ''
+                            ),
+                            '}', ''
+                        ),
+                        '[', ''
+                    ),
+                    ']', ''
+                ) AS cliente_nombre,
+
+                COALESCE(f.estado, '') AS estado,
+
+                COALESCE(f.subtotal, 0) AS subtotal,
+                COALESCE(f.impuestos_total, 0) AS impuestos,
+                COALESCE(f.total, 0) AS total,
+                COALESCE(f.saldo, 0) AS saldo,
+                COALESCE(f.pagos_total, COALESCE(f.total, 0) - COALESCE(f.saldo, 0)) AS pagos_total,
+
+                f.public_url,
+                COALESCE(f.observaciones, '') AS observaciones,
+                COALESCE(f.medio_pago, '') AS medio_pago,
+
+                COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
+                COALESCE(cc.codigo, '') AS centro_costo_codigo,
+                COALESCE(v.nombre, 'Sin vendedor') AS vendedor_nombre,
+
+                COALESCE(f.retenciones, '[]'::jsonb) AS retenciones
+
+            FROM siigo_facturas f
+            LEFT JOIN siigo_customers c
+                ON c.id::text = f.customer_id::text
+               AND c.idcliente = f.idcliente
+            LEFT JOIN siigo_centros_costo cc
+                ON cc.id = f.cost_center
+               AND cc.idcliente = f.idcliente
+            LEFT JOIN siigo_vendedores v
+                ON v.id::text = f.seller_id::text
+               AND v.idcliente = f.idcliente
+        )
+    """
+
     where_main = [
-        "fe.idcliente = :idcliente",
-        "fe.fecha >= :desde",
-        "fe.fecha < :hasta",
+        "b.idcliente = :idcliente",
+        "b.fecha >= :desde",
+        "b.fecha < :hasta",
     ]
 
     if factura:
-        where_main.append("LOWER(COALESCE(fe.idfactura, '')) LIKE :factura")
+        where_main.append("LOWER(COALESCE(b.idfactura, '')) LIKE :factura")
         params["factura"] = f"%{factura.lower()}%"
 
     if cliente:
-        # catálogo de clientes usa nombre como id
-        where_main.append("fe.cliente_nombre = :cliente")
+        # El catálogo de clientes usa el nombre como id.
+        where_main.append("LOWER(TRIM(b.cliente_nombre)) = LOWER(TRIM(:cliente))")
         params["cliente"] = cliente
 
     if cost_center:
-        where_main.append("fe.cost_center = :cost_center")
+        where_main.append("b.cost_center = :cost_center")
         params["cost_center"] = cost_center
 
     if estado_factura:
-        where_main.append("LOWER(COALESCE(fe.estado, '')) = :estado_factura")
+        where_main.append("LOWER(COALESCE(b.estado, '')) = :estado_factura")
         params["estado_factura"] = estado_factura
 
     exists_filter = ""
@@ -663,14 +732,21 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
             key = f"term_{i}"
             params[key] = f"%{term}%"
 
-            term_clauses_exists.append(f"LOWER(COALESCE(fi.descripcion, '')) LIKE LOWER(:{key})")
-            term_clauses_desc.append(f"LOWER(COALESCE(fi2.descripcion, '')) LIKE LOWER(:{key})")
+            term_clauses_exists.append(
+                f"LOWER(COALESCE(fi.descripcion, '')) LIKE LOWER(:{key})"
+            )
+
+            term_clauses_desc.append(
+                f"LOWER(COALESCE(fi2.descripcion, '')) LIKE LOWER(:{key})"
+            )
 
             term_clauses_header.extend([
-                f"LOWER(COALESCE(fe.idfactura, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(fe.cliente_nombre, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(fe.observaciones, '')) LIKE LOWER(:{key})",
-                f"LOWER(COALESCE(fe.medio_pago, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.idfactura, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.cliente_nombre, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.observaciones, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.medio_pago, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.centro_costo_nombre, '')) LIKE LOWER(:{key})",
+                f"LOWER(COALESCE(b.vendedor_nombre, '')) LIKE LOWER(:{key})",
             ])
 
         exists_filter = f"""
@@ -679,8 +755,8 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
                 OR EXISTS (
                     SELECT 1
                     FROM siigo_factura_items fi
-                    WHERE fi.factura_id = fe.factura_id
-                      AND fi.idcliente = fe.idcliente
+                    WHERE fi.factura_id = b.factura_id
+                      AND fi.idcliente = b.idcliente
                       AND ({' OR '.join(term_clauses_exists)})
                 )
             )
@@ -692,75 +768,82 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
 
     where_clause = " AND ".join(where_main)
 
-    sql_rows = text(f"""
-        WITH base AS (
-            SELECT
-                fe.factura_id,
-                fe.idfactura,
-                fe.fecha,
-                fe.vencimiento,
-                fe.cliente_nombre,
-                fe.estado,
-                fe.subtotal,
-                COALESCE(fe.impuestos_total, 0) AS impuestos,
-                COALESCE(fe.total, 0) AS total,
-                COALESCE(fe.saldo, 0) AS saldo,
-                fe.public_url,
-                fe.observaciones,
-                fe.medio_pago,
-                fe.cost_center,
-                fe.centro_costo_nombre,
-                fe.centro_costo_codigo,
-                fe.vendedor_nombre,
+    sql_rows = text(facturas_base_cte + f"""
+        SELECT
+            b.factura_id,
+            b.idfactura,
+            b.fecha,
+            b.vencimiento,
+            b.cliente_nombre,
+            b.estado,
+            b.subtotal,
+            b.impuestos,
+            b.total,
+            b.saldo,
+            b.pagos_total,
+            b.public_url,
+            b.observaciones,
+            b.medio_pago,
+            b.cost_center,
+            b.centro_costo_nombre,
+            b.centro_costo_codigo,
+            b.vendedor_nombre,
 
-                COALESCE((
-                    SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(fe.retenciones) AS r
-                    WHERE jsonb_typeof(fe.retenciones) = 'array'
-                      AND LOWER(COALESCE(r->>'type', '')) = 'reteica'
-                ), 0) AS reteica,
+            COALESCE((
+                SELECT SUM((r->>'value')::numeric)
+                FROM jsonb_array_elements(b.retenciones) AS r
+                WHERE jsonb_typeof(b.retenciones) = 'array'
+                  AND LOWER(COALESCE(r->>'type', '')) = 'reteica'
+            ), 0) AS reteica,
 
-                COALESCE((
-                    SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(fe.retenciones) AS r
-                    WHERE jsonb_typeof(fe.retenciones) = 'array'
-                      AND LOWER(COALESCE(r->>'type', '')) = 'reteiva'
-                ), 0) AS reteiva,
+            COALESCE((
+                SELECT SUM((r->>'value')::numeric)
+                FROM jsonb_array_elements(b.retenciones) AS r
+                WHERE jsonb_typeof(b.retenciones) = 'array'
+                  AND LOWER(COALESCE(r->>'type', '')) = 'reteiva'
+            ), 0) AS reteiva,
 
-                COALESCE((
-                    SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(fe.retenciones) AS r
-                    WHERE jsonb_typeof(fe.retenciones) = 'array'
-                      AND LOWER(COALESCE(r->>'type', '')) LIKE '%autorretencion%'
-                ), 0) AS autorretencion,
+            COALESCE((
+                SELECT SUM((r->>'value')::numeric)
+                FROM jsonb_array_elements(b.retenciones) AS r
+                WHERE jsonb_typeof(b.retenciones) = 'array'
+                  AND LOWER(COALESCE(r->>'type', '')) LIKE '%autorretencion%'
+            ), 0) AS autorretencion,
 
-                COALESCE((
-                    SELECT SUM((r->>'value')::numeric)
-                    FROM jsonb_array_elements(fe.retenciones) AS r
-                    WHERE jsonb_typeof(fe.retenciones) = 'array'
-                ), 0) AS total_retenciones,
+            COALESCE((
+                SELECT SUM((r->>'value')::numeric)
+                FROM jsonb_array_elements(b.retenciones) AS r
+                WHERE jsonb_typeof(b.retenciones) = 'array'
+            ), 0) AS total_retenciones,
 
-                (
-                    SELECT STRING_AGG(TRIM(fi2.descripcion), ' || ' ORDER BY TRIM(fi2.descripcion))
-                    FROM siigo_factura_items fi2
-                    WHERE fi2.factura_id = fe.factura_id
-                      AND fi2.idcliente = fe.idcliente
-                      {descripcion_filter}
-                ) AS descripcion,
+            (
+                SELECT STRING_AGG(TRIM(fi2.descripcion), ' || ' ORDER BY TRIM(fi2.descripcion))
+                FROM siigo_factura_items fi2
+                WHERE fi2.factura_id = b.factura_id
+                  AND fi2.idcliente = b.idcliente
+                  {descripcion_filter}
+            ) AS descripcion,
 
+            CASE
+                WHEN ABS(COALESCE(b.saldo, 0)) <= 1 THEN 'pagada'
+                WHEN ABS(COALESCE(b.total, 0) - COALESCE(b.saldo, 0)) <= 1 THEN 'pendiente'
+                ELSE 'parcial'
+            END AS estado_pago_real
+
+        FROM facturas_base b
+        WHERE {where_clause}
+        {exists_filter}
+        AND (
+            :estado_pago = ''
+            OR (
                 CASE
-                    WHEN ABS(COALESCE(fe.saldo, 0)) <= 1 THEN 'pagada'
-                    WHEN ABS(COALESCE(fe.total, 0) - COALESCE(fe.saldo, 0)) <= 1 THEN 'pendiente'
+                    WHEN ABS(COALESCE(b.saldo, 0)) <= 1 THEN 'pagada'
+                    WHEN ABS(COALESCE(b.total, 0) - COALESCE(b.saldo, 0)) <= 1 THEN 'pendiente'
                     ELSE 'parcial'
-                END AS estado_pago_real
-            FROM facturas_enriquecidas fe
-            WHERE {where_clause}
-            {exists_filter}
+                END
+            ) = :estado_pago
         )
-        SELECT *
-        FROM base
-        WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
-        ORDER BY fecha DESC, idfactura DESC
+        ORDER BY b.fecha DESC, b.idfactura DESC
         LIMIT :limit
     """)
 
@@ -787,26 +870,24 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
         "saldo": float(sum((r.get("saldo") or 0) for r in rows)),
     }
 
-    sql_series = text(f"""
-        WITH base AS (
-            SELECT
-                fe.fecha,
-                COALESCE(fe.total, 0) AS total,
-                CASE
-                    WHEN ABS(COALESCE(fe.saldo, 0)) <= 1 THEN 'pagada'
-                    WHEN ABS(COALESCE(fe.total, 0) - COALESCE(fe.saldo, 0)) <= 1 THEN 'pendiente'
-                    ELSE 'parcial'
-                END AS estado_pago_real
-            FROM facturas_enriquecidas fe
-            WHERE {where_clause}
-            {exists_filter}
-        )
+    sql_series = text(facturas_base_cte + f"""
         SELECT
-            TO_CHAR(date_trunc('month', fecha), 'YYYY-MM') AS mes,
-            COALESCE(SUM(total), 0) AS total_facturado,
+            TO_CHAR(date_trunc('month', b.fecha), 'YYYY-MM') AS mes,
+            COALESCE(SUM(b.total), 0) AS total_facturado,
             COUNT(*) AS cantidad
-        FROM base
-        WHERE (:estado_pago = '' OR estado_pago_real = :estado_pago)
+        FROM facturas_base b
+        WHERE {where_clause}
+        {exists_filter}
+        AND (
+            :estado_pago = ''
+            OR (
+                CASE
+                    WHEN ABS(COALESCE(b.saldo, 0)) <= 1 THEN 'pagada'
+                    WHEN ABS(COALESCE(b.total, 0) - COALESCE(b.saldo, 0)) <= 1 THEN 'pendiente'
+                    ELSE 'parcial'
+                END
+            ) = :estado_pago
+        )
         GROUP BY 1
         ORDER BY 1
     """)
@@ -829,10 +910,11 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
             "desde": desde,
             "hasta": hasta,
             "terminos_aplicados": terminos,
+            "fuente": "siigo_facturas",
         },
     }
-
-
+    
+    
 # Helper para pagina de PNL y para la de indicadores
 def construir_pnl_auxiliares(idcliente, desde, hasta):
     from sqlalchemy import text
