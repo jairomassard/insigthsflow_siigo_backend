@@ -6452,7 +6452,7 @@ def create_app():
                 params_mov["desde"] = fecha_desde_val
 
             if fecha_hasta_val:
-                wh_mov.append("m.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh_mov.append("m.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_mov["hasta"] = fecha_hasta_val
 
             if cliente:
@@ -6493,7 +6493,7 @@ def create_app():
                 params_fac["desde"] = fecha_desde_val
 
             if fecha_hasta_val:
-                wh_fac.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh_fac.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_fac["hasta"] = fecha_hasta_val
 
             if cliente:
@@ -7100,12 +7100,12 @@ def create_app():
                 params_cat["desde"] = fecha_desde_val
 
             if fecha_hasta_val:
-                wh_cat_mov.append("m.fecha < (:hasta::date + INTERVAL '1 day')")
-                wh_cat_fac.append("f.fecha < (:hasta::date + INTERVAL '1 day')")
+                wh_cat_mov.append("m.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
+                wh_cat_fac.append("f.fecha < (CAST(:hasta AS date) + INTERVAL '1 day')")
                 params_cat["hasta"] = fecha_hasta_val
 
             where_cat_mov = " AND ".join(wh_cat_mov)
-            where_cat_fac = " AND ".join(wh_cat_fac)
+            where_cat_fac = " AND ".join(wh_cat_fac) 
 
             sql_catalogo_clientes = text(f"""
                 WITH clientes AS (
