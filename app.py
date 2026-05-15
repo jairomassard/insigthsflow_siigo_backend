@@ -2519,27 +2519,61 @@ def recalcular_ajustes_compras_cliente(idcliente):
             FROM siigo_compras_ajustes
             WHERE idcliente = :idcliente
             GROUP BY idcliente, documento_origen
+        ),
+        calculado AS (
+            SELECT
+                c.id,
+                c.idcliente,
+                c.idcompra,
+                COALESCE(c.total, 0) AS total_original,
+                COALESCE(c.saldo, 0) AS saldo_siigo,
+                COALESCE(a.total_ajustes, 0) AS total_ajustes_raw,
+                COALESCE(a.ajustes_count, 0) AS ajustes_count,
+
+                CASE
+                    -- Para Documento Soporte, Siigo manda el saldo final en CxP.
+                    -- Si hay ajuste y hay saldo, usamos ese saldo para replicar Siigo.
+                    WHEN c.idcompra ILIKE 'DS-%'
+                      AND COALESCE(a.total_ajustes, 0) > 0
+                      AND COALESCE(c.saldo, 0) > 0
+                    THEN COALESCE(c.saldo, 0)
+
+                    -- Para facturas FC y demás documentos, usamos la nota importada.
+                    ELSE GREATEST(
+                        COALESCE(c.total, 0) - COALESCE(a.total_ajustes, 0),
+                        0
+                    )
+                END AS total_neto_siigo
+
+            FROM siigo_compras c
+            JOIN ajustes a
+                ON a.idcliente = c.idcliente
+                AND a.documento_origen = c.idcompra
+            WHERE c.idcliente = :idcliente
         )
         UPDATE siigo_compras c
         SET
-            total_ajustes_debito = COALESCE(a.total_ajustes, 0),
-            total_ajustado = GREATEST(
-                COALESCE(c.total, 0) - COALESCE(a.total_ajustes, 0),
+            -- Este valor queda como ajuste aplicado al total para que cuadre con Siigo.
+            -- El valor bruto importado sigue guardado en siigo_compras_ajustes.
+            total_ajustes_debito = GREATEST(
+                calc.total_original - calc.total_neto_siigo,
                 0
             ),
-            ajustes_count = COALESCE(a.ajustes_count, 0),
+
+            total_ajustado = calc.total_neto_siigo,
+            ajustes_count = calc.ajustes_count,
+
             estado_ajuste = CASE
-                WHEN COALESCE(a.total_ajustes, 0) = 0 THEN 'sin_ajuste'
-                WHEN COALESCE(a.total_ajustes, 0) < COALESCE(c.total, 0) THEN 'ajustado_parcial'
-                ELSE 'ajustado_total'
+                WHEN calc.ajustes_count = 0 THEN 'sin_ajuste'
+                WHEN calc.total_neto_siigo <= 0 THEN 'ajustado_total'
+                WHEN calc.total_neto_siigo < calc.total_original THEN 'ajustado_parcial'
+                ELSE 'sin_ajuste'
             END,
+
             ajustes_updated_at = NOW()
-        FROM ajustes a
-        WHERE c.idcliente = a.idcliente
-          AND c.idcompra = a.documento_origen
+        FROM calculado calc
+        WHERE c.id = calc.id
     """), {"idcliente": idcliente})
-
-
 
 
 
@@ -10869,7 +10903,7 @@ def create_app():
             HAVING SUM(COALESCE(c.total_ajustado, c.total, 0)) > 0
             ORDER BY total_compras DESC
         """
-        
+
         rows = db.session.execute(text(query), params).mappings().all()
         resultado = [dict(r) for r in rows]
 
