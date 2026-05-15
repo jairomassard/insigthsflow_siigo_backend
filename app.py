@@ -2540,736 +2540,8 @@ def recalcular_ajustes_compras_cliente(idcliente):
     """), {"idcliente": idcliente})
 
 
-@app.route("/siigo/recalcular-ajustes-compras", methods=["POST"])
-@jwt_required()
-def recalcular_ajustes_compras_endpoint():
-    import time
-    import traceback
 
-    inicio = time.time()
-    endpoint_log = "/siigo/recalcular-ajustes-compras"
-    log_id = None
 
-    claims = get_jwt()
-    idcliente = claims.get("idcliente")
-
-    if not idcliente:
-        return jsonify({"error": "Token sin cliente asociado"}), 400
-
-    log_id = _crear_log_sync_modulo_inicio(
-        idcliente=idcliente,
-        endpoint=endpoint_log,
-        origen="manual_modulo",
-        params={},
-        mensaje="Recalculo de ajustes de compras iniciado."
-    )
-
-    try:
-        recalcular_ajustes_compras_cliente(idcliente)
-        db.session.commit()
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="OK",
-            detalle=(
-                "Recalculo de ajustes de compras finalizado correctamente. "
-                "Se actualizaron columnas resumen en siigo_compras."
-            ),
-            status_code=200,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({
-            "mensaje": "Ajustes de compras recalculados correctamente.",
-            "log_id": log_id,
-        }), 200
-
-    except Exception as e:
-        db.session.rollback()
-        traceback.print_exc()
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=f"Error recalculando ajustes de compras: {str(e)}",
-            status_code=500,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({
-            "error": f"Error recalculando ajustes de compras: {str(e)}",
-            "log_id": log_id,
-        }), 500
-
-
-# --- Importar Notas Débito de Compras / Documento Soporte desde Excel ---
-@app.route("/importar/notas-debito-compras-excel", methods=["POST"])
-@jwt_required()
-def importar_notas_debito_compras_excel():
-    import pandas as pd
-    import time
-    import traceback
-    import json
-    import re
-
-    from datetime import date, datetime
-    from decimal import Decimal, InvalidOperation
-    from sqlalchemy import text
-
-    inicio = time.time()
-    endpoint_log = "/importar/notas-debito-compras-excel"
-    log_id = None
-
-    claims = get_jwt()
-    idcliente = claims.get("idcliente")
-
-    if not idcliente:
-        return jsonify({"error": "Token sin cliente asociado"}), 400
-
-    mes = request.form.get("mes")
-    anio = request.form.get("anio")
-
-    params_log = {
-        "mes": mes,
-        "anio": anio,
-    }
-
-    log_id = _crear_log_sync_modulo_inicio(
-        idcliente=idcliente,
-        endpoint=endpoint_log,
-        origen="manual_modulo",
-        params=params_log,
-        mensaje=(
-            "Carga de notas débito de compras desde Excel: proceso iniciado"
-            + (f" para periodo {mes}/{anio}." if mes and anio else ".")
-        )
-    )
-
-    if "archivo" not in request.files:
-        detalle = "Archivo no proporcionado."
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=400,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({"error": "Archivo no proporcionado"}), 400
-
-    if not mes or not anio:
-        detalle = "Debe indicar mes y año del reporte de notas débito."
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=400,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({"error": "Debe indicar mes y año del reporte"}), 400
-
-    try:
-        mes_int = int(mes)
-        anio_int = int(anio)
-        periodo = date(anio_int, mes_int, 1)
-    except Exception:
-        detalle = f"Mes o año inválido. mes={mes}, anio={anio}"
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=400,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({"error": "Mes o año inválido"}), 400
-
-    file = request.files["archivo"]
-    filename = getattr(file, "filename", "") or ""
-
-    def limpiar_texto(value):
-        if value is None:
-            return ""
-        txt = str(value).strip().replace("\xa0", " ")
-        txt = re.sub(r"\s+", " ", txt)
-        return txt
-
-    def normalizar_header(value):
-        import unicodedata
-
-        txt = limpiar_texto(value).lower()
-        txt = "".join(
-            ch for ch in unicodedata.normalize("NFD", txt)
-            if unicodedata.category(ch) != "Mn"
-        )
-        txt = re.sub(r"[^a-z0-9]+", "_", txt)
-        txt = re.sub(r"_+", "_", txt).strip("_")
-        return txt
-
-    def normalizar_numero(value):
-        if value is None:
-            return Decimal("0")
-
-        if isinstance(value, Decimal):
-            return value
-
-        if isinstance(value, (int, float)):
-            try:
-                return Decimal(str(value)).quantize(Decimal("0.01"))
-            except Exception:
-                return Decimal("0")
-
-        txt = str(value).strip()
-
-        if not txt or txt.lower() in ["nan", "none", "null", "-"]:
-            return Decimal("0")
-
-        txt = txt.replace("$", "").replace("COP", "").replace("cop", "").strip()
-        txt = txt.replace("\xa0", "")
-
-        # Formato colombiano: 1.234.567,89
-        if "," in txt and "." in txt:
-            txt = txt.replace(".", "").replace(",", ".")
-        elif "," in txt:
-            txt = txt.replace(",", ".")
-
-        txt = re.sub(r"[^0-9\.\-]", "", txt)
-
-        try:
-            return Decimal(txt or "0").quantize(Decimal("0.01"))
-        except (InvalidOperation, ValueError):
-            return Decimal("0")
-
-    def parse_fecha(value):
-        if value is None:
-            return None
-
-        if isinstance(value, datetime):
-            return value.date()
-
-        if isinstance(value, date):
-            return value
-
-        txt = str(value).strip()
-        if not txt or txt.lower() in ["nan", "none", "null"]:
-            return None
-
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(txt[:10], fmt).date()
-            except Exception:
-                pass
-
-        try:
-            parsed = pd.to_datetime(txt, errors="coerce", dayfirst=True)
-            if pd.isna(parsed):
-                return None
-            return parsed.date()
-        except Exception:
-            return None
-
-    def get_val(row, columnas, campo):
-        col = columnas.get(campo)
-        if not col:
-            return None
-        return row.get(col)
-
-    def resolver_columnas(headers_originales):
-        normalizadas = {normalizar_header(h): h for h in headers_originales}
-
-        equivalencias = {
-            "ajuste_nombre": [
-                "numero_comprobante",
-                "nro_comprobante",
-                "no_comprobante",
-                "comprobante",
-            ],
-            "consecutivo": [
-                "consecutivo",
-                "numero",
-                "nro",
-            ],
-            "documento_origen": [
-                "comprobante_relacionado",
-                "documento_relacionado",
-                "doc_relacionado",
-                "comp_relacionado",
-            ],
-            "factura_proveedor": [
-                "factura_proveedor",
-                "factura_del_proveedor",
-                "documento_proveedor",
-            ],
-            "fecha_creacion": [
-                "fecha_creacion",
-                "fecha_de_creacion",
-            ],
-            "fecha_elaboracion": [
-                "fecha_elaboracion",
-                "fecha_de_elaboracion",
-                "fecha",
-            ],
-            "proveedor_identificacion": [
-                "identificacion",
-                "nit",
-                "identificacion_tercero",
-                "nit_tercero",
-            ],
-            "proveedor_nombre": [
-                "nombre_tercero",
-                "tercero",
-                "proveedor",
-                "nombre",
-            ],
-            "centro_costo": [
-                "centro_costo",
-                "centro_de_costo",
-            ],
-            "tipo_registro": [
-                "tipo_registro",
-                "tipo_de_registro",
-            ],
-            "total": [
-                "total",
-                "valor_total",
-                "valor",
-            ],
-            "descuento_totales": [
-                "descuento_en_totales",
-                "descuentos_en_totales",
-                "descuento_totales",
-            ],
-            "impuesto_nombre": [
-                "nombre_impuesto",
-                "impuesto",
-                "descripcion_impuesto",
-                "tipo_impuesto",
-            ],
-        }
-
-        resueltas = {}
-
-        for campo, posibles in equivalencias.items():
-            for posible in posibles:
-                if posible in normalizadas:
-                    resueltas[campo] = normalizadas[posible]
-                    break
-
-        return resueltas
-
-    try:
-        try:
-            df_raw = pd.read_excel(file, header=None, engine="calamine")
-        except Exception:
-            file.stream.seek(0)
-            df_raw = pd.read_excel(file, header=None)
-
-        # Según el archivo de Siigo: fila 8 visual = índice 7
-        headers = df_raw.iloc[7].tolist()
-        headers = [limpiar_texto(h) for h in headers]
-
-        # Datos desde fila 9 visual = índice 8
-        df = df_raw.iloc[8:].copy()
-        df.columns = headers
-        df = df.dropna(how="all")
-        df = df.where(pd.notnull(df), None)
-
-        columnas = resolver_columnas(headers)
-
-    except Exception as e:
-        traceback.print_exc()
-
-        detalle = f"No se pudo leer el Excel de notas débito. Archivo={filename}. Error={str(e)}"
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=400,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
-
-    requeridas = [
-        "ajuste_nombre",
-        "documento_origen",
-        "fecha_elaboracion",
-        "proveedor_identificacion",
-        "proveedor_nombre",
-        "tipo_registro",
-        "total",
-    ]
-
-    faltantes = [campo for campo in requeridas if campo not in columnas]
-
-    if faltantes:
-        detalle = (
-            "El archivo de notas débito no contiene todas las columnas mínimas requeridas. "
-            f"Faltantes={faltantes}. Columnas detectadas={headers}"
-        )
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=400,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({
-            "error": "El archivo no contiene todas las columnas mínimas requeridas.",
-            "faltantes": faltantes,
-            "columnas_detectadas": headers,
-            "columnas_mapeadas": columnas,
-            "log_id": log_id,
-        }), 400
-
-    grupos = {}
-    filas_omitidas = 0
-    errores = []
-
-    try:
-        for idx, row in df.iterrows():
-            try:
-                ajuste_nombre = limpiar_texto(get_val(row, columnas, "ajuste_nombre"))
-                documento_origen = limpiar_texto(get_val(row, columnas, "documento_origen"))
-
-                if not ajuste_nombre or not documento_origen:
-                    filas_omitidas += 1
-                    continue
-
-                proveedor_identificacion = limpiar_texto(
-                    get_val(row, columnas, "proveedor_identificacion")
-                )
-                proveedor_nombre = limpiar_texto(get_val(row, columnas, "proveedor_nombre"))
-                centro_costo = limpiar_texto(get_val(row, columnas, "centro_costo"))
-                factura_proveedor = limpiar_texto(get_val(row, columnas, "factura_proveedor"))
-                consecutivo = limpiar_texto(get_val(row, columnas, "consecutivo"))
-
-                fecha_creacion = parse_fecha(get_val(row, columnas, "fecha_creacion"))
-                fecha_elaboracion = parse_fecha(get_val(row, columnas, "fecha_elaboracion"))
-
-                tipo_registro = limpiar_texto(get_val(row, columnas, "tipo_registro")).lower()
-                impuesto_nombre = limpiar_texto(get_val(row, columnas, "impuesto_nombre")).lower()
-
-                total = normalizar_numero(get_val(row, columnas, "total"))
-                descuento_totales = normalizar_numero(get_val(row, columnas, "descuento_totales"))
-
-                key = (
-                    ajuste_nombre,
-                    documento_origen,
-                    proveedor_identificacion,
-                    proveedor_nombre,
-                    centro_costo,
-                    factura_proveedor,
-                )
-
-                if key not in grupos:
-                    documento_origen_tipo = "OTRO"
-                    if documento_origen.upper().startswith("DS-"):
-                        documento_origen_tipo = "DS"
-                    elif documento_origen.upper().startswith("FC-"):
-                        documento_origen_tipo = "FC"
-
-                    grupos[key] = {
-                        "ajuste_nombre": ajuste_nombre,
-                        "consecutivo": consecutivo,
-                        "factura_proveedor": factura_proveedor,
-                        "documento_origen": documento_origen,
-                        "documento_origen_tipo": documento_origen_tipo,
-                        "fecha_creacion": fecha_creacion,
-                        "fecha_elaboracion": fecha_elaboracion,
-                        "proveedor_identificacion": proveedor_identificacion,
-                        "proveedor_nombre": proveedor_nombre,
-                        "centro_costo": centro_costo,
-                        "valor_items": Decimal("0"),
-                        "valor_iva": Decimal("0"),
-                        "valor_retefuente": Decimal("0"),
-                        "valor_reteica": Decimal("0"),
-                        "filas": [],
-                    }
-
-                grupo = grupos[key]
-
-                if not grupo["fecha_creacion"] and fecha_creacion:
-                    grupo["fecha_creacion"] = fecha_creacion
-
-                if not grupo["fecha_elaboracion"] and fecha_elaboracion:
-                    grupo["fecha_elaboracion"] = fecha_elaboracion
-
-                if "secuencia" in tipo_registro:
-                    grupo["valor_items"] += total
-
-                texto_impuesto = f"{tipo_registro} {impuesto_nombre}"
-
-                if "iva" in texto_impuesto:
-                    grupo["valor_iva"] += total
-
-                if "reteica" in texto_impuesto or "ica" in texto_impuesto:
-                    grupo["valor_reteica"] += descuento_totales
-
-                elif (
-                    "retefuente" in texto_impuesto
-                    or "retencion" in texto_impuesto
-                    or "retención" in texto_impuesto
-                ):
-                    grupo["valor_retefuente"] += descuento_totales
-
-                else:
-                    if descuento_totales > 0:
-                        grupo["valor_reteica"] += descuento_totales
-
-                fila_raw = {}
-                for col in headers:
-                    val = row.get(col)
-                    if isinstance(val, (datetime, date)):
-                        fila_raw[col] = val.isoformat()
-                    elif isinstance(val, Decimal):
-                        fila_raw[col] = str(val)
-                    else:
-                        fila_raw[col] = None if val is None else str(val)
-
-                grupo["filas"].append(fila_raw)
-
-            except Exception as e:
-                errores.append(f"Fila Excel {idx + 1}: {str(e)}")
-
-        registros_insertados = 0
-        registros_actualizados = 0
-        registros_omitidos_fuera_periodo = 0
-
-        upsert_sql = text("""
-            INSERT INTO siigo_compras_ajustes (
-                idcliente,
-                ajuste_nombre,
-                consecutivo,
-                factura_proveedor,
-                documento_origen,
-                documento_origen_tipo,
-                fecha_creacion,
-                fecha_elaboracion,
-                proveedor_identificacion,
-                proveedor_nombre,
-                centro_costo,
-                valor_items,
-                valor_iva,
-                valor_retefuente,
-                valor_reteica,
-                total_ajuste,
-                fuente,
-                archivo_origen,
-                raw_json,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                :idcliente,
-                :ajuste_nombre,
-                :consecutivo,
-                :factura_proveedor,
-                :documento_origen,
-                :documento_origen_tipo,
-                :fecha_creacion,
-                :fecha_elaboracion,
-                :proveedor_identificacion,
-                :proveedor_nombre,
-                :centro_costo,
-                :valor_items,
-                :valor_iva,
-                :valor_retefuente,
-                :valor_reteica,
-                :total_ajuste,
-                'excel_siigo',
-                :archivo_origen,
-                CAST(:raw_json AS JSONB),
-                NOW(),
-                NOW()
-            )
-            ON CONFLICT (idcliente, ajuste_nombre, documento_origen)
-            DO UPDATE SET
-                consecutivo = EXCLUDED.consecutivo,
-                factura_proveedor = EXCLUDED.factura_proveedor,
-                documento_origen_tipo = EXCLUDED.documento_origen_tipo,
-                fecha_creacion = EXCLUDED.fecha_creacion,
-                fecha_elaboracion = EXCLUDED.fecha_elaboracion,
-                proveedor_identificacion = EXCLUDED.proveedor_identificacion,
-                proveedor_nombre = EXCLUDED.proveedor_nombre,
-                centro_costo = EXCLUDED.centro_costo,
-                valor_items = EXCLUDED.valor_items,
-                valor_iva = EXCLUDED.valor_iva,
-                valor_retefuente = EXCLUDED.valor_retefuente,
-                valor_reteica = EXCLUDED.valor_reteica,
-                total_ajuste = EXCLUDED.total_ajuste,
-                fuente = EXCLUDED.fuente,
-                archivo_origen = EXCLUDED.archivo_origen,
-                raw_json = EXCLUDED.raw_json,
-                updated_at = NOW()
-        """)
-
-        existe_sql = text("""
-            SELECT id
-            FROM siigo_compras_ajustes
-            WHERE idcliente = :idcliente
-              AND ajuste_nombre = :ajuste_nombre
-              AND documento_origen = :documento_origen
-            LIMIT 1
-        """)
-
-        for key, grupo in grupos.items():
-            try:
-                fecha_elaboracion = grupo["fecha_elaboracion"]
-
-                if fecha_elaboracion:
-                    if fecha_elaboracion.year != anio_int or fecha_elaboracion.month != mes_int:
-                        registros_omitidos_fuera_periodo += 1
-                        continue
-
-                total_ajuste = (
-                    grupo["valor_items"]
-                    - grupo["valor_retefuente"]
-                    - grupo["valor_reteica"]
-                )
-
-                if total_ajuste < Decimal("0"):
-                    total_ajuste = Decimal("0")
-
-                raw_json = json.dumps(
-                    {
-                        "periodo_cargue": periodo.isoformat(),
-                        "archivo": filename,
-                        "filas": grupo["filas"],
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                )
-
-                existe = db.session.execute(existe_sql, {
-                    "idcliente": idcliente,
-                    "ajuste_nombre": grupo["ajuste_nombre"],
-                    "documento_origen": grupo["documento_origen"],
-                }).fetchone()
-
-                db.session.execute(upsert_sql, {
-                    "idcliente": idcliente,
-                    "ajuste_nombre": grupo["ajuste_nombre"],
-                    "consecutivo": grupo["consecutivo"] or None,
-                    "factura_proveedor": grupo["factura_proveedor"] or None,
-                    "documento_origen": grupo["documento_origen"],
-                    "documento_origen_tipo": grupo["documento_origen_tipo"],
-                    "fecha_creacion": grupo["fecha_creacion"],
-                    "fecha_elaboracion": grupo["fecha_elaboracion"],
-                    "proveedor_identificacion": grupo["proveedor_identificacion"] or None,
-                    "proveedor_nombre": grupo["proveedor_nombre"] or None,
-                    "centro_costo": grupo["centro_costo"] or None,
-                    "valor_items": grupo["valor_items"],
-                    "valor_iva": grupo["valor_iva"],
-                    "valor_retefuente": grupo["valor_retefuente"],
-                    "valor_reteica": grupo["valor_reteica"],
-                    "total_ajuste": total_ajuste,
-                    "archivo_origen": filename,
-                    "raw_json": raw_json,
-                })
-
-                if existe:
-                    registros_actualizados += 1
-                else:
-                    registros_insertados += 1
-
-            except Exception as e:
-                errores.append(
-                    f"Nota {grupo.get('ajuste_nombre')} -> {grupo.get('documento_origen')}: {str(e)}"
-                )
-
-        # Recalcula columnas resumen en siigo_compras.
-        recalcular_ajustes_compras_cliente(idcliente)
-
-        db.session.commit()
-
-    except Exception as e:
-        db.session.rollback()
-        traceback.print_exc()
-
-        detalle = (
-            f"Error al guardar notas débito en BD. Periodo={periodo}. "
-            f"Archivo={filename}. Error={str(e)}"
-        )
-
-        _finalizar_log_sync_modulo(
-            log_id=log_id,
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            resultado="ERROR",
-            detalle=detalle,
-            status_code=500,
-            duracion_segundos=round(time.time() - inicio, 2),
-        )
-
-        return jsonify({
-            "error": f"Error al guardar en BD: {str(e)}",
-            "log_id": log_id,
-        }), 500
-
-    respuesta = {
-        "mensaje": f"Notas débito de compras {periodo.strftime('%m/%Y')} importadas correctamente.",
-        "archivo": filename,
-        "periodo": periodo.isoformat(),
-        "registros_detectados": len(grupos),
-        "registros_insertados": registros_insertados,
-        "registros_actualizados": registros_actualizados,
-        "registros_omitidos_fuera_periodo": registros_omitidos_fuera_periodo,
-        "filas_omitidas": filas_omitidas,
-        "errores": errores[:20],
-        "total_errores": len(errores),
-        "columnas_mapeadas": columnas,
-        "recalculo_compras": "OK",
-        "nota_tecnica": (
-            "Los ajustes quedaron guardados en siigo_compras_ajustes y reflejados "
-            "en siigo_compras.total_ajustes_debito, total_ajustado, estado_ajuste y ajustes_count."
-        ),
-        "log_id": log_id,
-    }
-
-    _finalizar_log_sync_modulo(
-        log_id=log_id,
-        idcliente=idcliente,
-        endpoint=endpoint_log,
-        resultado="OK",
-        detalle=(
-            f"Carga de notas débito finalizada correctamente. "
-            f"Periodo={periodo.isoformat()}. "
-            f"Archivo={filename}. "
-            f"Registros detectados={len(grupos)}. "
-            f"Insertados={registros_insertados}. "
-            f"Actualizados={registros_actualizados}. "
-            f"Omitidos fuera de periodo={registros_omitidos_fuera_periodo}. "
-            f"Filas omitidas={filas_omitidas}. "
-            f"Errores={len(errores)}. "
-            f"Recalculo compras=OK."
-        ),
-        status_code=200,
-        duracion_segundos=round(time.time() - inicio, 2),
-    )
-
-    return jsonify(respuesta), 200
 
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
@@ -6321,6 +5593,75 @@ def create_app():
 
 
 
+    # ======================================================
+    # Ajustes de compras por Notas Débito / Notas de ajuste
+    # ======================================================
+
+    @app.route("/siigo/recalcular-ajustes-compras", methods=["POST"])
+    @jwt_required()
+    def recalcular_ajustes_compras_endpoint():
+        import time
+        import traceback
+
+        inicio = time.time()
+        endpoint_log = "/siigo/recalcular-ajustes-compras"
+        log_id = None
+
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente asociado"}), 400
+
+        log_id = _crear_log_sync_modulo_inicio(
+            idcliente=idcliente,
+            endpoint=endpoint_log,
+            origen="manual_modulo",
+            params={},
+            mensaje="Recalculo de ajustes de compras iniciado."
+        )
+
+        try:
+            recalcular_ajustes_compras_cliente(idcliente)
+            db.session.commit()
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="OK",
+                detalle=(
+                    "Recalculo de ajustes de compras finalizado correctamente. "
+                    "Se actualizaron columnas resumen en siigo_compras."
+                ),
+                status_code=200,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
+            return jsonify({
+                "mensaje": "Ajustes de compras recalculados correctamente.",
+                "log_id": log_id,
+            }), 200
+
+        except Exception as e:
+            db.session.rollback()
+            traceback.print_exc()
+
+            _finalizar_log_sync_modulo(
+                log_id=log_id,
+                idcliente=idcliente,
+                endpoint=endpoint_log,
+                resultado="ERROR",
+                detalle=f"Error recalculando ajustes de compras: {str(e)}",
+                status_code=500,
+                duracion_segundos=round(time.time() - inicio, 2),
+            )
+
+            return jsonify({
+                "error": f"Error recalculando ajustes de compras: {str(e)}",
+                "log_id": log_id,
+            }), 500
+
 
     # --- Importar Notas Débito de Compras / Documento Soporte desde Excel ---
     @app.route("/importar/notas-debito-compras-excel", methods=["POST"])
@@ -6331,7 +5672,6 @@ def create_app():
         import traceback
         import json
         import re
-        unicodedata_importado = False
 
         from datetime import date, datetime
         from decimal import Decimal, InvalidOperation
@@ -6485,7 +5825,6 @@ def create_app():
             if not txt or txt.lower() in ["nan", "none", "null"]:
                 return None
 
-            # Pandas puede entregar Timestamp como string
             for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
                 try:
                     return datetime.strptime(txt[:10], fmt).date()
@@ -6596,7 +5935,7 @@ def create_app():
                 file.stream.seek(0)
                 df_raw = pd.read_excel(file, header=None)
 
-            # Según tu archivo: fila 8 visual = índice 7
+            # Según el archivo de Siigo: fila 8 visual = índice 7
             headers = df_raw.iloc[7].tolist()
             headers = [limpiar_texto(h) for h in headers]
 
@@ -6723,7 +6062,6 @@ def create_app():
                             "valor_iva": Decimal("0"),
                             "valor_retefuente": Decimal("0"),
                             "valor_reteica": Decimal("0"),
-                            "total_ajuste": Decimal("0"),
                             "filas": [],
                         }
 
@@ -6735,11 +6073,9 @@ def create_app():
                     if not grupo["fecha_elaboracion"] and fecha_elaboracion:
                         grupo["fecha_elaboracion"] = fecha_elaboracion
 
-                    # Normalmente las líneas de "Secuencia" son el valor base/total de la devolución.
                     if "secuencia" in tipo_registro:
                         grupo["valor_items"] += total
 
-                    # Clasificación conservadora de impuestos / retenciones.
                     texto_impuesto = f"{tipo_registro} {impuesto_nombre}"
 
                     if "iva" in texto_impuesto:
@@ -6748,13 +6084,14 @@ def create_app():
                     if "reteica" in texto_impuesto or "ica" in texto_impuesto:
                         grupo["valor_reteica"] += descuento_totales
 
-                    elif "retefuente" in texto_impuesto or "retencion" in texto_impuesto or "retención" in texto_impuesto:
+                    elif (
+                        "retefuente" in texto_impuesto
+                        or "retencion" in texto_impuesto
+                        or "retención" in texto_impuesto
+                    ):
                         grupo["valor_retefuente"] += descuento_totales
 
                     else:
-                        # En el archivo revisado, el descuento en totales venía como ReteICA.
-                        # Si Siigo trae descuento pero no trae nombre de impuesto, lo dejamos como ReteICA
-                        # para que el neto cuadre con el total real del documento.
                         if descuento_totales > 0:
                             grupo["valor_reteica"] += descuento_totales
 
@@ -6858,8 +6195,6 @@ def create_app():
                 try:
                     fecha_elaboracion = grupo["fecha_elaboracion"]
 
-                    # Control suave: si el usuario seleccionó mes/año, solo cargamos ese periodo.
-                    # Si alguna fila no trae fecha, la permitimos para no perder data.
                     if fecha_elaboracion:
                         if fecha_elaboracion.year != anio_int or fecha_elaboracion.month != mes_int:
                             registros_omitidos_fuera_periodo += 1
@@ -6921,6 +6256,9 @@ def create_app():
                         f"Nota {grupo.get('ajuste_nombre')} -> {grupo.get('documento_origen')}: {str(e)}"
                     )
 
+            # Recalcula columnas resumen en siigo_compras.
+            recalcular_ajustes_compras_cliente(idcliente)
+
             db.session.commit()
 
         except Exception as e:
@@ -6959,6 +6297,11 @@ def create_app():
             "errores": errores[:20],
             "total_errores": len(errores),
             "columnas_mapeadas": columnas,
+            "recalculo_compras": "OK",
+            "nota_tecnica": (
+                "Los ajustes quedaron guardados en siigo_compras_ajustes y reflejados "
+                "en siigo_compras.total_ajustes_debito, total_ajustado, estado_ajuste y ajustes_count."
+            ),
             "log_id": log_id,
         }
 
@@ -6976,80 +6319,14 @@ def create_app():
                 f"Actualizados={registros_actualizados}. "
                 f"Omitidos fuera de periodo={registros_omitidos_fuera_periodo}. "
                 f"Filas omitidas={filas_omitidas}. "
-                f"Errores={len(errores)}."
+                f"Errores={len(errores)}. "
+                f"Recalculo compras=OK."
             ),
             status_code=200,
             duracion_segundos=round(time.time() - inicio, 2),
         )
 
         return jsonify(respuesta), 200
-
-
-
-    @app.route("/siigo/recalcular-ajustes-compras", methods=["POST"])
-    @jwt_required()
-    def recalcular_ajustes_compras_endpoint():
-        import time
-        import traceback
-
-        inicio = time.time()
-        endpoint_log = "/siigo/recalcular-ajustes-compras"
-        log_id = None
-
-        claims = get_jwt()
-        idcliente = claims.get("idcliente")
-
-        if not idcliente:
-            return jsonify({"error": "Token sin cliente asociado"}), 400
-
-        log_id = _crear_log_sync_modulo_inicio(
-            idcliente=idcliente,
-            endpoint=endpoint_log,
-            origen="manual_modulo",
-            params={},
-            mensaje="Recalculo de ajustes de compras iniciado."
-        )
-
-        try:
-            recalcular_ajustes_compras_cliente(idcliente)
-            db.session.commit()
-
-            _finalizar_log_sync_modulo(
-                log_id=log_id,
-                idcliente=idcliente,
-                endpoint=endpoint_log,
-                resultado="OK",
-                detalle=(
-                    "Recalculo de ajustes de compras finalizado correctamente. "
-                    "Se actualizaron columnas resumen en siigo_compras."
-                ),
-                status_code=200,
-                duracion_segundos=round(time.time() - inicio, 2),
-            )
-
-            return jsonify({
-                "mensaje": "Ajustes de compras recalculados correctamente.",
-                "log_id": log_id,
-            }), 200
-
-        except Exception as e:
-            db.session.rollback()
-            traceback.print_exc()
-
-            _finalizar_log_sync_modulo(
-                log_id=log_id,
-                idcliente=idcliente,
-                endpoint=endpoint_log,
-                resultado="ERROR",
-                detalle=f"Error recalculando ajustes de compras: {str(e)}",
-                status_code=500,
-                duracion_segundos=round(time.time() - inicio, 2),
-            )
-
-            return jsonify({
-                "error": f"Error recalculando ajustes de compras: {str(e)}",
-                "log_id": log_id,
-            }), 500
 
 
 
