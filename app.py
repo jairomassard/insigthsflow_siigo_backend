@@ -15180,6 +15180,9 @@ def create_app():
         desde = request.args.get("desde", "2026-01-01")
         hasta = request.args.get("hasta", "2026-12-31")
 
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
         # 1) EVOLUCIÓN MENSUAL
         # - retefuente: todo 2365%
         # - reteica_conceptos: solo ICA operativo del período (236805%)
@@ -15196,7 +15199,7 @@ def create_app():
             AND (
                     cuenta_codigo LIKE '2365%'
                     OR cuenta_codigo LIKE '236805%'
-                )
+            )
             GROUP BY periodo_anio, periodo_mes
             ORDER BY periodo_anio, periodo_mes
         """)
@@ -15218,7 +15221,7 @@ def create_app():
             AND (
                     cuenta_codigo LIKE '2365%'
                     OR cuenta_codigo LIKE '236805%'
-                )
+            )
             GROUP BY cuenta_codigo, cuenta_nombre
             HAVING SUM(credito - debito) <> 0
             ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
@@ -15334,22 +15337,32 @@ def create_app():
 
             return "Otros"
 
-        # --- EVOLUCIÓN ---
+        # --- EVOLUCIÓN + RESUMEN POR PERIODO ---
         evolucion = []
+        resumen_por_periodo = []
         total_rf = 0.0
         total_ica_conceptos = 0.0
 
         for r in res_evo:
+            periodo = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
             rf = float(r["retefuente"] or 0)
             ica_conceptos = float(r["reteica_conceptos"] or 0)
+            total_periodo = rf + ica_conceptos
 
             total_rf += rf
             total_ica_conceptos += ica_conceptos
 
             evolucion.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+                "label": periodo,
                 "retefuente": rf,
                 "reteica_conceptos": ica_conceptos
+            })
+
+            resumen_por_periodo.append({
+                "periodo": periodo,
+                "retefuente": rf,
+                "reteica_conceptos": ica_conceptos,
+                "total_periodo": total_periodo
             })
 
         # --- COMPOSICIÓN / TABLA PRINCIPAL ---
@@ -15396,6 +15409,45 @@ def create_app():
                 "valor": valor
             })
 
+        # --- TOTALES POR PERIODO PARA TARJETAS ---
+        def construir_totales_por_periodo(rows):
+            acumulado = {}
+
+            for row in rows:
+                periodo = row["label"]
+                cuenta = row["cuenta"]
+                concepto = row["concepto"]
+                valor = float(row["valor"] or 0)
+
+                if periodo not in acumulado:
+                    acumulado[periodo] = {
+                        "periodo": periodo,
+                        "valor": 0.0,
+                        "conceptos_count": 0,
+                        "cuentas_count": 0,
+                        "_conceptos": set(),
+                        "_cuentas": set()
+                    }
+
+                acumulado[periodo]["valor"] += valor
+                acumulado[periodo]["_conceptos"].add(concepto)
+                acumulado[periodo]["_cuentas"].add(cuenta)
+
+            salida = []
+            for periodo in sorted(acumulado.keys()):
+                item = acumulado[periodo]
+                salida.append({
+                    "periodo": periodo,
+                    "valor": item["valor"],
+                    "conceptos_count": len(item["_conceptos"]),
+                    "cuentas_count": len(item["_cuentas"])
+                })
+
+            return salida
+
+        totales_ica_por_periodo = construir_totales_por_periodo(ica_detalle_mensual)
+        totales_retefuente_por_periodo = construir_totales_por_periodo(retefuente_detalle_mensual)
+
         valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
 
         return jsonify({
@@ -15405,12 +15457,20 @@ def create_app():
                 "total_general": total_rf + total_ica_conceptos
             },
             "evolucion": evolucion,
+            "resumen_por_periodo": resumen_por_periodo,
             "composicion": composicion,
             "ica_detalle_mensual": ica_detalle_mensual,
             "retefuente_detalle_mensual": retefuente_detalle_mensual,
+            "totales_ica_por_periodo": totales_ica_por_periodo,
+            "totales_retefuente_por_periodo": totales_retefuente_por_periodo,
             "referencias_contables": {
                 "cuenta_236898": valor_236898,
                 "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
+            },
+            "metadata": {
+                "desde": desde,
+                "hasta": hasta,
+                "nota_alcance": "Reporte gerencial basado en auxiliares contables cargados. No reemplaza la liquidación tributaria oficial ni la validación del contador."
             }
         }), 200
 
