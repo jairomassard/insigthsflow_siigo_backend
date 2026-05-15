@@ -10802,7 +10802,7 @@ def create_app():
         hasta = request.args.get("hasta")
         estado = request.args.get("estado")  # "pagado" | "pendiente"
 
-        condiciones = ["idcliente = :idcliente"]
+        condiciones = ["c.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
         def validar_fecha(fecha_str):
@@ -10812,59 +10812,113 @@ def create_app():
                 return None
 
         if desde and validar_fecha(desde):
-            condiciones.append("fecha >= :desde")
+            condiciones.append("c.fecha >= :desde")
             params["desde"] = desde
         if hasta and validar_fecha(hasta):
-            condiciones.append("fecha <= :hasta")
+            condiciones.append("c.fecha <= :hasta")
             params["hasta"] = hasta
 
         # --- Filtro por estado real de siigo_compras ---
         if estado:
             estado_norm = estado.strip().lower()
             if estado_norm in ["pagado", "pendiente"]:
-                condiciones.append("LOWER(estado) = :estado")
+                condiciones.append("LOWER(c.estado) = :estado")
                 params["estado"] = estado_norm
 
         where_sql = " AND ".join(condiciones)
 
         # --- Resumen por proveedor ---
+        # --- Resumen por proveedor ---
         query = f"""
             SELECT
-                COALESCE(proveedor_identificacion, '') AS proveedor_identificacion,
-                COALESCE(proveedor_nombre, '') AS proveedor_nombre,
+                COALESCE(c.proveedor_identificacion, '') AS proveedor_identificacion,
+                COALESCE(c.proveedor_nombre, '') AS proveedor_nombre,
+
                 COUNT(*) AS num_compras,
-                SUM(COALESCE(total, 0)) AS total_compras,
-                SUM(CASE WHEN estado = 'pendiente' THEN saldo ELSE 0 END) AS total_saldo,
-                MAX(fecha) AS ultima_fecha
-            FROM siigo_compras
+
+                -- Total neto ajustado por notas débito
+                SUM(COALESCE(c.total_ajustado, c.total, 0)) AS total_compras,
+
+                -- Auditoría de ajustes
+                SUM(COALESCE(c.total, 0)) AS total_original,
+                SUM(COALESCE(c.total_ajustes_debito, 0)) AS total_notas_debito,
+                SUM(
+                    CASE
+                        WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
+                        ELSE 0
+                    END
+                ) AS documentos_con_ajuste,
+
+                -- Saldo limitado al total ajustado para evitar pendientes inflados
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(c.estado, '')) = 'pendiente'
+                        THEN LEAST(
+                            COALESCE(c.saldo, 0),
+                            COALESCE(c.total_ajustado, c.total, 0)
+                        )
+                        ELSE 0
+                    END
+                ) AS total_saldo,
+
+                MAX(c.fecha) AS ultima_fecha
+
+            FROM siigo_compras c
             WHERE {where_sql}
-            GROUP BY proveedor_identificacion, proveedor_nombre
-            HAVING SUM(COALESCE(total, 0)) > 0
+            GROUP BY c.proveedor_identificacion, c.proveedor_nombre
+            HAVING SUM(COALESCE(c.total_ajustado, c.total, 0)) > 0
             ORDER BY total_compras DESC
         """
+        
         rows = db.session.execute(text(query), params).mappings().all()
         resultado = [dict(r) for r in rows]
 
         for r in resultado:
-            r["total_pagado"] = float(r["total_compras"] or 0) - float(r["total_saldo"] or 0)
+            total_compras = float(r["total_compras"] or 0)
+            total_saldo = float(r["total_saldo"] or 0)
+            r["total_pagado"] = max(total_compras - total_saldo, 0)
 
         detalle = []
         if incluir_detalle:
             query_detalle = f"""
                 SELECT
-                    idcompra,
-                    factura_proveedor,
-                    proveedor_identificacion,
-                    proveedor_nombre,
-                    fecha,
-                    vencimiento,
-                    total,
-                    saldo,
-                    estado
-                FROM siigo_compras
+                    c.idcompra,
+                    c.factura_proveedor,
+                    c.proveedor_identificacion,
+                    c.proveedor_nombre,
+                    c.fecha,
+                    c.vencimiento,
+
+                    -- Total neto ajustado para compatibilidad con el frontend actual
+                    COALESCE(c.total_ajustado, c.total, 0) AS total,
+
+                    -- Auditoría de ajustes
+                    COALESCE(c.total, 0) AS total_original,
+                    COALESCE(c.total_ajustes_debito, 0) AS total_ajustes_debito,
+                    COALESCE(c.total_ajustado, c.total, 0) AS total_ajustado,
+                    COALESCE(c.estado_ajuste, 'sin_ajuste') AS estado_ajuste,
+                    COALESCE(c.ajustes_count, 0) AS ajustes_count,
+
+                    -- Saldo limitado al total ajustado
+                    LEAST(
+                        COALESCE(c.saldo, 0),
+                        COALESCE(c.total_ajustado, c.total, 0)
+                    ) AS saldo,
+
+                    CASE
+                        WHEN COALESCE(c.total_ajustado, c.total, 0) = 0 THEN 'pagado'
+                        WHEN COALESCE(c.saldo, 0) <= 0 THEN 'pagado'
+                        WHEN COALESCE(c.saldo, 0) >= COALESCE(c.total_ajustado, c.total, 0) THEN 'pendiente'
+                        ELSE 'parcial'
+                    END AS estado,
+
+                    COALESCE(c.estado, '') AS estado_original
+
+                FROM siigo_compras c
                 WHERE {where_sql}
-                ORDER BY proveedor_nombre, fecha DESC
+                ORDER BY c.proveedor_nombre, c.fecha DESC
             """
+
             rows_detalle = db.session.execute(text(query_detalle), params).mappings().all()
             detalle = [dict(r) for r in rows_detalle]
 
@@ -11863,7 +11917,7 @@ def create_app():
             ORDER BY total DESC
             LIMIT 10
         """)
-        
+
         top_proveedores = [
             dict(r) for r in db.session.execute(sql_top_proveedores, params_egr).mappings().all()
         ]
