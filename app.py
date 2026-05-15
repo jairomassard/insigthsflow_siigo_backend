@@ -11590,8 +11590,25 @@ def create_app():
         sql_egresos = text(f"""
             SELECT
                 date_trunc('month', c.fecha)::date AS mes,
-                COALESCE(SUM(c.total), 0) AS egresos,
-                COUNT(*) AS facturas_compra
+
+                -- Egresos netos ajustados por notas débito de compras
+                COALESCE(SUM(COALESCE(c.total_ajustado, c.total, 0)), 0) AS egresos,
+
+                -- Auditoría: cuánto era antes de ajustes
+                COALESCE(SUM(COALESCE(c.total, 0)), 0) AS egresos_originales,
+
+                -- Auditoría: cuánto se descontó por notas débito
+                COALESCE(SUM(COALESCE(c.total_ajustes_debito, 0)), 0) AS notas_debito_compras,
+
+                COUNT(*) AS facturas_compra,
+
+                SUM(
+                    CASE
+                        WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
+                        ELSE 0
+                    END
+                ) AS documentos_compra_con_ajuste
+
             FROM siigo_compras c
             WHERE {where_egr}
             GROUP BY date_trunc('month', c.fecha)::date
@@ -11649,6 +11666,10 @@ def create_app():
         total_facturas_emitidas = 0
         total_notas_credito = 0
         total_egresos = 0
+        total_egresos_originales = 0
+        total_notas_debito_compras = 0
+        total_documentos_compra_con_ajuste = 0
+
         total_nomina = 0
         facturas_venta = 0
         facturas_compra = 0
@@ -11668,7 +11689,10 @@ def create_app():
 
             egr = egresos_dict.get(mes, {
                 "egresos": 0,
+                "egresos_originales": 0,
+                "notas_debito_compras": 0,
                 "facturas_compra": 0,
+                "documentos_compra_con_ajuste": 0,
             })
 
             nom = nomina_dict.get(mes, {
@@ -11682,6 +11706,10 @@ def create_app():
             notas_credito = ing["notas_credito"] or 0
 
             egresos_base = egr["egresos"] or 0
+            egresos_originales = egr["egresos_originales"] or 0
+            notas_debito_compras = egr["notas_debito_compras"] or 0
+            documentos_compra_con_ajuste = egr["documentos_compra_con_ajuste"] or 0
+
             nomina_mes = nom["nomina"] or 0
             egresos = egresos_base + nomina_mes
 
@@ -11705,7 +11733,15 @@ def create_app():
                 "notas_credito": notas_credito,
 
                 "egresos": egresos,
+
+                # Compras/gastos netos ajustados por notas débito
                 "egresos_base": egresos_base,
+
+                # Auditoría de ajustes de compras
+                "egresos_originales": egresos_originales,
+                "notas_debito_compras": notas_debito_compras,
+                "documentos_compra_con_ajuste": documentos_compra_con_ajuste,
+
                 "nomina": nomina_mes,
 
                 "utilidad": utilidad,
@@ -11723,6 +11759,10 @@ def create_app():
             total_facturas_emitidas += facturas_emitidas
             total_notas_credito += notas_credito
             total_egresos += egresos
+            total_egresos_originales += egresos_originales + nomina_mes
+            total_notas_debito_compras += notas_debito_compras
+            total_documentos_compra_con_ajuste += documentos_compra_con_ajuste
+
             total_nomina += nomina_mes
             facturas_venta += ing["facturas_venta"] or 0
             notas_credito_count += ing["notas_credito_count"] or 0
@@ -11748,6 +11788,12 @@ def create_app():
             "notas_credito": total_notas_credito,
 
             "egresos": total_egresos,
+
+            # Auditoría de egresos ajustados por notas débito
+            "egresos_originales": total_egresos_originales,
+            "notas_debito_compras": total_notas_debito_compras,
+            "documentos_compra_con_ajuste": total_documentos_compra_con_ajuste,
+
             "nomina": total_nomina,
             "utilidad": utilidad_total,
             "margen": round(margen_total, 2),
@@ -11796,14 +11842,28 @@ def create_app():
         sql_top_proveedores = text(f"""
             SELECT
                 COALESCE(c.proveedor_nombre, 'Sin proveedor') AS nombre,
-                COALESCE(SUM(c.total), 0) AS total
+
+                -- Total neto ajustado para ranking
+                COALESCE(SUM(COALESCE(c.total_ajustado, c.total, 0)), 0) AS total,
+
+                -- Auditoría
+                COALESCE(SUM(COALESCE(c.total, 0)), 0) AS total_original,
+                COALESCE(SUM(COALESCE(c.total_ajustes_debito, 0)), 0) AS total_notas_debito,
+
+                SUM(
+                    CASE
+                        WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
+                        ELSE 0
+                    END
+                ) AS documentos_con_ajuste
+
             FROM siigo_compras c
             WHERE {where_egr}
             GROUP BY COALESCE(c.proveedor_nombre, 'Sin proveedor')
             ORDER BY total DESC
             LIMIT 10
         """)
-
+        
         top_proveedores = [
             dict(r) for r in db.session.execute(sql_top_proveedores, params_egr).mappings().all()
         ]
