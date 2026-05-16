@@ -2577,6 +2577,475 @@ def recalcular_ajustes_compras_cliente(idcliente):
 
 
 
+
+# Helpers de la pagina de Indicadores financieros
+#_________________________________________________________________
+
+# ============================================================
+# HELPERS DE CONFIGURACIÓN FINANCIERA
+# ============================================================
+
+INDICADORES_CONFIG_FIELDS = [
+    "liquidez_min",
+    "liquidez_max",
+    "apalancamiento_max",
+    "rentabilidad_min",
+    "autonomia_min",
+    "solvencia_min",
+    "cobertura_activo_pasivo_min",
+    "capital_trabajo_min",
+    "porcentaje_pasivo_corto_max",
+    "porcentaje_activo_no_corriente_max",
+    "endeudamiento_largo_plazo_max",
+]
+
+
+def _to_float_or_none(value):
+    """
+    Convierte valores recibidos desde frontend a float o None.
+    Permite que el modal envíe strings vacíos sin romper el backend.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return None
+        value = value.replace(",", ".")
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalizar_bool(value, default=True):
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "t", "yes", "si", "sí", "activo")
+
+    return bool(value)
+
+
+def obtener_config_indicadores_financieros(idcliente):
+    """
+    Retorna la configuración financiera activa del cliente.
+    Si no existe, retorna None.
+    """
+    sql = text("""
+        SELECT
+            id,
+            idcliente,
+            activo,
+            liquidez_min,
+            liquidez_max,
+            apalancamiento_max,
+            rentabilidad_min,
+            autonomia_min,
+            solvencia_min,
+            cobertura_activo_pasivo_min,
+            capital_trabajo_min,
+            porcentaje_pasivo_corto_max,
+            porcentaje_activo_no_corriente_max,
+            endeudamiento_largo_plazo_max,
+            creado_por,
+            actualizado_por,
+            created_at,
+            updated_at
+        FROM indicadores_financieros_config
+        WHERE idcliente = :idcliente
+        LIMIT 1
+    """)
+
+    row = db.session.execute(sql, {"idcliente": idcliente}).mappings().first()
+
+    if not row:
+        return None
+
+    config = dict(row)
+
+    # Normalizar fechas a string para JSON
+    for campo_fecha in ("created_at", "updated_at"):
+        if config.get(campo_fecha) is not None:
+            config[campo_fecha] = str(config[campo_fecha])
+
+    return config
+
+
+def guardar_config_indicadores_financieros(idcliente, payload, idusuario=None):
+    """
+    Crea o actualiza la configuración financiera del cliente.
+    Usa ON CONFLICT(idcliente), por eso la tabla debe tener UNIQUE(idcliente).
+    """
+    data = {
+        "idcliente": idcliente,
+        "activo": _normalizar_bool(payload.get("activo"), True),
+        "creado_por": idusuario,
+        "actualizado_por": idusuario,
+    }
+
+    for field in INDICADORES_CONFIG_FIELDS:
+        data[field] = _to_float_or_none(payload.get(field))
+
+    sql = text("""
+        INSERT INTO indicadores_financieros_config (
+            idcliente,
+            activo,
+            liquidez_min,
+            liquidez_max,
+            apalancamiento_max,
+            rentabilidad_min,
+            autonomia_min,
+            solvencia_min,
+            cobertura_activo_pasivo_min,
+            capital_trabajo_min,
+            porcentaje_pasivo_corto_max,
+            porcentaje_activo_no_corriente_max,
+            endeudamiento_largo_plazo_max,
+            creado_por,
+            actualizado_por,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :idcliente,
+            :activo,
+            :liquidez_min,
+            :liquidez_max,
+            :apalancamiento_max,
+            :rentabilidad_min,
+            :autonomia_min,
+            :solvencia_min,
+            :cobertura_activo_pasivo_min,
+            :capital_trabajo_min,
+            :porcentaje_pasivo_corto_max,
+            :porcentaje_activo_no_corriente_max,
+            :endeudamiento_largo_plazo_max,
+            :creado_por,
+            :actualizado_por,
+            NOW(),
+            NOW()
+        )
+        ON CONFLICT (idcliente)
+        DO UPDATE SET
+            activo = EXCLUDED.activo,
+            liquidez_min = EXCLUDED.liquidez_min,
+            liquidez_max = EXCLUDED.liquidez_max,
+            apalancamiento_max = EXCLUDED.apalancamiento_max,
+            rentabilidad_min = EXCLUDED.rentabilidad_min,
+            autonomia_min = EXCLUDED.autonomia_min,
+            solvencia_min = EXCLUDED.solvencia_min,
+            cobertura_activo_pasivo_min = EXCLUDED.cobertura_activo_pasivo_min,
+            capital_trabajo_min = EXCLUDED.capital_trabajo_min,
+            porcentaje_pasivo_corto_max = EXCLUDED.porcentaje_pasivo_corto_max,
+            porcentaje_activo_no_corriente_max = EXCLUDED.porcentaje_activo_no_corriente_max,
+            endeudamiento_largo_plazo_max = EXCLUDED.endeudamiento_largo_plazo_max,
+            actualizado_por = EXCLUDED.actualizado_por,
+            updated_at = NOW()
+    """)
+
+    db.session.execute(sql, data)
+    db.session.commit()
+
+    return obtener_config_indicadores_financieros(idcliente)
+
+
+def config_tiene_parametros_utiles(config):
+    """
+    Determina si la empresa realmente configuró al menos un umbral.
+    No basta con que exista la fila. Debe tener al menos un parámetro financiero.
+    """
+    if not config:
+        return False
+
+    if not config.get("activo", True):
+        return False
+
+    for field in INDICADORES_CONFIG_FIELDS:
+        if config.get(field) is not None:
+            return True
+
+    return False
+
+
+def _evaluar_indicador(valor, minimo=None, maximo=None):
+    """
+    Evalúa un indicador contra umbrales definidos por la empresa.
+    No usa reglas universales. Solo compara contra lo configurado.
+    """
+    if valor is None:
+        return {
+            "estado": "sin_dato",
+            "severidad": "neutral",
+            "texto": "No hay información suficiente para calcular este indicador.",
+            "valor": valor,
+            "minimo": minimo,
+            "maximo": maximo,
+        }
+
+    if minimo is None and maximo is None:
+        return {
+            "estado": "sin_parametro",
+            "severidad": "neutral",
+            "texto": "Indicador calculado sin parámetro empresarial configurado.",
+            "valor": valor,
+            "minimo": minimo,
+            "maximo": maximo,
+        }
+
+    if minimo is not None and valor < minimo:
+        return {
+            "estado": "por_debajo",
+            "severidad": "warning",
+            "texto": "Por debajo del mínimo definido por la empresa.",
+            "valor": valor,
+            "minimo": minimo,
+            "maximo": maximo,
+        }
+
+    if maximo is not None and valor > maximo:
+        return {
+            "estado": "por_encima",
+            "severidad": "warning",
+            "texto": "Por encima del máximo definido por la empresa.",
+            "valor": valor,
+            "minimo": minimo,
+            "maximo": maximo,
+        }
+
+    return {
+        "estado": "dentro_rango",
+        "severidad": "ok",
+        "texto": "Dentro del rango configurado por la empresa.",
+        "valor": valor,
+        "minimo": minimo,
+        "maximo": maximo,
+    }
+
+
+def construir_interpretaciones_neutrales(indicadores):
+    """
+    Modo sin parametrización:
+    no se emite juicio financiero.
+    """
+    texto = (
+        "Indicador calculado. Su lectura debe realizarse según la industria, "
+        "el modelo operativo y los criterios financieros definidos por la empresa."
+    )
+
+    return {
+        key: texto
+        for key in indicadores.keys()
+    }
+
+
+def construir_interpretaciones_detalle_neutrales(indicadores):
+    """
+    Estructura compatible para frontend, pero sin semáforo de dictamen.
+    """
+    detalle = {}
+
+    for key, value in indicadores.items():
+        detalle[key] = {
+            "estado": "sin_parametros",
+            "severidad": "neutral",
+            "texto": (
+                "Sin parámetros empresariales configurados. "
+                "InsightFlow muestra este indicador de forma informativa, sin dictamen automático."
+            ),
+            "valor": value,
+            "minimo": None,
+            "maximo": None,
+        }
+
+    return detalle
+
+
+def interpretar_indicadores_con_parametros(indicadores, config):
+    """
+    Modo parametrizado:
+    evalúa indicadores solo contra los umbrales definidos por la empresa.
+    """
+    detalle = {}
+
+    detalle["liquidez"] = _evaluar_indicador(
+        indicadores.get("liquidez"),
+        minimo=config.get("liquidez_min"),
+        maximo=config.get("liquidez_max"),
+    )
+
+    detalle["apalancamiento"] = _evaluar_indicador(
+        indicadores.get("apalancamiento"),
+        minimo=None,
+        maximo=config.get("apalancamiento_max"),
+    )
+
+    detalle["rentabilidad"] = _evaluar_indicador(
+        indicadores.get("rentabilidad"),
+        minimo=config.get("rentabilidad_min"),
+        maximo=None,
+    )
+
+    detalle["autonomia"] = _evaluar_indicador(
+        indicadores.get("autonomia"),
+        minimo=config.get("autonomia_min"),
+        maximo=None,
+    )
+
+    detalle["solvencia"] = _evaluar_indicador(
+        indicadores.get("solvencia"),
+        minimo=config.get("solvencia_min"),
+        maximo=None,
+    )
+
+    detalle["cobertura_activo_pasivo"] = _evaluar_indicador(
+        indicadores.get("cobertura_activo_pasivo"),
+        minimo=config.get("cobertura_activo_pasivo_min"),
+        maximo=None,
+    )
+
+    detalle["capital_trabajo"] = _evaluar_indicador(
+        indicadores.get("capital_trabajo"),
+        minimo=config.get("capital_trabajo_min"),
+        maximo=None,
+    )
+
+    detalle["porcentaje_pasivo_corto"] = _evaluar_indicador(
+        indicadores.get("porcentaje_pasivo_corto"),
+        minimo=None,
+        maximo=config.get("porcentaje_pasivo_corto_max"),
+    )
+
+    detalle["porcentaje_activo_no_corriente"] = _evaluar_indicador(
+        indicadores.get("porcentaje_activo_no_corriente"),
+        minimo=None,
+        maximo=config.get("porcentaje_activo_no_corriente_max"),
+    )
+
+    detalle["endeudamiento_largo_plazo"] = _evaluar_indicador(
+        indicadores.get("endeudamiento_largo_plazo"),
+        minimo=None,
+        maximo=config.get("endeudamiento_largo_plazo_max"),
+    )
+
+    # Para cifras base que no son indicadores de juicio, mantener lectura neutral.
+    campos_neutrales = [
+        "activo_total",
+        "pasivo_total",
+        "patrimonio",
+        "ingresos",
+        "costos",
+        "gastos",
+        "utilidad_neta",
+        "activo_corriente",
+        "activo_no_corriente",
+        "pasivo_corto",
+        "pasivo_largo",
+    ]
+
+    for key in campos_neutrales:
+        detalle[key] = {
+            "estado": "dato_base",
+            "severidad": "neutral",
+            "texto": "Dato base calculado desde la información contable cargada.",
+            "valor": indicadores.get(key),
+            "minimo": None,
+            "maximo": None,
+        }
+
+    return detalle
+
+
+def construir_conclusiones_parametrizadas(interpretaciones_detalle):
+    """
+    Genera conclusiones solo con base en parámetros definidos por la empresa.
+    No usa rangos genéricos de InsightFlow.
+    """
+    conclusiones = []
+
+    labels = {
+        "liquidez": "Liquidez corriente",
+        "apalancamiento": "Apalancamiento",
+        "rentabilidad": "Rentabilidad neta",
+        "autonomia": "Autonomía financiera",
+        "solvencia": "Solvencia",
+        "cobertura_activo_pasivo": "Cobertura activo/pasivo",
+        "capital_trabajo": "Capital de trabajo",
+        "porcentaje_pasivo_corto": "Pasivo de corto plazo",
+        "porcentaje_activo_no_corriente": "Activo no corriente",
+        "endeudamiento_largo_plazo": "Endeudamiento de largo plazo",
+    }
+
+    for key, item in interpretaciones_detalle.items():
+        if key not in labels:
+            continue
+
+        estado = item.get("estado")
+        texto = item.get("texto")
+
+        if estado in ("por_debajo", "por_encima"):
+            conclusiones.append(
+                f"⚠ {labels[key]}: {texto}"
+            )
+
+    if not conclusiones:
+        conclusiones.append(
+            "Los indicadores parametrizados se encuentran dentro de los rangos definidos por la empresa o no presentan alertas configuradas."
+        )
+
+    return conclusiones
+
+
+def neutralizar_resumen_balance_si_aplica(resumen_balance, parametros_configurados):
+    """
+    Evita que resúmenes ejecutivos heredados del balance emitan dictámenes genéricos
+    cuando la empresa no ha definido parámetros propios.
+    """
+    if parametros_configurados:
+        return resumen_balance
+
+    if not isinstance(resumen_balance, dict):
+        return resumen_balance
+
+    resumen_limpio = dict(resumen_balance)
+
+    # Si el helper de balance trae narrativas/alertas/conclusiones,
+    # se limpian para evitar dictámenes genéricos.
+    for key in [
+        "narrativa",
+        "alertas",
+        "conclusiones",
+        "diagnostico",
+        "diagnóstico",
+        "interpretacion",
+        "interpretación",
+        "lectura",
+    ]:
+        if key in resumen_limpio:
+            if isinstance(resumen_limpio[key], list):
+                resumen_limpio[key] = []
+            elif isinstance(resumen_limpio[key], dict):
+                resumen_limpio[key] = {}
+            else:
+                resumen_limpio[key] = None
+
+    resumen_limpio["nota_interpretacion"] = (
+        "La lectura ejecutiva automática se encuentra desactivada porque "
+        "la empresa no ha configurado parámetros financieros propios. "
+        "Los datos se muestran de forma informativa."
+    )
+
+    return resumen_limpio
+
+
+
+
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
 #---------------------------------------------------------------------------------------------------------
@@ -16102,6 +16571,93 @@ def create_app():
 
     # ----------------------------------------------------------
     # Indicadores financieros construidos desde AuxiliarContable
+
+    # ============================================================
+    # ENDPOINT: CONSULTAR CONFIGURACIÓN
+    # ============================================================
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/config", methods=["GET"])
+    @jwt_required()
+    def get_indicadores_financieros_config():
+        try:
+            claims = get_jwt()
+            idcliente = claims.get("idcliente")
+
+            if not idcliente:
+                return jsonify({"error": "No autorizado"}), 403
+
+            config = obtener_config_indicadores_financieros(idcliente)
+            parametros_configurados = config_tiene_parametros_utiles(config)
+
+            return jsonify({
+                "ok": True,
+                "config": config,
+                "parametros_configurados": parametros_configurados,
+                "modo_interpretacion": "parametrizado" if parametros_configurados else "sin_parametros",
+                "nota": (
+                    "Cuando no existen parámetros financieros configurados, "
+                    "InsightFlow muestra los indicadores sin dictamen automático."
+                )
+            }), 200
+
+        except Exception as e:
+            current_app.logger.exception("Error consultando configuración de indicadores financieros")
+            return jsonify({
+                "ok": False,
+                "error": "No fue posible consultar la configuración financiera",
+                "detalle": str(e)
+            }), 500
+
+
+    # ============================================================
+    # ENDPOINT: GUARDAR / ACTUALIZAR CONFIGURACIÓN
+    # ============================================================
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/config", methods=["POST"])
+    @jwt_required()
+    def post_indicadores_financieros_config():
+        try:
+            claims = get_jwt()
+            idcliente = claims.get("idcliente")
+            idusuario = claims.get("idusuario") or claims.get("sub")
+
+            if not idcliente:
+                return jsonify({"error": "No autorizado"}), 403
+
+            payload = request.get_json(silent=True) or {}
+
+            config = guardar_config_indicadores_financieros(
+                idcliente=idcliente,
+                payload=payload,
+                idusuario=idusuario
+            )
+
+            parametros_configurados = config_tiene_parametros_utiles(config)
+
+            return jsonify({
+                "ok": True,
+                "message": "Configuración financiera guardada correctamente.",
+                "config": config,
+                "parametros_configurados": parametros_configurados,
+                "modo_interpretacion": "parametrizado" if parametros_configurados else "sin_parametros"
+            }), 200
+
+        except Exception as e:
+            current_app.logger.exception("Error guardando configuración de indicadores financieros")
+            db.session.rollback()
+            return jsonify({
+                "ok": False,
+                "error": "No fue posible guardar la configuración financiera",
+                "detalle": str(e)
+            }), 500
+
+
+    # ============================================================
+    # ENDPOINT PRINCIPAL:
+    # Indicadores financieros construidos desde AuxiliarContable
+    # Conserva la lógica anterior + parametrización
+    # ============================================================
+
     @app.route("/reportes/auxiliares/indicadores-financieros", methods=["GET"])
     @jwt_required()
     def indicadores_financieros_auxiliares():
@@ -16124,13 +16680,20 @@ def create_app():
 
         try:
             # --------------------------------------------------
+            # 0) Configuración financiera del cliente
+            # --------------------------------------------------
+            config_financiera = obtener_config_indicadores_financieros(idcliente)
+            parametros_configurados = config_tiene_parametros_utiles(config_financiera)
+            modo_interpretacion = "parametrizado" if parametros_configurados else "sin_parametros"
+
+            # --------------------------------------------------
             # 1) Snapshot del balance al corte final del período
             # --------------------------------------------------
             regenerar_snapshot_saldos_corte(idcliente, str(fecha_hasta))
 
             # --------------------------------------------------
             # 2) Balance general al corte final
-            #    Ojo: esto es acumulado hasta la fecha de corte.
+            #    Esto es acumulado hasta la fecha de corte.
             # --------------------------------------------------
             balance = construir_balance_general(idcliente, str(fecha_hasta))
             if not balance.get("ok"):
@@ -16141,6 +16704,12 @@ def create_app():
             bk = balance.get("kpis", {})
             meta_balance = balance.get("meta", {})
             resumen_balance = balance.get("resumen", {})
+
+            # Neutralizar narrativas genéricas si no hay parámetros
+            resumen_balance = neutralizar_resumen_balance_si_aplica(
+                resumen_balance,
+                parametros_configurados
+            )
 
             # --------------------------------------------------
             # 3) P&L del período seleccionado
@@ -16218,27 +16787,63 @@ def create_app():
             }
 
             # =========================
-            # Interpretaciones
+            # Explicaciones conceptuales neutrales
             # =========================
-            interpretaciones = {
-                k: interpretar_indicador(k, v) for k, v in indicadores.items()
+            explicaciones = {
+                "liquidez": "Activo corriente / Pasivo corriente. Mide cuántas veces el activo corriente cubre el pasivo corriente.",
+                "apalancamiento": "Pasivo total / Activo total. Mide qué proporción de los activos está financiada con deuda.",
+                "rentabilidad": "Utilidad neta / Ingresos. Mide el margen neto del período seleccionado.",
+                "capital_trabajo": "Activo corriente - Pasivo corriente. Mide la diferencia entre recursos corrientes y obligaciones corrientes.",
+                "solvencia": "Activo total / Pasivo total. Mide la cobertura general de pasivos con activos.",
+                "autonomia": "Patrimonio / Activo total. Mide qué proporción de la empresa está financiada con recursos propios.",
+                "porcentaje_pasivo_corto": "Pasivo corriente / Pasivo total. Mide la concentración de obligaciones en el corto plazo.",
+                "porcentaje_activo_no_corriente": "Activo no corriente / Activo total. Mide la proporción de activos menos líquidos o de permanencia.",
+                "cobertura_activo_pasivo": "Activo total / Pasivo total. Mide la relación global entre activos y pasivos.",
+                "endeudamiento_largo_plazo": "Pasivo no corriente / Patrimonio. Mide la relación entre deuda de largo plazo y capital propio.",
+                "activo_total": "Total de recursos controlados por la empresa al corte final.",
+                "pasivo_total": "Total de obligaciones con terceros al corte final.",
+                "patrimonio": "Recursos propios o acumulados de la empresa al corte final.",
+                "ingresos": "Ingresos del período seleccionado.",
+                "costos": "Costos del período seleccionado.",
+                "gastos": "Gastos del período seleccionado.",
+                "utilidad_neta": "Resultado neto del período analizado.",
+                "activo_corriente": "Recursos líquidos o realizables en el corto plazo.",
+                "activo_no_corriente": "Activos de permanencia o recuperación a largo plazo.",
+                "pasivo_corto": "Obligaciones exigibles en el corto plazo.",
+                "pasivo_largo": "Obligaciones exigibles a largo plazo.",
             }
 
-            explicaciones = {
-                "liquidez": "Activo corriente / Pasivo corriente. Mide capacidad para cubrir obligaciones de corto plazo.",
-                "apalancamiento": "Pasivo total / Activo total. Mide qué proporción de los activos está financiada con deuda.",
-                "rentabilidad": "Utilidad neta / Ingresos. Mide el margen neto del período.",
-                "capital_trabajo": "Activo corriente - Pasivo corriente. Mide el colchón operativo de corto plazo.",
-                "solvencia": "Activo total / Pasivo total. Evalúa cobertura general de deudas con activos.",
-                "autonomia": "Patrimonio / Activo total. Mide qué tanto de la empresa está financiado con recursos propios.",
-                "porcentaje_pasivo_corto": "Pasivo corriente / Pasivo total. Mide concentración de deuda en el corto plazo.",
-                "porcentaje_activo_no_corriente": "Activo no corriente / Activo total. Mide proporción de activos menos líquidos.",
-                "cobertura_activo_pasivo": "Activo total / Pasivo total. Cobertura global de pasivos.",
-                "endeudamiento_largo_plazo": "Pasivo no corriente / Patrimonio. Mide presión financiera de largo plazo frente al capital propio.",
-            }
+            # =========================
+            # Interpretaciones
+            # =========================
+            if parametros_configurados:
+                interpretaciones_detalle = interpretar_indicadores_con_parametros(
+                    indicadores,
+                    config_financiera
+                )
+
+                interpretaciones = {
+                    k: v.get("texto")
+                    for k, v in interpretaciones_detalle.items()
+                }
+
+                conclusiones = construir_conclusiones_parametrizadas(
+                    interpretaciones_detalle
+                )
+            else:
+                interpretaciones_detalle = construir_interpretaciones_detalle_neutrales(
+                    indicadores
+                )
+
+                interpretaciones = construir_interpretaciones_neutrales(
+                    indicadores
+                )
+
+                conclusiones = []
 
             # =========================
             # Resumen técnico
+            # Mantiene la estructura anterior, pero sin dictamen.
             # =========================
             resumen_financiero = [
                 {
@@ -16313,56 +16918,25 @@ def create_app():
                 })
 
             # =========================
-            # Diagnóstico ejecutivo corto
+            # Respuesta
             # =========================
-            conclusiones = []
-
-            if liquidez is not None:
-                if liquidez < 1:
-                    conclusiones.append("⚠ Riesgo de iliquidez: el activo corriente no cubre el pasivo de corto plazo.")
-                elif liquidez > 3:
-                    conclusiones.append("⚠ Exceso de liquidez: podría existir capital ocioso o baja eficiencia en el uso de recursos.")
-                else:
-                    conclusiones.append("✅ La liquidez luce saludable para atender compromisos de corto plazo.")
-
-            if apalancamiento is not None:
-                if apalancamiento > 0.8:
-                    conclusiones.append("⚠ El apalancamiento es alto: una parte importante de los activos está financiada con deuda.")
-                elif apalancamiento > 0.6:
-                    conclusiones.append("• El apalancamiento es moderado y conviene seguir monitoreándolo.")
-                else:
-                    conclusiones.append("✅ La estructura de endeudamiento luce controlada.")
-
-            if rentabilidad is not None:
-                if rentabilidad < 0:
-                    conclusiones.append("🔻 La empresa presenta pérdida neta en el período analizado.")
-                elif rentabilidad < 0.1:
-                    conclusiones.append("• La empresa genera utilidad, pero con margen neto bajo.")
-                else:
-                    conclusiones.append("✅ La rentabilidad neta del período es positiva y saludable.")
-
-            if autonomia is not None:
-                if autonomia < 0.3:
-                    conclusiones.append("⚠ La autonomía financiera es baja y existe fuerte dependencia de terceros.")
-                elif autonomia < 0.5:
-                    conclusiones.append("• La autonomía financiera es moderada.")
-                else:
-                    conclusiones.append("✅ La autonomía financiera es sólida.")
-
-            if patrimonio <= 0:
-                conclusiones.append("❗ El patrimonio es nulo o negativo, situación que requiere revisión prioritaria.")
-
             return jsonify({
                 "resumen_financiero": resumen_financiero,
                 "indicadores": indicadores,
                 "explicaciones": explicaciones,
                 "interpretaciones": interpretaciones,
+                "interpretaciones_detalle": interpretaciones_detalle,
                 "conclusiones": conclusiones,
                 "evolucion_mensual": evolucion_mensual,
 
-                # NUEVO: estos dos son clave para traer la interpretación ejecutiva real del balance
+                # Se conservan los datos del endpoint anterior
                 "meta_balance": meta_balance,
                 "resumen_balance": resumen_balance,
+
+                # Nueva capa de configuración
+                "config_financiera": config_financiera,
+                "parametros_configurados": parametros_configurados,
+                "modo_interpretacion": modo_interpretacion,
 
                 "meta": {
                     "fuente": "auxiliar_contable",
@@ -16374,7 +16948,14 @@ def create_app():
                     "fecha_corte_balance": str(fecha_hasta),
                     "logica_balance": "acumulado_al_corte",
                     "logica_pnl": "movimientos_del_periodo",
-                    "nota": "Los indicadores de balance se calculan con saldos acumulados al corte final; la utilidad y la rentabilidad se calculan sobre el período seleccionado."
+                    "nota": (
+                        "Los indicadores de balance se calculan con saldos acumulados al corte final; "
+                        "la utilidad y la rentabilidad se calculan sobre el período seleccionado. "
+                        "Cuando no existen parámetros financieros configurados, InsightFlow muestra "
+                        "los indicadores sin dictamen automático."
+                    ),
+                    "modo_interpretacion": modo_interpretacion,
+                    "parametros_configurados": parametros_configurados
                 }
             }), 200
 
