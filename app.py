@@ -17379,6 +17379,41 @@ def create_app():
             )
 
             # =========================================================
+            # NORMALIZACIÓN DEFENSIVA DEL RUNWAY
+            # =========================================================
+            # Regla: si el backend calcula meses de autonomía, también debe exponer
+            # el gasto promedio usado para calcularlos.
+            try:
+                caja_actual = _safe_float(caja_info.get("actual", 0)) if isinstance(caja_info, dict) else 0
+                runway_meses = _safe_float(runway_info.get("actual", 0)) if isinstance(runway_info, dict) else 0
+
+                burn_promedio = 0
+
+                if isinstance(runway_info, dict):
+                    burn_promedio = _safe_float(
+                        runway_info.get("burn_promedio_3m")
+                        or runway_info.get("burn_promedio")
+                        or runway_info.get("gasto_promedio")
+                        or runway_info.get("gasto_promedio_3m")
+                        or runway_info.get("egresos_promedio")
+                        or runway_info.get("egresos_promedio_3m")
+                        or 0
+                    )
+
+                # Si hay meses y caja, pero no llegó el gasto promedio,
+                # lo reconstruimos con la misma fórmula: gasto = caja / meses.
+                if burn_promedio <= 0 and caja_actual > 0 and runway_meses > 0:
+                    burn_promedio = caja_actual / runway_meses
+
+                if isinstance(runway_info, dict):
+                    runway_info["burn_promedio_3m"] = _round2(burn_promedio)
+                    runway_info["gasto_promedio_3m"] = _round2(burn_promedio)
+                    runway_info["meses_promedio"] = int(config.get("meses_promedio_runway") or 3) if config else 3
+                    runway_info["formula"] = "autonomia_caja = caja_disponible / gasto_promedio"
+            except Exception as e:
+                print("WARN normalizando runway_info:", str(e))
+
+            # =========================================================
             # 6. TOP GASTOS
             # =========================================================
             top_gastos_limite = int(config.get("top_gastos") or 5) if config else 5
