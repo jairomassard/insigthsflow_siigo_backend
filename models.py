@@ -1110,3 +1110,85 @@ class SiigoDocumentoSoporteApiStaging(db.Model):
 
     created_siigo = db.Column(db.DateTime)
     synced_at = db.Column(db.DateTime, server_default=db.func.now())
+
+
+
+class IndicadoresFinancierosConfig(db.Model):
+    __tablename__ = "indicadores_financieros_config"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    idcliente = db.Column(
+        db.Integer,
+        db.ForeignKey("clientes.idcliente", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    activo = db.Column(db.Boolean, nullable=False, default=True)
+
+    # Liquidez
+    liquidez_min = db.Column(db.Numeric(18, 4))
+    liquidez_max = db.Column(db.Numeric(18, 4))
+
+    # Endeudamiento / apalancamiento
+    apalancamiento_max = db.Column(db.Numeric(18, 4))
+    endeudamiento_largo_plazo_max = db.Column(db.Numeric(18, 4))
+
+    # Rentabilidad
+    rentabilidad_min = db.Column(db.Numeric(18, 4))
+
+    # Solvencia / autonomía
+    autonomia_min = db.Column(db.Numeric(18, 4))
+    solvencia_min = db.Column(db.Numeric(18, 4))
+    cobertura_activo_pasivo_min = db.Column(db.Numeric(18, 4))
+
+    # Capital de trabajo
+    capital_trabajo_min = db.Column(db.Numeric(18, 2))
+
+    # Composición del balance
+    porcentaje_pasivo_corto_max = db.Column(db.Numeric(18, 4))
+    porcentaje_activo_no_corriente_max = db.Column(db.Numeric(18, 4))
+
+    # Auditoría
+    creado_por = db.Column(db.Integer)
+    actualizado_por = db.Column(db.Integer)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "idcliente",
+            name="uq_indicadores_financieros_config_idcliente"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "idcliente": self.idcliente,
+            "activo": self.activo,
+
+            "liquidez_min": float(self.liquidez_min) if self.liquidez_min is not None else None,
+            "liquidez_max": float(self.liquidez_max) if self.liquidez_max is not None else None,
+            "apalancamiento_max": float(self.apalancamiento_max) if self.apalancamiento_max is not None else None,
+            "rentabilidad_min": float(self.rentabilidad_min) if self.rentabilidad_min is not None else None,
+            "autonomia_min": float(self.autonomia_min) if self.autonomia_min is not None else None,
+            "solvencia_min": float(self.solvencia_min) if self.solvencia_min is not None else None,
+            "cobertura_activo_pasivo_min": float(self.cobertura_activo_pasivo_min) if self.cobertura_activo_pasivo_min is not None else None,
+            "capital_trabajo_min": float(self.capital_trabajo_min) if self.capital_trabajo_min is not None else None,
+            "porcentaje_pasivo_corto_max": float(self.porcentaje_pasivo_corto_max) if self.porcentaje_pasivo_corto_max is not None else None,
+            "porcentaje_activo_no_corriente_max": float(self.porcentaje_activo_no_corriente_max) if self.porcentaje_activo_no_corriente_max is not None else None,
+            "endeudamiento_largo_plazo_max": float(self.endeudamiento_largo_plazo_max) if self.endeudamiento_largo_plazo_max is not None else None,
+
+            "creado_por": self.creado_por,
+            "actualizado_por": self.actualizado_por,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

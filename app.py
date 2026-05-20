@@ -3561,6 +3561,7 @@ def create_app():
 
                 # Configuración del dashboard / módulos / notificaciones
                 "dashboard_resumen_config",
+                "indicadores_financieros_config",
                 "modulos_disponibles",
                 "system_notifications",
             ]
@@ -17387,22 +17388,29 @@ def create_app():
             # 7. TOP CLIENTES / PROVEEDORES
             # =========================================================
             params = {"idcliente": idcliente}
-            condiciones_ing = ["idcliente = :idcliente"]
-            condiciones_egr = ["idcliente = :idcliente"]
+
+            # Clientes:
+            # Usamos la misma fuente y lógica del reporte financiero consolidado:
+            # ventas_movimientos_enriquecidos = facturas emitidas - notas crédito, con impuesto.
+            condiciones_ing = ["m.idcliente = :idcliente"]
+
+            # Proveedores:
+            # Usamos siigo_compras con alias c y total_ajustado cuando exista.
+            condiciones_egr = ["c.idcliente = :idcliente"]
 
             if fecha_desde:
-                condiciones_ing.append("fecha >= :desde")
-                condiciones_egr.append("fecha >= :desde")
+                condiciones_ing.append("m.fecha >= :desde")
+                condiciones_egr.append("c.fecha >= :desde")
                 params["desde"] = fecha_desde
 
             if fecha_hasta_ajustada:
-                condiciones_ing.append("fecha <= :hasta")
-                condiciones_egr.append("fecha <= :hasta")
+                condiciones_ing.append("m.fecha <= :hasta")
+                condiciones_egr.append("c.fecha <= :hasta")
                 params["hasta"] = fecha_hasta_ajustada
 
             if centro_costos:
-                condiciones_ing.append("cost_center = :centro_costos")
-                condiciones_egr.append("cost_center = :centro_costos")
+                condiciones_ing.append("m.cost_center = :centro_costos")
+                condiciones_egr.append("c.cost_center = :centro_costos")
                 params["centro_costos"] = centro_costos
 
             where_ing = " AND ".join(condiciones_ing)
@@ -17413,36 +17421,75 @@ def create_app():
 
             sql_top_clientes = text(f"""
                 SELECT
-                    cliente_nombre AS nombre,
-                    COALESCE(SUM(total), 0) AS total
-                FROM facturas_enriquecidas
+                    COALESCE(NULLIF(TRIM(m.cliente_nombre), ''), 'Sin cliente') AS nombre,
+
+                    -- Venta neta con impuesto:
+                    -- facturas emitidas menos notas crédito
+                    COALESCE(SUM(m.total), 0) AS total,
+
+                    -- Auditoría
+                    COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'FACTURA'
+                        THEN m.total ELSE 0 END
+                    ), 0) AS facturas_emitidas,
+
+                    ABS(COALESCE(SUM(
+                        CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                        THEN m.total ELSE 0 END
+                    ), 0)) AS notas_credito
+
+                FROM ventas_movimientos_enriquecidos m
                 WHERE {where_ing}
-                GROUP BY cliente_nombre
+                GROUP BY COALESCE(NULLIF(TRIM(m.cliente_nombre), ''), 'Sin cliente')
                 ORDER BY total DESC
                 LIMIT {limit_clientes}
             """)
 
             sql_top_proveedores = text(f"""
                 SELECT
-                    COALESCE(proveedor_nombre, 'Sin proveedor') AS nombre,
-                    COALESCE(SUM(total), 0) AS total
-                FROM siigo_compras
+                    COALESCE(NULLIF(TRIM(c.proveedor_nombre), ''), 'Sin proveedor') AS nombre,
+
+                    -- Total neto ajustado para ranking
+                    COALESCE(SUM(COALESCE(c.total_ajustado, c.total, 0)), 0) AS total,
+
+                    -- Auditoría
+                    COALESCE(SUM(COALESCE(c.total, 0)), 0) AS total_original,
+                    COALESCE(SUM(COALESCE(c.total_ajustes_debito, 0)), 0) AS total_notas_debito,
+
+                    SUM(
+                        CASE
+                            WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
+                            ELSE 0
+                        END
+                    ) AS documentos_con_ajuste
+
+                FROM siigo_compras c
                 WHERE {where_egr}
-                GROUP BY COALESCE(proveedor_nombre, 'Sin proveedor')
+                GROUP BY COALESCE(NULLIF(TRIM(c.proveedor_nombre), ''), 'Sin proveedor')
                 ORDER BY total DESC
                 LIMIT {limit_proveedores}
             """)
 
             top_clientes = [
-                {"nombre": str(r["nombre"]), "total": _round2(r["total"])}
+                {
+                    "nombre": str(r["nombre"]),
+                    "total": _round2(r["total"]),
+                    "facturas_emitidas": _round2(r["facturas_emitidas"]),
+                    "notas_credito": _round2(r["notas_credito"]),
+                }
                 for r in db.session.execute(sql_top_clientes, params).mappings().all()
             ]
 
             top_proveedores = [
-                {"nombre": str(r["nombre"]), "total": _round2(r["total"])}
+                {
+                    "nombre": str(r["nombre"]),
+                    "total": _round2(r["total"]),
+                    "total_original": _round2(r["total_original"]),
+                    "total_notas_debito": _round2(r["total_notas_debito"]),
+                    "documentos_con_ajuste": int(r["documentos_con_ajuste"] or 0),
+                }
                 for r in db.session.execute(sql_top_proveedores, params).mappings().all()
             ]
-
             # =========================================================
             # 8. EXPLICACIONES + ACCIONES + ALERTAS
             # =========================================================
@@ -17464,7 +17511,7 @@ def create_app():
             if runway_info.get("requiere_parametrizacion"):
                 alertas = [{
                     "nivel": "media",
-                    "titulo": "Cash runway pendiente",
+                    "titulo": "Autonomía de caja pendiente",
                     "descripcion": runway_info.get("mensaje") or "El indicador requiere parametrización."
                 }]
 
