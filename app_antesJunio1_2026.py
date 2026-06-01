@@ -11288,7 +11288,7 @@ def create_app():
 
 
 
-    # Reporte de Compras a Proveedores
+    #Reporte de Compras a Proveedores
     # --- ENDPOINT: Reporte General de Compras por Proveedor ---
     @app.route("/reportes/compras/proveedores", methods=["GET"])
     @jwt_required()
@@ -11318,7 +11318,6 @@ def create_app():
         if desde and validar_fecha(desde):
             condiciones.append("c.fecha >= :desde")
             params["desde"] = desde
-
         if hasta and validar_fecha(hasta):
             condiciones.append("c.fecha <= :hasta")
             params["hasta"] = hasta
@@ -11332,95 +11331,8 @@ def create_app():
 
         where_sql = " AND ".join(condiciones)
 
-        # ----------------------------------------------------------
-        # KPIs generales del periodo filtrado
-        # ----------------------------------------------------------
-        query_kpis = f"""
-            SELECT
-                COUNT(
-                    DISTINCT NULLIF(
-                        TRIM(COALESCE(c.proveedor_identificacion, '')),
-                        ''
-                    )
-                ) AS total_proveedores,
-
-                COUNT(*) AS total_documentos,
-
-                -- Total neto ajustado por notas débito
-                SUM(COALESCE(c.total_ajustado, c.total, 0)) AS total_compras,
-
-                -- Compras con Factura: documentos FC
-                SUM(
-                    CASE
-                        WHEN c.idcompra LIKE 'FC-%' THEN 1
-                        ELSE 0
-                    END
-                ) AS total_facturas,
-
-                SUM(
-                    CASE
-                        WHEN c.idcompra LIKE 'FC-%'
-                        THEN COALESCE(c.total_ajustado, c.total, 0)
-                        ELSE 0
-                    END
-                ) AS total_compras_factura,
-
-                -- Compras con Cuenta de Cobro: documentos DS
-                SUM(
-                    CASE
-                        WHEN c.idcompra LIKE 'DS-%' THEN 1
-                        ELSE 0
-                    END
-                ) AS total_cuentas_cobro,
-
-                SUM(
-                    CASE
-                        WHEN c.idcompra LIKE 'DS-%'
-                        THEN COALESCE(c.total_ajustado, c.total, 0)
-                        ELSE 0
-                    END
-                ) AS total_compras_cuenta_cobro,
-
-                -- Total pagado ajustado
-                SUM(
-                    GREATEST(
-                        COALESCE(c.total_ajustado, c.total, 0) -
-                        LEAST(
-                            COALESCE(c.saldo, 0),
-                            COALESCE(c.total_ajustado, c.total, 0)
-                        ),
-                        0
-                    )
-                ) AS total_pagado,
-
-                -- Total pendiente ajustado
-                SUM(
-                    LEAST(
-                        COALESCE(c.saldo, 0),
-                        COALESCE(c.total_ajustado, c.total, 0)
-                    )
-                ) AS total_saldo,
-
-                -- Auditoría de ajustes
-                SUM(COALESCE(c.total, 0)) AS total_original,
-                SUM(COALESCE(c.total_ajustes_debito, 0)) AS total_notas_debito,
-                SUM(
-                    CASE
-                        WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
-                        ELSE 0
-                    END
-                ) AS documentos_con_ajuste
-
-            FROM siigo_compras c
-            WHERE {where_sql}
-            AND COALESCE(c.total_ajustado, c.total, 0) > 0
-        """
-
-        row_kpis = db.session.execute(text(query_kpis), params).mappings().first()
-
-        # ----------------------------------------------------------
-        # Resumen por proveedor
-        # ----------------------------------------------------------
+        # --- Resumen por proveedor ---
+        # --- Resumen por proveedor ---
         query = f"""
             SELECT
                 COALESCE(c.proveedor_identificacion, '') AS proveedor_identificacion,
@@ -11471,7 +11383,6 @@ def create_app():
             r["total_pagado"] = max(total_compras - total_saldo, 0)
 
         detalle = []
-
         if incluir_detalle:
             query_detalle = f"""
                 SELECT
@@ -11516,10 +11427,10 @@ def create_app():
             detalle = [dict(r) for r in rows_detalle]
 
         return jsonify({
-            "kpis": dict(row_kpis or {}),
             "resumen": resultado,
             "detalle": detalle if incluir_detalle else None
         })
+
 
 
 
