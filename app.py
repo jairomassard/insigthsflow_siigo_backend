@@ -14795,7 +14795,7 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
 
-        # Aceptamos ambos nombres porque en algunas páginas usamos centro_costos
+        # Aceptamos ambos nombres porque algunas páginas usan centro_costos
         centro_costo = (
             request.args.get("centro_costo")
             or request.args.get("centro_costos")
@@ -14806,228 +14806,129 @@ def create_app():
 
         params = {"idcliente": idcliente}
 
-        condiciones_base = [
+        filtros = [
             "mb.idcliente = :idcliente",
             "mb.tipo_movimiento = 'FACTURA'",
         ]
 
-        condiciones_facturas_periodo = []
-        condiciones_notas_periodo = [
-            "mn.idcliente = :idcliente",
-            "mn.tipo_movimiento = 'NOTA_CREDITO'",
-        ]
-
         if desde:
-            condiciones_facturas_periodo.append("fib.fecha >= :desde")
-            condiciones_notas_periodo.append("mn.fecha >= :desde")
+            filtros.append("mb.fecha >= :desde")
             params["desde"] = desde
 
         if hasta:
-            condiciones_facturas_periodo.append("fib.fecha <= :hasta")
-            condiciones_notas_periodo.append("mn.fecha <= :hasta")
+            filtros.append("mb.fecha <= :hasta")
             params["hasta"] = hasta
 
         if centro_costo:
-            condiciones_base.append("""
+            filtros.append("""
                 (
                     CAST(mb.cost_center AS TEXT) = :centro_costo
                     OR mb.centro_costo_nombre = :centro_costo
                     OR mb.centro_costo_codigo = :centro_costo
                 )
             """)
-
-            condiciones_notas_periodo.append("""
-                (
-                    CAST(mn.cost_center AS TEXT) = :centro_costo
-                    OR mn.centro_costo_nombre = :centro_costo
-                    OR mn.centro_costo_codigo = :centro_costo
-                )
-            """)
-
             params["centro_costo"] = centro_costo
 
-        where_base = " AND ".join(condiciones_base)
-
-        where_facturas_periodo = (
-            " AND ".join(condiciones_facturas_periodo)
-            if condiciones_facturas_periodo
-            else "1=1"
-        )
-
-        where_notas_periodo = " AND ".join(condiciones_notas_periodo)
-
-        where_producto = ""
         if producto_code:
-            where_producto = "WHERE producto_code = :producto_code"
+            filtros.append("i.producto_id = :producto_code")
             params["producto_code"] = producto_code
 
+        where = " AND ".join(filtros)
+
         columna_orden = (
-            "SUM(cantidad)"
+            "SUM(COALESCE(i.cantidad, 0))"
             if ordenar_por == "cantidad"
-            else "SUM(ventas_netas)"
+            else "SUM(COALESCE(i.total_item, 0))"
         )
 
-        sql_base = text(f"""
-            WITH factura_items_base AS (
-                SELECT
-                    mb.idcliente,
-                    mb.movimiento_id AS factura_id,
-                    mb.documento AS factura_documento,
-                    mb.fecha,
-                    mb.cost_center,
-                    mb.centro_costo_nombre,
-                    mb.centro_costo_codigo,
+        def norm_decimal(value):
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
 
-                    i.producto_id AS producto_code,
-                    COALESCE(p.name, i.descripcion, i.producto_id) AS producto,
+        def normalize_row(row):
+            return {k: norm_decimal(v) for k, v in dict(row).items()}
 
-                    COALESCE(i.cantidad, 0) AS cantidad,
-                    COALESCE(i.total_item, 0) AS total_item,
-
-                    SUM(COALESCE(i.total_item, 0)) OVER (
-                        PARTITION BY mb.idcliente, mb.documento
-                    ) AS factura_total_items
-
-                FROM ventas_movimientos_enriquecidos mb
-                JOIN siigo_factura_items i
-                    ON i.factura_id = mb.movimiento_id
-                AND i.idcliente = mb.idcliente
-                LEFT JOIN siigo_productos p
-                    ON p.code = i.producto_id
-                AND p.idcliente = mb.idcliente
-                WHERE {where_base}
-            ),
-
-            movimientos_producto AS (
-                -- Facturas emitidas del periodo, por producto
-                SELECT
-                    fib.producto_code,
-                    fib.producto,
-                    fib.cantidad,
-                    fib.total_item AS facturas_emitidas,
-                    0::numeric AS notas_credito,
-                    fib.total_item AS ventas_netas,
-                    fib.factura_id,
-                    fib.factura_documento
-                FROM factura_items_base fib
-                WHERE {where_facturas_periodo}
-
-                UNION ALL
-
-                -- Notas crédito del periodo asignadas a los productos
-                -- de la factura afectada.
-                SELECT
-                    fib.producto_code,
-                    fib.producto,
-
-                    0::numeric AS cantidad,
-                    0::numeric AS facturas_emitidas,
-
-                    CASE
-                        WHEN ABS(COALESCE(fib.factura_total_items, 0)) > 0
-                        THEN
-                            ABS(COALESCE(mn.total, 0))
-                            * ABS(COALESCE(fib.total_item, 0))
-                            / ABS(COALESCE(fib.factura_total_items, 0))
-                        ELSE 0
-                    END AS notas_credito,
-
-                    CASE
-                        WHEN ABS(COALESCE(fib.factura_total_items, 0)) > 0
-                        THEN
-                            -1 * (
-                                ABS(COALESCE(mn.total, 0))
-                                * ABS(COALESCE(fib.total_item, 0))
-                                / ABS(COALESCE(fib.factura_total_items, 0))
-                            )
-                        ELSE 0
-                    END AS ventas_netas,
-
-                    fib.factura_id,
-                    fib.factura_documento
-
-                FROM ventas_movimientos_enriquecidos mn
-                JOIN factura_items_base fib
-                    ON TRIM(COALESCE(fib.factura_documento, '')) =
-                    TRIM(COALESCE(mn.documento_afectado, ''))
-                WHERE {where_notas_periodo}
-            ),
-
-            agregado AS (
-                SELECT
-                    producto_code,
-                    producto,
-
-                    COALESCE(SUM(cantidad), 0) AS cantidad,
-                    COALESCE(SUM(facturas_emitidas), 0) AS facturas_emitidas,
-                    COALESCE(SUM(notas_credito), 0) AS notas_credito,
-                    COALESCE(SUM(ventas_netas), 0) AS ventas_netas,
-
-                    -- Compatibilidad con frontend actual:
-                    COALESCE(SUM(ventas_netas), 0) AS total,
-
-                    COUNT(DISTINCT factura_id) FILTER (
-                        WHERE facturas_emitidas <> 0
-                    ) AS facturas
-
-                FROM movimientos_producto
-                GROUP BY producto_code, producto
-            )
-
-            SELECT *
-            FROM agregado
-            {where_producto}
+        # --- KPIs ---
+        sql_kpis = text(f"""
+            SELECT
+                COALESCE(SUM(i.total_item), 0) AS ventas_totales,
+                COALESCE(SUM(i.total_item), 0) AS ventas_facturadas,
+                COALESCE(SUM(i.cantidad), 0) AS unidades_facturadas,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas,
+                CASE
+                    WHEN COUNT(DISTINCT mb.movimiento_id) > 0
+                    THEN COALESCE(SUM(i.total_item), 0) / COUNT(DISTINCT mb.movimiento_id)
+                    ELSE 0
+                END AS ticket_promedio
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            WHERE {where}
         """)
 
-        rows = [
-            dict(r)
-            for r in db.session.execute(sql_base, params).mappings().all()
-        ]
-
-        def norm(v):
-            if isinstance(v, Decimal):
-                return float(v)
-            return v
-
-        rows = [{k: norm(v) for k, v in row.items()} for row in rows]
-
-        ventas_netas = sum(float(r.get("ventas_netas") or 0) for r in rows)
-        facturas_emitidas = sum(float(r.get("facturas_emitidas") or 0) for r in rows)
-        notas_credito = sum(float(r.get("notas_credito") or 0) for r in rows)
-        facturas = sum(int(r.get("facturas") or 0) for r in rows)
-
-        kpis = {
-            # Compatibilidad con frontend actual
-            "ventas_totales": ventas_netas,
-
-            # Nuevos campos alineados
-            "ventas_netas": ventas_netas,
-            "facturas_emitidas": facturas_emitidas,
-            "notas_credito": notas_credito,
-
-            "facturas": facturas,
-            "ticket_promedio": (ventas_netas / facturas) if facturas else 0,
-
-            "fuente": "ventas_movimientos_enriquecidos + siigo_factura_items",
-            "logica": "ventas_netas = facturas_emitidas - notas_credito asignadas por factura afectada",
-        }
-
-        rows_ordenadas = sorted(
-            rows,
-            key=lambda r: float(
-                r.get("cantidad") if ordenar_por == "cantidad" else r.get("ventas_netas") or 0
-            ),
-            reverse=True,
+        kpis = normalize_row(
+            db.session.execute(sql_kpis, params).mappings().first() or {}
         )
 
-        top10 = rows_ordenadas[:10]
+        kpis["fuente"] = "ventas_movimientos_enriquecidos + siigo_factura_items"
+        kpis["logica"] = (
+            "Ventas facturadas por producto. No descuenta notas crédito porque "
+            "las notas crédito no tienen detalle confiable de productos."
+        )
 
-        bottom10 = sorted(
-            rows,
-            key=lambda r: float(
-                r.get("cantidad") if ordenar_por == "cantidad" else r.get("ventas_netas") or 0
-            ),
-        )[:10]
+        # --- Top 10 ---
+        sql_top = text(f"""
+            SELECT
+                i.producto_id AS code,
+                COALESCE(p.name, i.producto_id) AS producto,
+                COALESCE(SUM(i.cantidad), 0) AS cantidad,
+                COALESCE(SUM(i.total_item), 0) AS total,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            LEFT JOIN siigo_productos p
+                ON p.code = i.producto_id
+            AND p.idcliente = mb.idcliente
+            WHERE {where}
+            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
+            ORDER BY {columna_orden} DESC
+            LIMIT 10
+        """)
+
+        top10 = [
+            normalize_row(r)
+            for r in db.session.execute(sql_top, params).mappings().all()
+        ]
+
+        # --- Bottom 10 ---
+        sql_bottom = text(f"""
+            SELECT
+                i.producto_id AS code,
+                COALESCE(p.name, i.producto_id) AS producto,
+                COALESCE(SUM(i.cantidad), 0) AS cantidad,
+                COALESCE(SUM(i.total_item), 0) AS total,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            LEFT JOIN siigo_productos p
+                ON p.code = i.producto_id
+            AND p.idcliente = mb.idcliente
+            WHERE {where}
+            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
+            ORDER BY {columna_orden} ASC
+            LIMIT 10
+        """)
+
+        bottom10 = [
+            normalize_row(r)
+            for r in db.session.execute(sql_bottom, params).mappings().all()
+        ]
 
         return jsonify({
             "kpis": kpis,
@@ -15043,78 +14944,156 @@ def create_app():
         claims = get_jwt()
         idcliente = claims.get("idcliente")
 
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
         sql = text("""
-            SELECT DISTINCT p.code, p.name
-            FROM siigo_factura_items i
-            JOIN facturas_enriquecidas f ON f.factura_id = i.factura_id
-            JOIN siigo_productos p ON p.code = i.producto_id AND p.idcliente = f.idcliente
-            WHERE f.idcliente = :idcliente
-            ORDER BY p.code
+            SELECT DISTINCT
+                i.producto_id AS code,
+                COALESCE(p.name, i.producto_id) AS name
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            LEFT JOIN siigo_productos p
+                ON p.code = i.producto_id
+            AND p.idcliente = mb.idcliente
+            WHERE mb.idcliente = :idcliente
+            AND mb.tipo_movimiento = 'FACTURA'
+            ORDER BY COALESCE(p.name, i.producto_id)
         """)
+
         rows = db.session.execute(sql, {"idcliente": idcliente}).mappings().all()
-        return jsonify([{"code": r["code"], "name": r["name"], "label": f"{r['code']} - {r['name']}"} for r in rows])
+
+        return jsonify([
+            {
+                "code": r["code"],
+                "name": r["name"],
+                "label": f"{r['code']} - {r['name']}"
+            }
+            for r in rows
+        ])
+
 
 
     # --- Detalle producto con histórico mensual ---
     @app.route("/reportes/productos/detalle", methods=["GET"])
     @jwt_required()
     def detalle_producto():
+        from sqlalchemy.sql import text
+        from decimal import Decimal
+
         claims = get_jwt()
         idcliente = claims.get("idcliente")
+
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
 
         producto_code = request.args.get("producto_code")
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        centro_costo = request.args.get("centro_costo")
+
+        centro_costo = (
+            request.args.get("centro_costo")
+            or request.args.get("centro_costos")
+        )
 
         if not producto_code:
             return jsonify({"error": "Falta producto_code"}), 400
 
-        filtros = ["f.idcliente = :idcliente", "f.estado_pago = 'pagada'", "i.producto_id = :producto_code"]
-        params = {"idcliente": idcliente, "producto_code": producto_code}
+        params = {
+            "idcliente": idcliente,
+            "producto_code": producto_code,
+        }
+
+        filtros = [
+            "mb.idcliente = :idcliente",
+            "mb.tipo_movimiento = 'FACTURA'",
+            "i.producto_id = :producto_code",
+        ]
 
         if desde:
-            filtros.append("f.fecha >= :desde")
+            filtros.append("mb.fecha >= :desde")
             params["desde"] = desde
+
         if hasta:
-            filtros.append("f.fecha <= :hasta")
+            filtros.append("mb.fecha <= :hasta")
             params["hasta"] = hasta
+
         if centro_costo:
-            filtros.append("f.centro_costo_nombre = :centro_costo")
+            filtros.append("""
+                (
+                    CAST(mb.cost_center AS TEXT) = :centro_costo
+                    OR mb.centro_costo_nombre = :centro_costo
+                    OR mb.centro_costo_codigo = :centro_costo
+                )
+            """)
             params["centro_costo"] = centro_costo
 
         where = " AND ".join(filtros)
 
+        def norm_decimal(value):
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
+
+        def normalize_row(row):
+            return {k: norm_decimal(v) for k, v in dict(row).items()}
+
         # --- Totales ---
         sql_totales = text(f"""
-            SELECT p.code, p.name as producto,
-                SUM(i.cantidad) as cantidad,
-                SUM(i.total_item) as total,
-                COUNT(DISTINCT f.factura_id) as facturas
-            FROM siigo_factura_items i
-            JOIN facturas_enriquecidas f ON f.factura_id = i.factura_id
-            JOIN siigo_productos p ON p.code = i.producto_id AND p.idcliente = f.idcliente
+            SELECT
+                i.producto_id AS code,
+                COALESCE(p.name, i.producto_id) AS producto,
+                COALESCE(SUM(i.cantidad), 0) AS cantidad,
+                COALESCE(SUM(i.total_item), 0) AS total,
+                COALESCE(SUM(i.total_item), 0) AS ventas_facturadas,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            LEFT JOIN siigo_productos p
+                ON p.code = i.producto_id
+            AND p.idcliente = mb.idcliente
             WHERE {where}
-            GROUP BY p.code, p.name
+            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
         """)
-        detalle = dict(db.session.execute(sql_totales, params).mappings().first() or {})
+
+        detalle = normalize_row(
+            db.session.execute(sql_totales, params).mappings().first() or {}
+        )
 
         # --- Histórico mensual ---
         sql_hist = text(f"""
-            SELECT DATE_TRUNC('month', f.fecha) AS mes,
-                SUM(i.cantidad) AS cantidad,
-                SUM(i.total_item) AS total
-            FROM siigo_factura_items i
-            JOIN facturas_enriquecidas f ON f.factura_id = i.factura_id
+            SELECT
+                DATE_TRUNC('month', mb.fecha) AS mes,
+                COALESCE(SUM(i.cantidad), 0) AS cantidad,
+                COALESCE(SUM(i.total_item), 0) AS total,
+                COALESCE(SUM(i.total_item), 0) AS ventas_facturadas,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN siigo_factura_items i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
             WHERE {where}
-            GROUP BY DATE_TRUNC('month', f.fecha)
+            GROUP BY DATE_TRUNC('month', mb.fecha)
             ORDER BY mes
         """)
-        historico = [dict(r) for r in db.session.execute(sql_hist, params).mappings().all()]
+
+        historico = [
+            normalize_row(r)
+            for r in db.session.execute(sql_hist, params).mappings().all()
+        ]
 
         detalle["historico"] = historico
-        return jsonify(detalle)
+        detalle["fuente"] = "ventas_movimientos_enriquecidos + siigo_factura_items"
+        detalle["logica"] = (
+            "Detalle de productos facturados. No descuenta notas crédito porque "
+            "las notas crédito no tienen detalle confiable de productos."
+        )
 
+        return jsonify(detalle)
 
 
 
