@@ -8025,10 +8025,10 @@ def create_app():
                                 NULLIF(TRIM(BOTH '"' FROM c.name), ''),
                                 'Desconocido'
                             ),
-                            '[\\{{\\}}\\[\\]\\"]',
+                            '[\\{\\}\\[\\]\\"]',
                             '',
                             'g'
-                        ) AS cliente_nombre_ok
+                        ) AS cliente_nombre_ok,
                         COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
                     FROM siigo_facturas f
                     LEFT JOIN siigo_customers c
