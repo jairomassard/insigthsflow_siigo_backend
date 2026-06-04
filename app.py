@@ -1316,9 +1316,12 @@ def _resolver_corte_confiable_auxiliar(idcliente):
     Define el corte confiable para lectura ejecutiva.
 
     Reglas:
-    - Si la última fecha cargada cae exactamente en el último día de su mes,
-      se considera mes cerrado y ese mismo día es el corte confiable.
-    - Si la última fecha cargada es parcial dentro del mes,
+    - Si la última fecha cargada cae exactamente en el último día calendario del mes,
+      se considera mes cerrado.
+    - Si la última fecha cargada cae en el último día hábil aproximado del mes,
+      también se considera mes cerrado. Esto evita castigar meses donde el último
+      día calendario fue domingo/festivo o no tuvo movimientos contables.
+    - Si la última fecha cargada está muy lejos del cierre mensual,
       el corte confiable será el último día del mes anterior.
     - Si no existe data, retorna estructura vacía.
     """
@@ -1338,8 +1341,19 @@ def _resolver_corte_confiable_auxiliar(idcliente):
 
     ultimo_dia_del_mes = _last_day_of_month(ultima_fecha)
 
-    if ultima_fecha == ultimo_dia_del_mes:
-        fecha_corte_confiable = ultima_fecha
+    # Último día hábil aproximado:
+    # - Si el mes termina sábado, tomamos viernes.
+    # - Si el mes termina domingo, tomamos viernes.
+    # - Si termina lunes a viernes, tomamos ese mismo día.
+    ultimo_dia_habil = ultimo_dia_del_mes
+    while ultimo_dia_habil.weekday() >= 5:  # 5=sábado, 6=domingo
+        ultimo_dia_habil = ultimo_dia_habil - timedelta(days=1)
+
+    # Regla flexible:
+    # Si la última fecha cargada llega al último día hábil o después,
+    # el mes se considera cerrado.
+    if ultima_fecha >= ultimo_dia_habil:
+        fecha_corte_confiable = ultimo_dia_del_mes
         mes_actual_parcial = False
     else:
         fecha_corte_confiable = _last_day_of_month(_shift_months(ultima_fecha, -1))
