@@ -14695,82 +14695,190 @@ def create_app():
 
 
     # --- Reporte: Dashboard de Vendedores ---
-    # --- Reporte de Vendedores ---
+    # --- Reporte: Dashboard de Vendedores ---
     @app.route("/reportes/vendedores", methods=["GET"])
     @jwt_required()
     def reportes_vendedores():
+        from sqlalchemy.sql import text
+        from decimal import Decimal
+
         claims = get_jwt()
         idcliente = claims.get("idcliente")
+
         if not idcliente:
             return jsonify({"error": "Token sin cliente asociado"}), 400
 
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        centro_costos = request.args.get("centro_costos")
+
+        centro_costos = (
+            request.args.get("centro_costos")
+            or request.args.get("centro_costo")
+        )
+
         cliente = request.args.get("cliente")
 
-        filtros = ["f.idcliente = :idcliente", "f.estado_pago = 'pagada'"]
+        filtros = ["m.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
 
         if desde:
-            filtros.append("f.fecha >= :desde")
+            filtros.append("m.fecha >= :desde")
             params["desde"] = desde
+
         if hasta:
-            filtros.append("f.fecha <= :hasta")
+            filtros.append("m.fecha <= :hasta")
             params["hasta"] = hasta
+
         if centro_costos:
-            filtros.append("f.cost_center = :centro_costos")  # 👈 nombre correcto
+            filtros.append("""
+                (
+                    CAST(m.cost_center AS TEXT) = :centro_costos
+                    OR m.centro_costo_nombre = :centro_costos
+                    OR m.centro_costo_codigo = :centro_costos
+                )
+            """)
             params["centro_costos"] = centro_costos
 
         if cliente:
-            filtros.append("f.cliente_nombre = :cliente")
+            filtros.append("m.cliente_nombre = :cliente")
             params["cliente"] = cliente
-
 
         filtro_sql = " AND ".join(filtros)
 
-        # KPIs
-        sql_kpis = f"""
+        def norm_decimal(value):
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
+
+        def normalize_row(row):
+            return {k: norm_decimal(v) for k, v in dict(row).items()}
+
+        # KPIs generales
+        sql_kpis = text(f"""
             SELECT
-                COALESCE(SUM(f.total),0) AS ventas_totales,
-                COUNT(*) AS facturas,
-                CASE WHEN COUNT(*) > 0 THEN ROUND(SUM(f.total)/COUNT(*),2) ELSE 0 END AS ticket_promedio
-            FROM facturas_enriquecidas f
+                COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'FACTURA' 
+                    THEN m.total ELSE 0 
+                END), 0) AS facturas_emitidas,
+
+                ABS(COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'NOTA_CREDITO' 
+                    THEN m.total ELSE 0 
+                END), 0)) AS notas_credito,
+
+                COALESCE(SUM(m.total), 0) AS ventas_netas,
+
+                -- compatibilidad con frontend actual
+                COALESCE(SUM(m.total), 0) AS ventas_totales,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'FACTURA'
+                ) AS facturas,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'NOTA_CREDITO'
+                ) AS cantidad_notas_credito,
+
+                CASE 
+                    WHEN COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA') > 0
+                    THEN ROUND(
+                        COALESCE(SUM(m.total), 0)
+                        / COUNT(*) FILTER (WHERE m.tipo_movimiento = 'FACTURA'),
+                        2
+                    )
+                    ELSE 0
+                END AS ticket_promedio
+
+            FROM ventas_movimientos_enriquecidos m
             WHERE {filtro_sql}
-        """
-        kpis = db.session.execute(text(sql_kpis), params).mappings().first()
+        """)
+
+        kpis = normalize_row(
+            db.session.execute(sql_kpis, params).mappings().first() or {}
+        )
+
+        kpis["fuente"] = "ventas_movimientos_enriquecidos"
+        kpis["logica"] = "ventas_netas = facturas_emitidas - notas_credito"
 
         # Top 5 vendedores
-        sql_top = f"""
+        sql_top = text(f"""
             SELECT
-                COALESCE(f.vendedor_nombre, 'Sin asignar') AS vendedor_nombre,
-                SUM(f.total) AS total,
-                COUNT(*) AS facturas
-            FROM facturas_enriquecidas f
+                COALESCE(m.vendedor_nombre, 'Sin asignar') AS vendedor_nombre,
+
+                COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'FACTURA' 
+                    THEN m.total ELSE 0 
+                END), 0) AS facturas_emitidas,
+
+                ABS(COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'NOTA_CREDITO' 
+                    THEN m.total ELSE 0 
+                END), 0)) AS notas_credito,
+
+                COALESCE(SUM(m.total), 0) AS total,
+                COALESCE(SUM(m.total), 0) AS ventas_netas,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'FACTURA'
+                ) AS facturas,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'NOTA_CREDITO'
+                ) AS cantidad_notas_credito
+
+            FROM ventas_movimientos_enriquecidos m
             WHERE {filtro_sql}
-            GROUP BY COALESCE(f.vendedor_nombre, 'Sin asignar')
+            GROUP BY COALESCE(m.vendedor_nombre, 'Sin asignar')
             ORDER BY total DESC
             LIMIT 5
-        """
-        top5 = db.session.execute(text(sql_top), params).mappings().all()
+        """)
+
+        top5 = [
+            normalize_row(r)
+            for r in db.session.execute(sql_top, params).mappings().all()
+        ]
 
         # Ranking completo
-        sql_rank = f"""
+        sql_rank = text(f"""
             SELECT
-                COALESCE(f.vendedor_nombre, 'Sin asignar') AS vendedor_nombre,
-                SUM(f.total) AS total,
-                COUNT(*) AS facturas
-            FROM facturas_enriquecidas f
+                COALESCE(m.vendedor_nombre, 'Sin asignar') AS vendedor_nombre,
+
+                COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'FACTURA' 
+                    THEN m.total ELSE 0 
+                END), 0) AS facturas_emitidas,
+
+                ABS(COALESCE(SUM(CASE 
+                    WHEN m.tipo_movimiento = 'NOTA_CREDITO' 
+                    THEN m.total ELSE 0 
+                END), 0)) AS notas_credito,
+
+                COALESCE(SUM(m.total), 0) AS total,
+                COALESCE(SUM(m.total), 0) AS ventas_netas,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'FACTURA'
+                ) AS facturas,
+
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'NOTA_CREDITO'
+                ) AS cantidad_notas_credito
+
+            FROM ventas_movimientos_enriquecidos m
             WHERE {filtro_sql}
-            GROUP BY COALESCE(f.vendedor_nombre, 'Sin asignar')
+            GROUP BY COALESCE(m.vendedor_nombre, 'Sin asignar')
             ORDER BY total DESC
-        """
-        ranking = db.session.execute(text(sql_rank), params).mappings().all()
+        """)
+
+        ranking = [
+            normalize_row(r)
+            for r in db.session.execute(sql_rank, params).mappings().all()
+        ]
 
         return jsonify({
-            "kpis": dict(kpis) if kpis else {},
-            "top5": [dict(r) for r in top5],
-            "ranking": [dict(r) for r in ranking]
+            "kpis": kpis,
+            "top5": top5,
+            "ranking": ranking,
         })
 
 
