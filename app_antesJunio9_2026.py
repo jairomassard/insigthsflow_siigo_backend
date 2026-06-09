@@ -1565,7 +1565,7 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
             "requiere_parametrizacion": True,
             "visible": False,
             "modo_runway": "sin_configurar",
-            "mensaje": "La autonomía de caja requiere parametrización para este cliente."
+            "mensaje": "El cash runway requiere parametrización para este cliente."
         }
 
     mostrar_runway = bool(config.get("mostrar_runway", False))
@@ -1580,7 +1580,7 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
             "requiere_parametrizacion": True,
             "visible": False,
             "modo_runway": modo_runway,
-            "mensaje": "La visualización de autonomía de caja está desactivada para este cliente."
+            "mensaje": "La visualización de cash runway está desactivada para este cliente."
         }
 
     if modo_runway == "sin_configurar":
@@ -1591,7 +1591,7 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
             "requiere_parametrizacion": True,
             "visible": False,
             "modo_runway": modo_runway,
-            "mensaje": "La autonomía de caja requiere parametrización de fórmula para este cliente."
+            "mensaje": "El cash runway requiere parametrización de fórmula para este cliente."
         }
 
     if caja_info.get("actual") in (None, 0) or caja_info.get("requiere_parametrizacion"):
@@ -1602,7 +1602,7 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
             "requiere_parametrizacion": True,
             "visible": False,
             "modo_runway": modo_runway,
-            "mensaje": "No es posible calcular la autonomía de caja sin una caja disponible válida."
+            "mensaje": "No es posible calcular cash runway sin una caja disponible válida."
         }
 
     if modo_runway == "egresos_promedio":
@@ -1629,18 +1629,16 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
         egresos = [_safe_float(r["egresos_mes"]) for r in rows if _safe_float(r["egresos_mes"]) > 0]
         burn_promedio = _round2(sum(egresos) / len(egresos)) if egresos else 0
 
-        autonomia = _round2(_safe_float(caja_info["actual"]) / burn_promedio) if burn_promedio > 0 else None
+        runway = _round2(_safe_float(caja_info["actual"]) / burn_promedio) if burn_promedio > 0 else None
 
         return {
-            "actual": autonomia,
+            "actual": runway,
             "burn_promedio": burn_promedio if burn_promedio > 0 else None,
-            "gasto_promedio": burn_promedio if burn_promedio > 0 else None,
-            "egresos_promedio": burn_promedio if burn_promedio > 0 else None,
             "unidad": "meses",
             "requiere_parametrizacion": False,
-            "visible": autonomia is not None,
+            "visible": runway is not None,
             "modo_runway": modo_runway,
-            "mensaje": "Autonomía de caja calculada con egresos promedio de compras y gastos."
+            "mensaje": "Cash runway calculado con egresos promedio de compras/gastos."
         }
 
     return {
@@ -1650,7 +1648,7 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
         "requiere_parametrizacion": True,
         "visible": False,
         "modo_runway": modo_runway,
-        "mensaje": "El modo configurado para autonomía de caja no está implementado todavía."
+        "mensaje": "El modo de runway configurado no está implementado todavía."
     }
 
 
@@ -1737,16 +1735,16 @@ def _construir_explicaciones_y_acciones(
     if runway_meses > 0 and runway_meses < 1.5:
         alertas.append({
             "nivel": "alta",
-            "titulo": "Autonomía de caja ajustada",
+            "titulo": "Caja ajustada",
             "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
         })
     elif runway_meses >= 1.5 and runway_meses < 3:
         alertas.append({
             "nivel": "media",
-            "titulo": "Autonomía de caja moderada",
+            "titulo": "Runway moderado",
             "descripcion": f"La caja actual cubre aproximadamente {runway_meses:.2f} meses de operación."
         })
-    elif runway_meses >= 3:
+    else:
         alertas.append({
             "nivel": "baja",
             "titulo": "Caja con holgura",
@@ -17649,7 +17647,6 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos", type=int)
-        modo_periodo = request.args.get("modo_periodo")
 
         try:
             corte = _resolver_corte_confiable_auxiliar(idcliente)
@@ -17660,79 +17657,37 @@ def create_app():
                     "error": "No hay auxiliar contable cargado para construir el dashboard"
                 }), 400
 
-            modo_periodo = (
-                str(modo_periodo or (config.get("modo_periodo_default") if config else None) or "ytd_cerrado")
-                .strip()
-                .lower()
-            )
-
-            if modo_periodo not in {"ytd_cerrado", "ultimo_mes_cerrado", "manual"}:
-                modo_periodo = "ytd_cerrado"
-
-            # =========================================================
-            # RESOLUCIÓN DE PERÍODO
-            # =========================================================
-            ultima_fecha_auxiliar = corte["ultima_fecha_auxiliar"]
-            fecha_corte_confiable = corte["fecha_corte_confiable"]
-
-            rango_auto = False
-            ajuste_por_corte = False
-            tipo_corte = "cerrado"
-
-            # 1) Si no vienen fechas, el modo decide el rango automático
+            # Si el frontend no manda fechas, usar por defecto YTD cerrado
             if not desde or not hasta:
+                fecha_desde = corte["desde_ytd"]
+                fecha_hasta = corte["hasta_ytd"]
+                desde = fecha_desde.strftime("%Y-%m-%d")
+                hasta = fecha_hasta.strftime("%Y-%m-%d")
                 rango_auto = True
-
-                if modo_periodo == "ultimo_mes_cerrado":
-                    fecha_hasta = fecha_corte_confiable
-                    fecha_desde = _first_day_of_month(fecha_hasta)
-
-                elif modo_periodo == "manual":
-                    # Al día por defecto: desde inicio del mes actual disponible
-                    # hasta la última fecha cargada en auxiliares.
-                    fecha_hasta = ultima_fecha_auxiliar
-                    fecha_desde = _first_day_of_month(fecha_hasta)
-                    tipo_corte = "al_dia"
-
-                else:
-                    # Año corrido cerrado
-                    fecha_desde = corte["desde_ytd"]
-                    fecha_hasta = corte["hasta_ytd"]
-
             else:
                 try:
                     fecha_desde = datetime.strptime(desde, "%Y-%m-%d").date()
                     fecha_hasta = datetime.strptime(hasta, "%Y-%m-%d").date()
+                    rango_auto = False
                 except Exception:
                     return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
 
-            # 2) Ajuste según modo
-            if modo_periodo == "manual":
-                # Vista al día: permite mes parcial, pero no permite pasar
-                # de la última fecha realmente cargada en auxiliares.
-                tipo_corte = "al_dia"
+            # Ajuste automático al corte confiable
+            fecha_hasta_ajustada = fecha_hasta
+            ajuste_por_corte = False
 
-                if fecha_hasta > ultima_fecha_auxiliar:
-                    fecha_hasta = ultima_fecha_auxiliar
-                    ajuste_por_corte = True
+            if fecha_hasta > corte["fecha_corte_confiable"]:
+                fecha_hasta_ajustada = corte["fecha_corte_confiable"]
+                ajuste_por_corte = True
 
-                if fecha_desde > fecha_hasta:
-                    fecha_desde = _first_day_of_month(fecha_hasta)
-
-            else:
-                # Vista cerrada: no permite pasar del último corte mensual confiable.
-                tipo_corte = "cerrado"
-
-                if fecha_hasta > fecha_corte_confiable:
-                    fecha_hasta = fecha_corte_confiable
-                    ajuste_por_corte = True
-
-                if fecha_desde > fecha_hasta:
+                if fecha_desde > fecha_hasta_ajustada:
                     fecha_desde = corte["desde_ytd"]
 
-            desde = fecha_desde.strftime("%Y-%m-%d")
-            hasta = fecha_hasta.strftime("%Y-%m-%d")
-            fecha_hasta_ajustada = fecha_hasta
+                desde = fecha_desde.strftime("%Y-%m-%d")
+                hasta = fecha_hasta_ajustada.strftime("%Y-%m-%d")
+            else:
+                hasta = fecha_hasta.strftime("%Y-%m-%d")
+                desde = fecha_desde.strftime("%Y-%m-%d")
 
             # =========================================================
             # 1. P&L ACTUAL
@@ -17748,27 +17703,17 @@ def create_app():
             if not hay_datos_auxiliar_actual and corte["ultima_fecha_auxiliar"]:
                 mensaje_contexto = (
                     f"No hay información de auxiliar contable para el período seleccionado. "
-                    f"Última fecha disponible: {ultima_fecha_auxiliar.strftime('%Y-%m-%d')}."
-                )
-            elif ajuste_por_corte and modo_periodo == "manual":
-                mensaje_contexto = (
-                    f"Vista al día: el rango solicitado excedía la última fecha disponible en auxiliares. "
-                    f"Se ajustó automáticamente hasta {ultima_fecha_auxiliar.strftime('%Y-%m-%d')}."
+                    f"Última fecha disponible: {corte['ultima_fecha_auxiliar'].strftime('%Y-%m-%d')}."
                 )
             elif ajuste_por_corte:
                 mensaje_contexto = (
-                    f"Vista de corte cerrado: el rango solicitado excedía el último corte mensual confiable. "
-                    f"Se ajustó automáticamente hasta {fecha_corte_confiable.strftime('%Y-%m-%d')}."
-                )
-            elif modo_periodo == "manual" and corte["mes_actual_parcial"]:
-                mensaje_contexto = (
-                    f"Vista al día: el análisis incluye información parcial hasta "
-                    f"{ultima_fecha_auxiliar.strftime('%Y-%m-%d')}."
+                    f"El rango solicitado excedía el corte confiable del auxiliar. "
+                    f"Se ajustó automáticamente hasta {corte['fecha_corte_confiable'].strftime('%Y-%m-%d')}."
                 )
             elif corte["mes_actual_parcial"]:
                 mensaje_contexto = (
-                    f"Vista de corte cerrado: el mes más reciente está parcial y se excluye del análisis. "
-                    f"El corte usado es {fecha_corte_confiable.strftime('%Y-%m-%d')}."
+                    f"El mes más reciente cargado en auxiliares está parcial. "
+                    f"El análisis ejecutivo usa corte confiable hasta {corte['fecha_corte_confiable'].strftime('%Y-%m-%d')}."
                 )
 
             # =========================================================
@@ -17838,7 +17783,7 @@ def create_app():
             meta_eficiencia = _resolver_meta_eficiencia(config)
 
             # =========================================================
-            # 5. CAJA DISPONIBLE + AUTONOMÍA DE CAJA PARAMETRIZADA
+            # 5. CAJA DISPONIBLE + RUNWAY PARAMETRIZADOS
             # =========================================================
             caja_info = _calcular_caja_disponible_parametrizada(idcliente, hasta, config)
             runway_info = _calcular_cash_runway_parametrizado(
@@ -17849,8 +17794,10 @@ def create_app():
             )
 
             # =========================================================
-            # NORMALIZACIÓN DEFENSIVA DE AUTONOMÍA DE CAJA
+            # NORMALIZACIÓN DEFENSIVA DEL RUNWAY
             # =========================================================
+            # Regla: si el backend calcula meses de autonomía, también debe exponer
+            # el gasto promedio usado para calcularlos.
             try:
                 caja_actual = _safe_float(caja_info.get("actual", 0)) if isinstance(caja_info, dict) else 0
                 runway_meses = _safe_float(runway_info.get("actual", 0)) if isinstance(runway_info, dict) else 0
@@ -17868,6 +17815,8 @@ def create_app():
                         or 0
                     )
 
+                # Si hay meses y caja, pero no llegó el gasto promedio,
+                # lo reconstruimos con la misma fórmula: gasto = caja / meses.
                 if burn_promedio <= 0 and caja_actual > 0 and runway_meses > 0:
                     burn_promedio = caja_actual / runway_meses
 
@@ -17876,9 +17825,8 @@ def create_app():
                     runway_info["gasto_promedio_3m"] = _round2(burn_promedio)
                     runway_info["meses_promedio"] = int(config.get("meses_promedio_runway") or 3) if config else 3
                     runway_info["formula"] = "autonomia_caja = caja_disponible / gasto_promedio"
-                    runway_info["etiqueta"] = "Autonomía de caja"
             except Exception as e:
-                print("WARN normalizando autonomia_caja:", str(e))
+                print("WARN normalizando runway_info:", str(e))
 
             # =========================================================
             # 6. TOP GASTOS
@@ -17891,7 +17839,13 @@ def create_app():
             # =========================================================
             params = {"idcliente": idcliente}
 
+            # Clientes:
+            # Usamos la misma fuente y lógica del reporte financiero consolidado:
+            # ventas_movimientos_enriquecidos = facturas emitidas - notas crédito, con impuesto.
             condiciones_ing = ["m.idcliente = :idcliente"]
+
+            # Proveedores:
+            # Usamos siigo_compras con alias c y total_ajustado cuando exista.
             condiciones_egr = ["c.idcliente = :idcliente"]
 
             if fecha_desde:
@@ -17918,15 +17872,22 @@ def create_app():
             sql_top_clientes = text(f"""
                 SELECT
                     COALESCE(NULLIF(TRIM(m.cliente_nombre), ''), 'Sin cliente') AS nombre,
+
+                    -- Venta neta con impuesto:
+                    -- facturas emitidas menos notas crédito
                     COALESCE(SUM(m.total), 0) AS total,
+
+                    -- Auditoría
                     COALESCE(SUM(
                         CASE WHEN m.tipo_movimiento = 'FACTURA'
                         THEN m.total ELSE 0 END
                     ), 0) AS facturas_emitidas,
+
                     ABS(COALESCE(SUM(
                         CASE WHEN m.tipo_movimiento = 'NOTA_CREDITO'
                         THEN m.total ELSE 0 END
                     ), 0)) AS notas_credito
+
                 FROM ventas_movimientos_enriquecidos m
                 WHERE {where_ing}
                 GROUP BY COALESCE(NULLIF(TRIM(m.cliente_nombre), ''), 'Sin cliente')
@@ -17937,15 +17898,21 @@ def create_app():
             sql_top_proveedores = text(f"""
                 SELECT
                     COALESCE(NULLIF(TRIM(c.proveedor_nombre), ''), 'Sin proveedor') AS nombre,
+
+                    -- Total neto ajustado para ranking
                     COALESCE(SUM(COALESCE(c.total_ajustado, c.total, 0)), 0) AS total,
+
+                    -- Auditoría
                     COALESCE(SUM(COALESCE(c.total, 0)), 0) AS total_original,
                     COALESCE(SUM(COALESCE(c.total_ajustes_debito, 0)), 0) AS total_notas_debito,
+
                     SUM(
                         CASE
                             WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1
                             ELSE 0
                         END
                     ) AS documentos_con_ajuste
+
                 FROM siigo_compras c
                 WHERE {where_egr}
                 GROUP BY COALESCE(NULLIF(TRIM(c.proveedor_nombre), ''), 'Sin proveedor')
@@ -17973,7 +17940,6 @@ def create_app():
                 }
                 for r in db.session.execute(sql_top_proveedores, params).mappings().all()
             ]
-
             # =========================================================
             # 8. EXPLICACIONES + ACCIONES + ALERTAS
             # =========================================================
@@ -17991,6 +17957,7 @@ def create_app():
                 ebitda_anterior=ebitda_anterior,
             )
 
+            # Si runway no está parametrizado, no forzar alerta engañosa
             if runway_info.get("requiere_parametrizacion"):
                 alertas = [{
                     "nivel": "media",
@@ -18009,24 +17976,19 @@ def create_app():
                     "anterior_hasta": prev_hasta.strftime("%Y-%m-%d"),
                     "rango_auto": rango_auto,
                     "ajuste_por_corte": ajuste_por_corte,
-                    "modo_periodo": modo_periodo,
-                    "tipo_corte": tipo_corte,
-                    "ultima_fecha_auxiliar": ultima_fecha_auxiliar.strftime("%Y-%m-%d") if ultima_fecha_auxiliar else None,
-                    "fecha_corte_confiable": fecha_corte_confiable.strftime("%Y-%m-%d") if fecha_corte_confiable else None,
                 },
                 "metadata": {
                     "hay_datos_auxiliar_actual": hay_datos_auxiliar_actual,
                     "ultima_fecha_auxiliar": (
-                        ultima_fecha_auxiliar.strftime("%Y-%m-%d")
-                        if ultima_fecha_auxiliar else None
+                        corte["ultima_fecha_auxiliar"].strftime("%Y-%m-%d")
+                        if corte["ultima_fecha_auxiliar"] else None
                     ),
                     "fecha_corte_confiable": (
-                        fecha_corte_confiable.strftime("%Y-%m-%d")
-                        if fecha_corte_confiable else None
+                        corte["fecha_corte_confiable"].strftime("%Y-%m-%d")
+                        if corte["fecha_corte_confiable"] else None
                     ),
                     "mes_actual_parcial": corte["mes_actual_parcial"],
-                    "modo_periodo": modo_periodo,
-                    "tipo_corte": tipo_corte,
+                    "modo_periodo": corte["modo_periodo"],
                     "mensaje_contexto": mensaje_contexto,
                     "config_dashboard": {
                         "existe_config": bool(config),
