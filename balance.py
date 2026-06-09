@@ -89,6 +89,15 @@ def es_cuenta_impuesto_o_retencion(cuenta_codigo: str, nombre: str = ""):
         or "retencion" in nombre_l
     )
 
+def es_cuenta_iva_descontable_presentacion_pasivo(cuenta_codigo: str, nombre: str = ""):
+    codigo = str(cuenta_codigo or "").strip()
+    nombre_l = str(nombre or "").strip().lower()
+
+    return (
+        codigo.startswith(("240810", "240815"))
+        or "descontable" in nombre_l
+        or "saldo a favor en iva" in nombre_l
+    )
 
 def es_cuenta_transitoria_o_legalizacion(cuenta_codigo: str, nombre: str = ""):
     nombre_l = str(nombre or "").strip().lower()
@@ -320,6 +329,8 @@ def _ordenar_items(lista):
     return sorted(lista, key=lambda x: (str(x.get("cuenta_padre", "")), str(x.get("cuenta", ""))))
 
 
+
+
 def _clasificar_alerta_item(item, seccion):
     cuenta = str(item.get("cuenta", ""))
     nombre = str(item.get("nombre", ""))
@@ -369,6 +380,12 @@ def _clasificar_alerta_item(item, seccion):
         }
 
     if seccion == "PASIVO":
+        # Cuentas como 240810 / 240815 son IVA descontable.
+        # Aunque contablemente estén dentro del grupo 24, pueden aparecer con saldo negativo
+        # y no deben tratarse como alerta para el usuario.
+        if es_cuenta_iva_descontable_presentacion_pasivo(cuenta, nombre):
+            return None
+
         if es_cuenta_contra_pasivo(cuenta, nombre):
             return {
                 "nivel": "info",
@@ -383,7 +400,7 @@ def _clasificar_alerta_item(item, seccion):
             return {
                 "nivel": "info",
                 "categoria": "pasivo_impuesto_retencion_negativo",
-                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a IVA descontable, devolución o compensación tributaria.",
+                "mensaje": f"La cuenta de pasivo {cuenta} - {nombre} presenta saldo negativo; validar si corresponde a devolución, compensación tributaria o cuenta de naturaleza especial.",
                 "cuenta": cuenta,
                 "nombre": nombre,
                 "saldo": redondear(saldo, 2),
@@ -399,7 +416,6 @@ def _clasificar_alerta_item(item, seccion):
         }
 
     return None
-
 
 def _label_categoria_alerta(categoria: str):
     labels = {
@@ -551,11 +567,11 @@ def _armar_narrativa(
 ):
     narrativa = []
 
-    if abs(cuadratura_original) < 1:
-        narrativa.append("El balance cuadra correctamente con la información clasificada.")
+    if abs(ajuste_patrimonio_aplicado) < 1:
+        narrativa.append("El balance cuadra correctamente al combinar activos, pasivos, patrimonio reportado y resultado acumulado calculado.")
     else:
-        narrativa.append("El balance requirió completar patrimonio calculado para cerrar la ecuación contable.")
-
+        narrativa.append("El balance requirió un ajuste residual de patrimonio calculado para cerrar la ecuación contable.")
+    
     if patrimonio_total > 0:
         narrativa.append("La empresa presenta una posición patrimonial positiva.")
     elif patrimonio_total < 0:
@@ -563,8 +579,8 @@ def _armar_narrativa(
     else:
         narrativa.append("La empresa no muestra patrimonio neto en el corte evaluado.")
 
-    if abs(patrimonio_explicito_total) < 1 and abs(patrimonio_calculado_total) >= 1:
-        narrativa.append("El patrimonio visible proviene principalmente del resultado acumulado calculado desde las cuentas de ingresos, costos y gastos.")
+    if abs(patrimonio_calculado_total) >= 1:
+        narrativa.append("El patrimonio total combina el patrimonio reportado en cuentas clase 3 con el resultado acumulado calculado desde ingresos, costos y gastos.")
 
     if abs(activo_no_corriente_contra_total) >= 1:
         narrativa.append(
@@ -705,6 +721,9 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
     ajuste_patrimonio_aplicado_actual = 0.0
     ajuste_patrimonio_aplicado_anterior = 0.0
+    ajuste_cuadratura_residual_actual = 0.0
+    ajuste_cuadratura_residual_anterior = 0.0
+
     patrimonio_calculado_total_actual = 0.0
     patrimonio_calculado_total_anterior = 0.0
 
@@ -730,7 +749,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     if abs(cuadratura_post_resultado) >= 1:
         item_ajuste = _crear_item_sintetico(
             cuenta="39AJUSTE",
-            nombre="Ajuste de patrimonio calculado para cuadratura",
+            nombre="Ajuste residual de patrimonio para cuadratura",
             seccion="PATRIMONIO",
             grupo_balance="PATRIMONIO",
             saldo_actual=cuadratura_post_resultado,
@@ -738,6 +757,8 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             modo_comparativo=modo_comparativo and snapshot_comparativo_existe
         )
         patrimonio_calculado.append(item_ajuste)
+
+        ajuste_cuadratura_residual_actual = cuadratura_post_resultado
         ajuste_patrimonio_aplicado_actual += cuadratura_post_resultado
         patrimonio_calculado_total_actual += cuadratura_post_resultado
 
@@ -775,7 +796,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         patrimonio_calculado,
         cuadratura_original,
         patrimonio_explicito_actual,
-        ajuste_patrimonio_aplicado_actual
+        ajuste_cuadratura_residual_actual
     )
 
     if modo_comparativo and comparar_con_norm and not snapshot_comparativo_existe:
