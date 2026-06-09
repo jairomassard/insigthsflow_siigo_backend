@@ -508,6 +508,7 @@ def _agrupar_alertas(alertas_dict):
     return alertas_resumen, alertas_grupo
 
 
+
 def _armar_alertas(
     activo_corriente,
     activo_no_corriente_bruto,
