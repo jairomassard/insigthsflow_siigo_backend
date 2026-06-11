@@ -5748,9 +5748,14 @@ def create_app():
             }), 400
 
         try:
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data["access_token"]
-            _headers_bearer(token, cred)
+            headers = _headers_bearer(token, cred)
 
             # -------------------------
             # Sync vendedores
@@ -6094,7 +6099,12 @@ def create_app():
             }), 400
 
         try:
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data["access_token"]
             headers = _headers_bearer(token, cred)
 
@@ -9206,7 +9216,12 @@ def create_app():
 
                 return jsonify({"error": detalle}), 400
 
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data.get("access_token")
             if not token:
                 detalle = "Error al obtener token Siigo."
@@ -11160,7 +11175,12 @@ def create_app():
             }), 400
 
         try:
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data["access_token"]
             headers = _headers_bearer(token, cred)
 
@@ -11364,7 +11384,12 @@ def create_app():
             return jsonify({"error": "No se pudo desencriptar access_key"}), 400
 
         try:
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data["access_token"]
             headers = _headers_bearer(token, cred)
 
@@ -13622,14 +13647,15 @@ def create_app():
 
         try:
             # Obtener token
-            token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+            token_data = siigo_auth_json(
+                cred.base_url,
+                cred.client_id,
+                access_key,
+                cred=cred,
+            )
             token = token_data["access_token"]
 
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            }
+            headers = _headers_bearer(token, cred)
 
             if cred.partner_id:
                 headers["Partner-Id"] = cred.partner_id
@@ -13770,7 +13796,12 @@ def create_app():
                 }), 400
 
             try:
-                token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
+                token_data = siigo_auth_json(
+                    base_url=cred.base_url,
+                    username=cred.client_id,
+                    access_key=access_key,
+                    cred=cred,
+                )
             except Exception as e:
                 detalle = f"Error autenticando contra Siigo: {str(e)}"
 
@@ -13812,13 +13843,7 @@ def create_app():
                     "tipo": "siigo_token_error"
                 }), 502
 
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            }
-
-            if cred.partner_id:
-                headers["Partner-Id"] = cred.partner_id
+            headers = _headers_bearer(token, cred)
 
             base_url = cred.base_url.rstrip("/")
             url = f"{base_url}/v1/accounts-payable?page=1&page_size=100"
