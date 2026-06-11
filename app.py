@@ -14832,7 +14832,13 @@ def create_app():
             return jsonify({"error": "No se pudo desencriptar Access Key"}), 400
 
         # --- token ---
-        token_data = siigo_auth_json(base_url=cred.base_url, username=cred.client_id, access_key=access_key)
+        token_data = siigo_auth_json(
+            base_url=cred.base_url,
+            username=cred.client_id,
+            access_key=access_key,
+            cred=cred,
+        )
+
         token = token_data.get("access_token")
         headers = _headers_bearer(token, cred)
         base_url = cred.base_url.rstrip("/")
