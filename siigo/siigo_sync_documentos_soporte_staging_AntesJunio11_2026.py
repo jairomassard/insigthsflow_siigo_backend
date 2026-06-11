@@ -244,7 +244,7 @@ def sync_documentos_soporte_staging_desde_siigo(
             "detalle": auth_data,
         }
 
-    headers = _siigo_headers_bearer(token, cfg)
+    headers = _siigo_headers_bearer(token)
     base_url = cfg.base_url.rstrip("/")
 
     nuevas = 0

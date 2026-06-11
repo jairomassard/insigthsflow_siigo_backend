@@ -34,7 +34,7 @@ def sync_productos_desde_siigo(idcliente: int) -> str:
     if not token:
         raise RuntimeError(token_data.get("_error") or "No se pudo obtener token de Siigo")
 
-    headers = _siigo_headers_bearer(token, cred)
+    headers = _siigo_headers_bearer(token)
     base_url = (cred.base_url or "").rstrip("/")
 
     page = 1

@@ -31,7 +31,11 @@ from siigo.siigo_sync_pagos import sync_pagos_egresos_desde_siigo
 from siigo.siigo_sync_compras import sync_compras_desde_siigo
 from sqlalchemy import text, func
 from sqlalchemy.exc import IntegrityError
-from utils import _siigo_headers_bearer, _siigo_auth_json_for_client
+from utils import (
+    _siigo_headers_bearer,
+    _siigo_auth_json_for_client,
+    _siigo_partner_id_for_client,
+)
 
 from io import BytesIO
 import pandas as pd
@@ -237,8 +241,7 @@ REQUIRED_DB_FIELDS = [
 FERNET_KEY = os.environ.get("APP_CRYPTO_KEY")  # genera una vez y guárdala en .env
 fernet = Fernet(FERNET_KEY) if FERNET_KEY else None
 
-#PARTNER_ID_DEFAULT = "ProjectManagerApp"
-PARTNER_ID_DEFAULT = os.getenv("SIIGO_PARTNER_ID", "ProjectManagerApp")
+PARTNER_ID_DEFAULT = None
 AUTH_TIMEOUT_SEC = int(os.getenv("SIIGO_AUTH_TIMEOUT", "60"))
 SANDBOX = os.getenv("SIIGO_SANDBOX", "0") == "1"
 
@@ -3253,13 +3256,14 @@ def create_app():
 
         base_url = (cred.base_url or "").rstrip("/")
 
-        partner_id = (
-            getattr(cred, "partner_id", None)
-            or os.getenv("SIIGO_PARTNER_ID", "")
-            or "ProjectManagerApp"
-        )
-
-        partner_id = str(partner_id).strip().strip('"').strip("'")
+        try:
+            partner_id = _siigo_partner_id_for_client(cred)
+        except ValueError as e:
+            return jsonify({
+                "error": "Partner ID no configurado",
+                "detalle": str(e),
+                "idcliente": idcliente,
+            }), 400
 
         auth_headers = {
             "Content-Type": "application/json",
@@ -4936,7 +4940,15 @@ def create_app():
         base_url = (cfg.base_url or "").rstrip("/")
         username = cfg.client_id or ""                 # Usuario API (correo)
         access_key = dec(cfg.client_secret) or ""      # Access Key
-        partner_id = os.getenv("SIIGO_PARTNER_ID", PARTNER_ID_DEFAULT).strip() or PARTNER_ID_DEFAULT
+        try:
+            partner_id = _siigo_partner_id_for_client(cfg)
+        except ValueError as e:
+            return jsonify({
+                "ok": False,
+                "error": "Partner ID no configurado",
+                "detalle": str(e),
+                "idcliente": idcliente,
+            }), 400
 
         base_headers = {
             "Content-Type": "application/json",
@@ -5082,7 +5094,10 @@ def create_app():
             idcliente = q_idcliente
 
         cfg = SiigoCredencial.query.filter_by(idcliente=idcliente).first()
-        partner_id = os.getenv("SIIGO_PARTNER_ID", PARTNER_ID_DEFAULT).strip() or PARTNER_ID_DEFAULT
+        try:
+            partner_id = _siigo_partner_id_for_client(cfg)
+        except ValueError:
+            partner_id = None
 
         if cfg and cfg.client_secret:
             try:
@@ -5102,6 +5117,7 @@ def create_app():
             "client_id": (cfg.client_id if cfg else None),
             "secret_stored": bool(cfg and cfg.client_secret),
             "partner_id": partner_id,
+            "partner_id_configurado": bool(partner_id),
         })
         
 
@@ -5503,7 +5519,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token desde Siigo"}), 502
 
         base_url = (cfg.base_url or "").rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         # 1) Traer detalle crudo desde Siigo
         raw_detail = None
@@ -5734,7 +5750,7 @@ def create_app():
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data["access_token"]
-            headers = _headers_bearer(token)
+            _headers_bearer(token, cred)
 
             # -------------------------
             # Sync vendedores
@@ -6080,7 +6096,7 @@ def create_app():
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data["access_token"]
-            headers = _headers_bearer(token)
+            headers = _headers_bearer(token, cred)
 
             base_url = cred.base_url.rstrip("/")
             page = 1
@@ -9216,7 +9232,7 @@ def create_app():
 
             while True:
                 url = f"{cred.base_url.rstrip('/')}/v1/credit-notes?page={page}&page_size=100"
-                r = _request_with_retries("GET", url, headers=_headers_bearer(token))
+                r = _request_with_retries("GET", url, headers=_headers_bearer(token, cred))
 
                 if r.status_code != 200:
                     detalle = f"Siigo error {r.status_code}: {r.text}"
@@ -9434,7 +9450,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token desde Siigo"}), 502
 
         base_url = (cfg.base_url or "").rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         # 1) Traer detalle crudo desde Siigo
         raw_detail = None
@@ -9560,7 +9576,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         page_size = request.args.get("page_size", default=5, type=int)
@@ -9637,7 +9653,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         url = f"{base_url}/v1/purchase-support-documents/{documento_id}"
@@ -9701,7 +9717,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         url = f"{base_url}/v1/document-types?type=DS"
@@ -10253,7 +10269,7 @@ def create_app():
             return jsonify({"error": token_data["_error"]}), 502
 
         token = token_data.get("access_token")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cred)
         base_url = cred.base_url.rstrip("/")
         tried_urls = []
 
@@ -10609,7 +10625,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo token de Siigo"}), 502
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         tried = []
         raw_detail = None
@@ -10701,7 +10717,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         url = f"{base_url}/v1/purchases?page_size=20"  # número pequeño para ver ejemplo
         try:
@@ -10736,7 +10752,7 @@ def create_app():
 
         token_data = _siigo_auth_json_for_client(cred)
         token = token_data.get("access_token")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cred)
         base_url = cred.base_url.rstrip("/")
 
         # recorrer muchas páginas
@@ -10785,7 +10801,7 @@ def create_app():
             return jsonify({"error": token_data["_error"]}), 502
 
         token = token_data.get("access_token")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cred)
         base_url = cred.base_url.rstrip("/")
         url = f"{base_url}/v1/payment-receipts?page_size=100"
 
@@ -10839,7 +10855,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         # 1. Obtener tipos de documento de compra
         doc_types_url = f"{base_url}/v1/document-types?type=FC"
@@ -10896,7 +10912,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         url = f"{base_url}/v1/purchases?page_size=300"
         try:
@@ -10931,7 +10947,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         posibles_rutas = [
             "contacts",
@@ -11001,7 +11017,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         page = 1
         page_size = 100
@@ -11146,7 +11162,7 @@ def create_app():
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data["access_token"]
-            headers = _headers_bearer(token)
+            headers = _headers_bearer(token, cred)
 
             base_url = cred.base_url.rstrip("/")
             page = 1
@@ -11350,7 +11366,7 @@ def create_app():
         try:
             token_data = siigo_auth_json(cred.base_url, cred.client_id, access_key)
             token = token_data["access_token"]
-            headers = _headers_bearer(token)
+            headers = _headers_bearer(token, cred)
 
             base_url = cred.base_url.rstrip("/")
             page = 1
@@ -14793,7 +14809,7 @@ def create_app():
         # --- token ---
         token_data = siigo_auth_json(base_url=cred.base_url, username=cred.client_id, access_key=access_key)
         token = token_data.get("access_token")
-        headers = _headers_bearer(token)
+        headers = _headers_bearer(token, cred)
         base_url = cred.base_url.rstrip("/")
 
         # --- recorrer productos con paginación ---
@@ -15362,7 +15378,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         # 🔧 Payload: dejamos account_start y account_end vacíos según la documentación
         payload = {
@@ -15449,7 +15465,7 @@ def create_app():
             return jsonify({"error": "No se obtuvo access_token", "detalle": auth_data}), 500
 
         base_url = cfg.base_url.rstrip("/")
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
 
         # --- Payload de la petición ---
         payload = {
@@ -18830,7 +18846,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         page_size = request.args.get("page_size", default=10, type=int)
@@ -18937,7 +18953,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         url = f"{base_url}/v1/quotations/{cotizacion_id}"
@@ -19004,7 +19020,7 @@ def create_app():
                 "detalle": auth_data
             }), 400
 
-        headers = _siigo_headers_bearer(token)
+        headers = _siigo_headers_bearer(token, cfg)
         base_url = cfg.base_url.rstrip("/")
 
         page_size = request.args.get("page_size", default=50, type=int)

@@ -14,21 +14,16 @@ from .siigo_sync_refactor import (
 )
 from utils import siigo_date_to_utc
 
-
+PARTNER_ID = os.getenv("SIIGO_PARTNER_ID", "ProjectManagerApp")
 PAGE_SIZE = int(os.getenv("SIIGO_PAGE_SIZE", "100"))
 
 
-def fetch_all_payment_receipts(
-    base_url: str,
-    token: str,
-    page_size: int = PAGE_SIZE,
-    cred: Optional[SiigoCredencial] = None,
-) -> List[Dict[str, Any]]:
+def fetch_all_payment_receipts(base_url: str, token: str, page_size: int = PAGE_SIZE) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     page = 1
     while True:
         url = f"{base_url.rstrip('/')}/v1/payment-receipts?page={page}&page_size={page_size}"
-        r = _request_with_retries("GET", url, headers=_headers_bearer(token, cred))
+        r = _request_with_retries("GET", url, headers=_headers_bearer(token))
         if r.status_code != 200:
             raise SiigoError(f"Payment Receipts {r.status_code}: {r.text}")
         data = r.json() or {}
@@ -66,18 +61,14 @@ def sync_pagos_egresos_desde_siigo(
 
     auth_url = f"{cred.base_url.rstrip('/')}/auth"
     auth_payload = {"username": cred.client_id, "access_key": access_key}
-    headers = _headers_json(cred)
+    headers = _headers_json()
     resp = _request_with_retries("POST", auth_url, headers=headers, json=auth_payload)
 
     if resp.status_code != 200:
         raise RuntimeError(f"Error al autenticar en Siigo (HTTP {resp.status_code}): {resp.text}")
 
     token = resp.json().get("access_token")
-    pagos_list = fetch_all_payment_receipts(
-        cred.base_url,
-        token,
-        cred=cred,
-    )
+    pagos_list = fetch_all_payment_receipts(cred.base_url, token)
 
     print(f"🔍 Total pagos recibidos del API: {len(pagos_list)}")
 

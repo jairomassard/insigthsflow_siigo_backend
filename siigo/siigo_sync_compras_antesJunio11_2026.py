@@ -54,7 +54,7 @@ def sync_compras_desde_siigo(
     if not token:
         return {"error": "No se obtuvo access_token", "detalle": auth_data}
 
-    headers = _siigo_headers_bearer(token, cfg)
+    headers = _siigo_headers_bearer(token)
     base_url = cfg.base_url.rstrip("/")
 
     nuevas = 0

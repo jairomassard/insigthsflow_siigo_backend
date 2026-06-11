@@ -20,6 +20,7 @@ from utils import siigo_date_to_utc
 # -----------------------------
 # Config
 # -----------------------------
+PARTNER_ID = os.getenv("SIIGO_PARTNER_ID", "ProjectManagerApp")
 PAGE_SIZE = int(os.getenv("SIIGO_PAGE_SIZE", "100"))
 READ_TIMEOUT = int(os.getenv("SIIGO_READ_TIMEOUT", "90"))
 MAX_RETRIES = int(os.getenv("SIIGO_MAX_RETRIES", "5"))
@@ -56,61 +57,18 @@ class SiigoError(Exception):
     pass
 
 
-def _clean_header_value(value: Optional[str]) -> str:
-    """
-    Limpia valores de headers que puedan venir con espacios o comillas.
-    """
-    if value is None:
-        return ""
-
-    return str(value).strip().strip('"').strip("'")
-
-
-def _partner_id_for_client(cred: Optional[SiigoCredencial] = None) -> str:
-    """
-    Resuelve Partner ID para Siigo en modo multitenant.
-
-    Regla InsightFlow:
-    - Siempre debe venir de siigo_credenciales.partner_id.
-    - No usamos SIIGO_PARTNER_ID global.
-    - No usamos fallback quemado.
-
-    Si falta, se detiene con error claro.
-    """
-    if cred is None:
-        raise SiigoError(
-            "Partner ID de Siigo no configurado: no se recibió la credencial del cliente."
-        )
-
-    partner_id = _clean_header_value(getattr(cred, "partner_id", None))
-
-    if not partner_id:
-        raise SiigoError(
-            "Partner ID de Siigo no configurado para este cliente. "
-            "Debe guardar el campo partner_id en siigo_credenciales."
-        )
-
-    return partner_id
-
-
-def _headers_json(cred: Optional[SiigoCredencial] = None) -> Dict[str, str]:
-    partner_id = _partner_id_for_client(cred)
-
+def _headers_json() -> Dict[str, str]:
     return {
         "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Partner-Id": partner_id,
+        "Partner-Id": PARTNER_ID,
     }
 
 
-def _headers_bearer(token: str, cred: Optional[SiigoCredencial] = None) -> Dict[str, str]:
-    partner_id = _partner_id_for_client(cred)
-
+def _headers_bearer(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Partner-Id": partner_id,
+        "Partner-Id": PARTNER_ID,
     }
 
 
@@ -244,16 +202,9 @@ def _request_with_retries(method: str, url: str, headers: dict, **kwargs) -> req
 # -----------------------------
 # Autenticación y descarga
 # -----------------------------
-def siigo_auth_json(
-    base_url: str,
-    username: str,
-    access_key: str,
-    cred: Optional[SiigoCredencial] = None,
-) -> Dict[str, Any]:
+def siigo_auth_json(base_url: str, username: str, access_key: str) -> Dict[str, Any]:
     """
     Auth oficial: POST JSON a /auth o /v1/auth.
-
-    En InsightFlow el Partner ID debe venir desde cred.partner_id.
     """
     payload = {
         "username": username,
@@ -262,15 +213,14 @@ def siigo_auth_json(
 
     for path in ("/auth", "/v1/auth"):
         url = f"{base_url.rstrip('/')}{path}"
-
         r = _request_with_retries(
             "POST",
             url,
-            headers=_headers_json(cred),
+            headers=_headers_json(),
             json=payload,
         )
 
-        if r.status_code in (200, 201):
+        if r.status_code == 200:
             return r.json() or {}
 
         if r.status_code == 404:
@@ -285,7 +235,6 @@ def fetch_all_invoices(
     base_url: str,
     token: str,
     page_size: int = PAGE_SIZE,
-    cred: Optional[SiigoCredencial] = None,
 ) -> List[Dict[str, Any]]:
     """
     Pagina /v1/invoices en modo ligero.
@@ -299,7 +248,7 @@ def fetch_all_invoices(
         r = _request_with_retries(
             "GET",
             url,
-            headers=_headers_bearer(token, cred),
+            headers=_headers_bearer(token),
         )
 
         if r.status_code != 200:
@@ -327,7 +276,6 @@ def _fetch_invoice_detail_safe(
     base_url: str,
     token: str,
     invoice_id_or_uuid: str,
-    cred: Optional[SiigoCredencial] = None,
 ) -> dict:
     """
     Trae detalle por id/uuid; si falla, intenta por name.
@@ -337,7 +285,7 @@ def _fetch_invoice_detail_safe(
     r = _request_with_retries(
         "GET",
         url,
-        headers=_headers_bearer(token, cred),
+        headers=_headers_bearer(token),
     )
 
     if r.status_code != 200:
@@ -346,7 +294,7 @@ def _fetch_invoice_detail_safe(
         r2 = _request_with_retries(
             "GET",
             alt_url,
-            headers=_headers_bearer(token, cred),
+            headers=_headers_bearer(token),
         )
 
         if r2.status_code == 200:
@@ -410,7 +358,6 @@ def sync_facturas_desde_siigo(
         base_url=cred.base_url,
         username=cred.client_id,
         access_key=access_key,
-        cred=cred,
     )
 
     token = token_data["access_token"]
@@ -466,7 +413,6 @@ def sync_facturas_desde_siigo(
         invoices_list = fetch_all_invoices(
             base_url=cred.base_url,
             token=token,
-            cred=cred,
         )
 
         # 2) Filtro opcional por fecha (since=YYYY-MM-DD)
@@ -716,7 +662,6 @@ def sync_facturas_desde_siigo(
                 cred.base_url,
                 token,
                 inv_id,
-                cred=cred,
             )
         except Exception:
             fallidas += 1
