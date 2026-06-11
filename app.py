@@ -19815,6 +19815,7 @@ def create_app():
     # Enpoint para llevar a cabo la ejecucion del boton de sincronizacion de todo en siigo
     # Endpoint para sincronizar todo (invoca internamente otros endpoints)
     # Endpoint para sincronizar todo (invoca internamente otros endpoints)
+    # Endpoint para sincronizar todo (invoca internamente otros endpoints)
     @app.route("/siigo/sync-all", methods=["POST"])
     def siigo_sync_all():
         idcliente = obtener_idcliente_desde_request()
@@ -19973,17 +19974,69 @@ def create_app():
                     dur = round(time.time() - inicio, 1)
                     print(f"✅ {ep} completado en {dur}s -> {status}")
 
-                    log_parts.append(f"{ep} {params} -> {status}: {body}")
+                    # ==========================================================
+                    # Detectar errores lógicos aunque el HTTP sea 200.
+                    #
+                    # Algunos endpoints pueden responder HTTP 200 pero traer:
+                    # {"estado": "ERROR"}
+                    # {"status": "ERROR"}
+                    # {"resultado": "ERROR"}
+                    #
+                    # En esos casos sync-all debe marcar ERROR y detenerse,
+                    # porque operativamente el módulo falló aunque HTTP sea 200.
+                    # ==========================================================
+                    error_logico = False
+                    detalle_error_logico = None
+
+                    try:
+                        body_json = resp.get_json(silent=True)
+
+                        if isinstance(body_json, dict):
+                            estado_modulo = str(body_json.get("estado") or "").strip().upper()
+                            status_modulo = str(body_json.get("status") or "").strip().upper()
+                            resultado_modulo = str(body_json.get("resultado") or "").strip().upper()
+
+                            if estado_modulo == "ERROR":
+                                error_logico = True
+                                detalle_error_logico = "estado=ERROR"
+
+                            elif status_modulo == "ERROR":
+                                error_logico = True
+                                detalle_error_logico = "status=ERROR"
+
+                            elif resultado_modulo == "ERROR":
+                                error_logico = True
+                                detalle_error_logico = "resultado=ERROR"
+
+                    except Exception as e:
+                        print(f"⚠️ No se pudo interpretar JSON de {ep}: {e}")
+
+                    # Para que _resumir_detalle_sync marque error,
+                    # si hubo error lógico convertimos el status del log a 500.
+                    # El HTTP real queda visible dentro del texto.
+                    status_para_log = 500 if error_logico and status < 400 else status
+
+                    if error_logico:
+                        log_parts.append(
+                            f"{ep} {params} -> {status_para_log}: "
+                            f"ERROR_LOGICO detectado ({detalle_error_logico}). "
+                            f"HTTP real={status}. Body={body}"
+                        )
+                    else:
+                        log_parts.append(f"{ep} {params} -> {status_para_log}: {body}")
 
                     # 📊 Guardar métrica individual del endpoint
                     try:
                         resumen = body[:300] if body else None
+                        if error_logico:
+                            resumen = f"ERROR_LOGICO ({detalle_error_logico}). HTTP real={status}. {resumen or ''}"
+
                         metric = SiigoSyncMetric(
                             idcliente=idcliente,
                             endpoint=ep,
                             duracion_segundos=dur,
-                            status_code=status,
-                            resultado="OK" if status < 400 else "ERROR",
+                            status_code=status_para_log,
+                            resultado="OK" if status < 400 and not error_logico else "ERROR",
                             detalle_resumen=resumen
                         )
                         db.session.add(metric)
@@ -19991,8 +20044,15 @@ def create_app():
                     except Exception as e:
                         print(f"⚠️  Error guardando métrica: {e}")
 
-                    if status >= 400:
+                    if status >= 400 or error_logico:
                         overall_status = "ERROR"
+
+                        if error_logico:
+                            print(
+                                f"❌ {ep} respondió HTTP {status}, "
+                                f"pero reportó error lógico: {detalle_error_logico}"
+                            )
+
                         break
 
                     # Pausa defensiva para evitar rate limit de Siigo entre módulos
@@ -20089,7 +20149,11 @@ def create_app():
 
             ep_fallido = None
             for line in reversed(log_parts):
-                if ("->" in line and "ERROR" in line) or ("excepción" in line):
+                if (
+                    ("->" in line and "ERROR" in line)
+                    or ("ERROR_LOGICO" in line)
+                    or ("excepción" in line)
+                ):
                     ep_fallido = line.split(" ")[0]
                     break
 
@@ -20149,7 +20213,7 @@ def create_app():
                 config.ultimo_auto_ejecutado.isoformat()
                 if config and config.ultimo_auto_ejecutado else None
             )
-        })
+        }), 200
 
 # Este endpoint no esta en suso pero se deja para futura posible verificacion o uso
     # --- CRON: Verificador automático de sincronización Siigo (cada 4 horas) ---
