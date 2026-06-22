@@ -1342,6 +1342,13 @@ def _resolver_corte_confiable_auxiliar(idcliente):
             "modo_periodo": "sin_datos",
         }
 
+    # ── FIX: si el auxiliar tiene fechas futuras (ej. asientos programados),
+    # las ignoramos para el cálculo del corte confiable.
+    # La lógica de negocio no cambia: simplemente trabajamos con "hoy" como tope.
+    hoy = date.today()
+    if ultima_fecha > hoy:
+        ultima_fecha = hoy
+
     ultimo_dia_del_mes = _last_day_of_month(ultima_fecha)
 
     # Último día hábil aproximado:
