@@ -5142,19 +5142,6 @@ def create_app():
         since = request.args.get("since")
         modo_sync_all = request.headers.get("X-SYNC-ALL") == "1"
 
-        # --- NUEVO: parámetros opcionales de reproceso forzado ---
-        # Uso: para forzar el reproceso de facturas que YA tienen datos
-        # (subtotal/moneda llenos, aunque incorrectos) y que por eso
-        # only_missing=True nunca detecta como pendientes.
-        # Ej: POST /siigo/sync-facturas?deep=1&force_customer_identificacion=444444003
-        force_customer_identificacion = request.args.get("force_customer_identificacion")
-        force_idfacturas_raw = request.args.get("force_idfacturas")  # comma-separated
-        force_idfacturas = (
-            [x.strip() for x in force_idfacturas_raw.split(",") if x.strip()]
-            if force_idfacturas_raw
-            else None
-        )
-
         kwargs = {
             "idcliente": idcliente,
             "deep": deep,
@@ -5165,28 +5152,15 @@ def create_app():
         if batch:
             kwargs["batch_size"] = batch
 
-        # Solo se agregan al kwargs si vienen presentes; si no, el
-        # comportamiento normal de siempre queda 100% intacto.
-        if force_customer_identificacion:
-            kwargs["force_customer_identificacion"] = force_customer_identificacion
-
-        if force_idfacturas:
-            kwargs["force_idfacturas"] = force_idfacturas
-
         endpoint_log = "/siigo/sync-facturas"
         params_log = {
             "deep": deep,
             "batch": batch,
             "only_missing": only_missing,
             "since": since,
-            "force_customer_identificacion": force_customer_identificacion,
-            "force_idfacturas": force_idfacturas,
         }
 
         nombre_proceso = "Facturas detalle" if deep else "Facturas de venta"
-
-        if force_customer_identificacion or force_idfacturas:
-            nombre_proceso = f"{nombre_proceso} (reproceso forzado)"
 
         try:
             if modo_sync_all:
@@ -5265,12 +5239,11 @@ def create_app():
                 "origen": "manual_modulo",
                 "estado": "EN_EJECUCION",
                 "since": since,
-                "force_customer_identificacion": force_customer_identificacion,
-                "force_idfacturas": force_idfacturas,
             }), 202
 
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
 
 
     @app.route("/siigo/sync-facturas-completar-detalle", methods=["POST"])

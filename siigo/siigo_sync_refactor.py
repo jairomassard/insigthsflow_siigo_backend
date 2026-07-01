@@ -3,6 +3,12 @@
 # - Usa Decimal para todos los montos (evita Decimal vs float).
 # - Reintentos/backoff en requests.
 # - En deep=True solo trae detalle de un lote de facturas que lo necesitan.
+#
+# FIX 2026-07: Conversión de moneda extranjera (USD -> COP) usando el
+# exchange_rate que Siigo entrega en detalle.currency. Antes, currency
+# llegaba como dict y _str(dict) devolvía "" silenciosamente, dejando
+# los montos guardados tal cual venían en USD y el campo moneda forzado
+# siempre a "COP". Ver bug: facturas Tello Properties (idcliente=13).
 
 import os
 import time
@@ -382,6 +388,76 @@ def _needs_enrichment(f: SiigoFactura) -> bool:
 
 
 # -----------------------------
+# Conversión de moneda extranjera -> COP
+# -----------------------------
+def _extraer_moneda_y_tasa(detalle: dict):
+    """
+    Lee detalle["currency"] de forma segura.
+
+    Siigo devuelve currency como un dict, p.ej.:
+        {"code": "USD", "exchange_rate": 3475.72}
+
+    Antes este archivo hacía _str(detalle.get("currency")), lo cual
+    siempre devolvía "" porque _str() no sabe manejar un dict. Eso
+    dejaba moneda_codigo vacío y nunca se aplicaba conversión alguna.
+
+    Devuelve (moneda_codigo: str, tasa_cambio: Optional[Decimal]).
+    Si no hay currency, o code es COP, o no hay exchange_rate valido,
+    se devuelve tasa_cambio=None (equivale a "no convertir").
+    """
+    currency_obj = detalle.get("currency")
+
+    if not isinstance(currency_obj, dict):
+        return "COP", None
+
+    codigo = _str(currency_obj.get("code")).upper() or "COP"
+    tasa = _d(currency_obj.get("exchange_rate"), None)
+
+    if codigo == "COP" or not tasa or tasa <= DZERO:
+        return (codigo or "COP"), None
+
+    return codigo, tasa
+
+
+def _convertir_items_y_pagos_a_cop(items_detalle: List[Dict[str, Any]], payments: Any, tasa_cambio: Decimal):
+    """
+    Multiplica por tasa_cambio los montos monetarios de items y payments,
+    IN PLACE, antes de que el resto del código sume subtotal/IVA/pagos.
+
+    Así sum_subtotal_from_items / sum_iva_from_items / sum_payments_value
+    (que no cambian) ya trabajan en COP sin duplicar lógica.
+    """
+    for it in items_detalle:
+        if not isinstance(it, dict):
+            continue
+
+        if "price" in it:
+            it["price"] = float(_d(it.get("price"), DZERO) * tasa_cambio)
+
+        if "total" in it and it.get("total") is not None:
+            it["total"] = float(_d(it.get("total"), DZERO) * tasa_cambio)
+
+        taxes = it.get("taxes")
+        if isinstance(taxes, list):
+            for tx in taxes:
+                if isinstance(tx, dict) and "value" in tx:
+                    tx["value"] = float(_d(tx.get("value"), DZERO) * tasa_cambio)
+
+        # discount / discounts también son monetarios en algunos payloads de Siigo
+        for campo_desc in ("discount", "discounts"):
+            if campo_desc in it and it.get(campo_desc) not in (None, ""):
+                try:
+                    it[campo_desc] = float(_d(it.get(campo_desc), DZERO) * tasa_cambio)
+                except Exception:
+                    pass
+
+    if isinstance(payments, list):
+        for p in payments:
+            if isinstance(p, dict) and "value" in p:
+                p["value"] = float(_d(p.get("value"), DZERO) * tasa_cambio)
+
+
+# -----------------------------
 # Sync principal
 # -----------------------------
 def sync_facturas_desde_siigo(
@@ -390,7 +466,19 @@ def sync_facturas_desde_siigo(
     batch_size: int = 50,
     only_missing: bool = True,
     since: Optional[str] = None,
+    force_customer_identificacion: Optional[str] = None,
+    force_idfacturas: Optional[List[str]] = None,
 ) -> str:
+    """
+    force_customer_identificacion / force_idfacturas:
+    Parámetros opcionales (default None => comportamiento 100% igual al de
+    siempre). Si se pasan, en modo deep=True se ignora el filtro normal de
+    "solo pendientes" (only_missing) y se fuerza el reproceso de las
+    facturas que matcheen, sin importar si ya tenían subtotal/moneda
+    "llenos". Pensado para backfills puntuales, ej: facturas guardadas
+    en USD crudo por el bug de conversión de moneda (ver bug Tello
+    Properties, idcliente=13, customer_identificacion=444444003).
+    """
     cliente = Cliente.query.filter_by(idcliente=idcliente).first()
 
     if not cliente:
@@ -668,23 +756,63 @@ def sync_facturas_desde_siigo(
     total_facturas_scope = _query_facturas_scope_total().count()
     pendientes_antes = _query_facturas_pendientes_detalle().count()
 
-    if only_missing:
-        q = _query_facturas_pendientes_detalle()
+    # -----------------------------------------------------------
+    # Modo forzado: ignora only_missing por completo. Se usa para
+    # backfills puntuales (ej. facturas Tello en USD sin convertir).
+    # No aplica limit(batch_size): el universo forzado es explícito
+    # y pequeño por diseño (lo define quien llama al endpoint).
+    # -----------------------------------------------------------
+    modo_forzado = bool(force_customer_identificacion or force_idfacturas)
+
+    if modo_forzado:
+        q_forzado = SiigoFactura.query.filter_by(idcliente=idcliente)
+
+        condiciones = []
+
+        if force_customer_identificacion:
+            condiciones.append(
+                SiigoFactura.customer_identificacion == force_customer_identificacion
+            )
+
+        if force_idfacturas:
+            condiciones.append(SiigoFactura.idfactura.in_(force_idfacturas))
+
+        cond_final = condiciones[0]
+        for c in condiciones[1:]:
+            cond_final = cond_final | c
+
+        q_forzado = q_forzado.filter(cond_final)
+
+        objetivos: List[SiigoFactura] = (
+            q_forzado.order_by(SiigoFactura.fecha.desc(), SiigoFactura.id.desc()).all()
+        )
+
     else:
-        q = SiigoFactura.query.filter_by(idcliente=idcliente)
+        if only_missing:
+            q = _query_facturas_pendientes_detalle()
+        else:
+            q = SiigoFactura.query.filter_by(idcliente=idcliente)
 
-        if since:
-            try:
-                since_dt = datetime.fromisoformat(since).date()
-                q = q.filter(SiigoFactura.fecha >= since_dt)
-            except Exception:
-                pass
+            if since:
+                try:
+                    since_dt = datetime.fromisoformat(since).date()
+                    q = q.filter(SiigoFactura.fecha >= since_dt)
+                except Exception:
+                    pass
 
-    objetivos: List[SiigoFactura] = (
-        q.order_by(SiigoFactura.fecha.desc(), SiigoFactura.id.desc())
-        .limit(max(1, int(batch_size)))
-        .all()
-    )
+        objetivos = (
+            q.order_by(SiigoFactura.fecha.desc(), SiigoFactura.id.desc())
+            .limit(max(1, int(batch_size)))
+            .all()
+        )
+
+    if not objetivos and modo_forzado:
+        return (
+            "Modo forzado: no se encontraron facturas que coincidan con "
+            f"force_customer_identificacion={force_customer_identificacion!r} "
+            f"/ force_idfacturas={force_idfacturas!r}. "
+            "Revisa el/los valores enviados."
+        )
 
     if not objetivos:
         pendientes_despues = _query_facturas_pendientes_detalle().count()
@@ -753,6 +881,27 @@ def sync_facturas_desde_siigo(
         f.public_url = _str(detalle.get("public_url"))
         f.cost_center = detalle.get("cost_center")
 
+        # -----------------------------------------------------------
+        # FIX moneda extranjera: detectar code + exchange_rate ANTES
+        # de sumar nada, y convertir items/payments in-place para que
+        # todo lo que sigue (subtotal, iva, pagos, retenciones, items)
+        # ya trabaje en COP de forma consistente.
+        # -----------------------------------------------------------
+        moneda_codigo, tasa_cambio = _extraer_moneda_y_tasa(detalle)
+
+        items_detalle = _safe_items_list(detalle.get("items"))
+        payments = detalle.get("payments") or []
+
+        if tasa_cambio:
+            _convertir_items_y_pagos_a_cop(items_detalle, payments, tasa_cambio)
+
+        def _to_cop(valor: Optional[Decimal]) -> Optional[Decimal]:
+            if valor is None:
+                return None
+            if tasa_cambio:
+                return valor * tasa_cambio
+            return valor
+
         retenciones_raw = detalle.get("retentions") or []
         retenciones_clean = []
 
@@ -761,13 +910,10 @@ def sync_facturas_desde_siigo(
                 retenciones_clean.append({
                     "type": _str(r.get("type")),
                     "percentage": float(_d(r.get("percentage"), DZERO)),
-                    "value": float(_d(r.get("value"), DZERO)),
+                    "value": float(_to_cop(_d(r.get("value"), DZERO))),
                 })
 
         f.retenciones = retenciones_clean or None
-
-        items_detalle = _safe_items_list(detalle.get("items"))
-        payments = detalle.get("payments") or []
 
         # Fecha de vencimiento
         if isinstance(payments, list) and payments and isinstance(payments[0], dict):
@@ -782,20 +928,18 @@ def sync_facturas_desde_siigo(
         descuentos_total = DZERO
         pagos_total = sum_payments_value(payments)
 
-        total_det = _d(detalle.get("total"), None)
+        total_det = _to_cop(_d(detalle.get("total"), None))
 
         if total_det is None:
             total_det = subtotal + iva_total - descuentos_total
 
-        balance = _d(detalle.get("balance"), None)
+        balance = _to_cop(_d(detalle.get("balance"), None))
 
         if balance is None:
             balance = total_det - pagos_total
 
             if balance < DZERO:
                 balance = DZERO
-
-        currency = _str(detalle.get("currency"))
 
         estado_pago = "pendiente"
 
@@ -826,9 +970,11 @@ def sync_facturas_desde_siigo(
 
         f.estado_pago = estado_pago or f.estado_pago
 
-        # Si Siigo no devuelve moneda, dejamos COP para marcar la factura
-        # como técnicamente enriquecida y evitar reprocesos infinitos.
-        f.moneda = currency or f.moneda or "COP"
+        # FIX: antes esto siempre caía en "COP" porque currency (dict)
+        # pasaba por _str() y quedaba "". Ahora usamos el código real
+        # ya extraído arriba (COP si no hay moneda extranjera, o el
+        # código real -p.ej. USD- si la factura viene en otra moneda).
+        f.moneda = moneda_codigo or f.moneda or "COP"
 
         f.medio_pago = _str(
             payments[0].get("name")
@@ -920,6 +1066,14 @@ def sync_facturas_desde_siigo(
         if total_facturas_scope == 0
         else round((detalladas_total / total_facturas_scope) * 100, 1)
     )
+
+    if modo_forzado:
+        return (
+            f"Modo forzado: se reprocesaron {enriquecidas} facturas "
+            f"(fallidas: {fallidas}) que coincidían con "
+            f"force_customer_identificacion={force_customer_identificacion!r} "
+            f"/ force_idfacturas={force_idfacturas!r}."
+        )
 
     finalizado = pendientes_despues == 0
 
