@@ -593,6 +593,29 @@ def sync_facturas_desde_siigo(
                 total = _d(it.get("total"), DZERO)
                 balance = _d(it.get("balance"), DZERO)
                 public = _str(it.get("public_url"))
+
+                # -----------------------------------------------------------
+                # FIX moneda extranjera en modo ligero (deep=False).
+                #
+                # Este modo NO trae detalle completo de Siigo, solo el
+                # listado /v1/invoices. Si ese listado también incluye el
+                # objeto "currency" con exchange_rate, lo convertimos igual
+                # que en modo detallado. Si NO lo trae (no sabemos si el
+                # listado da esa info), NO podemos asumir que el total
+                # crudo es COP: si la factura ya fue enriquecida por el
+                # modo detallado y quedó marcada con una moneda extranjera
+                # (f.moneda != "COP"), protegemos total/saldo y NO los
+                # sobrescribimos aquí, para no deshacer la conversión ya
+                # aplicada. El modo detallado sigue siendo la fuente
+                # autorizada de total/saldo para facturas en moneda
+                # extranjera.
+                # -----------------------------------------------------------
+                moneda_codigo_it, tasa_it = _extraer_moneda_y_tasa(it)
+
+                if tasa_it:
+                    total = total * tasa_it
+                    balance = balance * tasa_it
+
                 payments = it.get("payments") or []
                 vencimiento = None
 
@@ -664,13 +687,26 @@ def sync_facturas_desde_siigo(
                         f.estado = status
                         changed = True
 
-                    if (total != DZERO) and (f.total != total):
-                        f.total = total
-                        changed = True
+                    # Si el listado no trajo info de moneda utilizable
+                    # (tasa_it es None) y esta factura YA fue enriquecida
+                    # en una moneda extranjera por el modo detallado,
+                    # protegemos total/saldo: no los sobrescribimos con
+                    # el valor crudo del listado, que podría venir sin
+                    # convertir.
+                    proteger_total_saldo = (
+                        not tasa_it
+                        and bool(f.moneda)
+                        and f.moneda != "COP"
+                    )
 
-                    if (balance is not None) and (f.saldo != balance):
-                        f.saldo = balance
-                        changed = True
+                    if not proteger_total_saldo:
+                        if (total != DZERO) and (f.total != total):
+                            f.total = total
+                            changed = True
+
+                        if (balance is not None) and (f.saldo != balance):
+                            f.saldo = balance
+                            changed = True
 
                     if public and f.public_url != public:
                         f.public_url = public
