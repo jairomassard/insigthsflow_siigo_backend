@@ -11773,7 +11773,9 @@ def create_app():
                     COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre
 
                 FROM siigo_compras c
-                LEFT JOIN siigo_centros_costo cc ON c.cost_center = cc.id
+                LEFT JOIN siigo_centros_costo cc
+                    ON c.cost_center = cc.id
+                    AND cc.idcliente = c.idcliente
                 WHERE {where_sql}
                 ORDER BY c.proveedor_nombre, c.fecha DESC
             """
