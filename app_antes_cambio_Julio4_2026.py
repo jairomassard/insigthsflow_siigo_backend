@@ -11562,7 +11562,6 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         estado = request.args.get("estado")  # "pagado" | "pendiente"
-        centro_costos = request.args.get("centro_costos")
 
         condiciones = ["c.idcliente = :idcliente"]
         params = {"idcliente": idcliente}
@@ -11587,11 +11586,6 @@ def create_app():
             if estado_norm in ["pagado", "pendiente"]:
                 condiciones.append("LOWER(c.estado) = :estado")
                 params["estado"] = estado_norm
-
-        # --- Filtro por centro de costo ---
-        if centro_costos:
-            condiciones.append("c.cost_center = :centro_costos")
-            params["centro_costos"] = centro_costos
 
         where_sql = " AND ".join(condiciones)
 
@@ -11768,12 +11762,9 @@ def create_app():
                         ELSE 'parcial'
                     END AS estado,
 
-                    COALESCE(c.estado, '') AS estado_original,
-
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre
+                    COALESCE(c.estado, '') AS estado_original
 
                 FROM siigo_compras c
-                LEFT JOIN siigo_centros_costo cc ON c.cost_center = cc.id
                 WHERE {where_sql}
                 ORDER BY c.proveedor_nombre, c.fecha DESC
             """
