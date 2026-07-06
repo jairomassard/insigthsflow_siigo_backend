@@ -246,6 +246,8 @@ def insertar_documentos_soporte_desde_staging(
                 omitidas += 1
                 continue
 
+            retencion_total = _to_decimal(s.retentions_total, Decimal("0"))
+
             compra = SiigoCompra(
                 idcliente=idcliente,
                 idcompra=s.name,
@@ -259,6 +261,7 @@ def insertar_documentos_soporte_desde_staging(
                 cost_center=s.cost_center,
                 creado=s.created_siigo,
                 factura_proveedor=s.factura_proveedor,
+                retencion_total=retencion_total,
             )
 
             db.session.add(compra)

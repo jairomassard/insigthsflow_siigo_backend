@@ -11892,39 +11892,33 @@ def create_app():
 
         # --- Evolución mensual (contable) ---
         # --- Evolución mensual (contable) ---
-        # base_neta: total bruto menos la retención (ReteICA/ReteFuente) ya descontada
-        # por Siigo en el saldo de Documento Soporte desde el momento en que se crea el
-        # documento (no es un pago real). Sin esto, "pagado" queda inflado por el valor
-        # de la retención aunque el proveedor no haya recibido ningún abono.
         query_evolucion = f"""
-            WITH base AS (
-                SELECT
-                    c.fecha,
-                    COALESCE(c.total_ajustado, c.total, 0) AS total_bruto,
-                    COALESCE(c.saldo, 0) AS saldo,
-                    GREATEST(
-                        COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0),
-                        0
-                    ) AS base_neta
-                FROM siigo_compras c
-                WHERE {where_sql}
-            )
             SELECT
-                date_trunc('month', fecha) AS mes,
+                date_trunc('month', c.fecha) AS mes,
 
-                -- Total neto ajustado por notas débito (bruto, sin descontar retención:
-                -- es el valor real de la compra/gasto)
-                SUM(total_bruto) AS total_compras,
+                -- Total neto ajustado por notas débito
+                SUM(COALESCE(c.total_ajustado, c.total, 0)) AS total_compras,
 
-                -- Pagado calculado sobre la base neta de retención.
+                -- Pagado calculado sobre total ajustado.
                 -- Evita negativos cuando una nota débito ajusta totalmente el documento.
-                SUM(GREATEST(base_neta - saldo, 0)) AS total_pagadas,
+                SUM(
+                    GREATEST(
+                        COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.saldo, 0),
+                        0
+                    )
+                ) AS total_pagadas,
 
-                -- Pendiente limitado a la base neta de retención.
+                -- Pendiente limitado al total ajustado.
                 -- Si el documento quedó ajustado en cero, no debe quedar pendiente inflado.
-                SUM(LEAST(saldo, base_neta)) AS total_pendientes
+                SUM(
+                    LEAST(
+                        COALESCE(c.saldo, 0),
+                        COALESCE(c.total_ajustado, c.total, 0)
+                    )
+                ) AS total_pendientes
 
-            FROM base
+            FROM siigo_compras c
+            WHERE {where_sql}
             GROUP BY mes
             ORDER BY mes
         """
@@ -11932,74 +11926,88 @@ def create_app():
 
         # --- KPIs generales (contables + parciales) ---
         # --- KPIs generales (contables + parciales) ---
-        # base_neta: ver nota en query_evolucion. El total bruto ("total_compras",
-        # "valor_compras_x_factura", "valor_compras_x_cta_cobro") se deja sin tocar
-        # porque representa el valor real de la compra/gasto, no el estado de pago.
         query_kpis = f"""
-            WITH base AS (
-                SELECT
-                    c.idcompra,
-                    COALESCE(c.total_ajustado, c.total, 0) AS total_bruto,
-                    COALESCE(c.saldo, 0) AS saldo,
-                    COALESCE(c.total_ajustes_debito, 0) AS total_ajustes_debito,
-                    COALESCE(c.ajustes_count, 0) AS ajustes_count,
-                    GREATEST(
-                        COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0),
-                        0
-                    ) AS base_neta
-                FROM siigo_compras c
-                WHERE {where_sql}
-            )
             SELECT
                 COUNT(*) AS total_facturas,
 
-                SUM(total_bruto) AS total_compras,
+                -- Total neto ajustado por notas débito
+                SUM(COALESCE(c.total_ajustado, c.total, 0)) AS total_compras,
 
-                SUM(GREATEST(base_neta - saldo, 0)) AS total_pagado,
+                -- Contable ajustado
+                SUM(
+                    GREATEST(
+                        COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.saldo, 0),
+                        0
+                    )
+                ) AS total_pagado,
 
-                SUM(LEAST(saldo, base_neta)) AS total_saldo,
+                SUM(
+                    LEAST(
+                        COALESCE(c.saldo, 0),
+                        COALESCE(c.total_ajustado, c.total, 0)
+                    )
+                ) AS total_saldo,
 
-                -- Conteos contables por saldo, usando la base neta de retención
+                -- Conteos contables por saldo, usando total ajustado
                 SUM(
                     CASE
-                        WHEN base_neta = 0 THEN 1
-                        WHEN saldo = 0 THEN 1
+                        WHEN COALESCE(c.total_ajustado, c.total, 0) = 0 THEN 1
+                        WHEN COALESCE(c.saldo, 0) = 0 THEN 1
                         ELSE 0
                     END
                 ) AS facturas_pagadas,
 
                 SUM(
                     CASE
-                        WHEN base_neta > 0 AND saldo >= base_neta THEN 1 ELSE 0
+                        WHEN COALESCE(c.total_ajustado, c.total, 0) > 0
+                         AND COALESCE(c.saldo, 0) >= COALESCE(c.total_ajustado, c.total, 0)
+                        THEN 1 ELSE 0
                     END
                 ) AS facturas_pendientes,
 
                 SUM(
                     CASE
-                        WHEN saldo > 0 AND saldo < base_neta THEN 1 ELSE 0
+                        WHEN COALESCE(c.saldo, 0) > 0
+                         AND COALESCE(c.saldo, 0) < COALESCE(c.total_ajustado, c.total, 0)
+                        THEN 1 ELSE 0
                     END
                 ) AS facturas_parciales,
 
                 -- Valor parcial ajustado
                 SUM(
                     CASE
-                        WHEN saldo > 0 AND saldo < base_neta THEN saldo
+                        WHEN COALESCE(c.saldo, 0) > 0
+                         AND COALESCE(c.saldo, 0) < COALESCE(c.total_ajustado, c.total, 0)
+                        THEN COALESCE(c.saldo, 0)
                         ELSE 0
                     END
                 ) AS saldo_parcial,
 
-                -- KPIs por tipo documento usando valor bruto (valor real de la compra)
-                SUM(CASE WHEN idcompra LIKE 'FC-%' THEN 1 ELSE 0 END) AS compras_x_factura,
-                SUM(CASE WHEN idcompra LIKE 'FC-%' THEN total_bruto ELSE 0 END) AS valor_compras_x_factura,
+                -- KPIs por tipo documento usando valor neto ajustado
+                SUM(CASE WHEN c.idcompra LIKE 'FC-%' THEN 1 ELSE 0 END) AS compras_x_factura,
+                SUM(
+                    CASE
+                        WHEN c.idcompra LIKE 'FC-%'
+                        THEN COALESCE(c.total_ajustado, c.total, 0)
+                        ELSE 0
+                    END
+                ) AS valor_compras_x_factura,
 
-                SUM(CASE WHEN idcompra LIKE 'DS-%' THEN 1 ELSE 0 END) AS compras_x_cta_cobro,
-                SUM(CASE WHEN idcompra LIKE 'DS-%' THEN total_bruto ELSE 0 END) AS valor_compras_x_cta_cobro,
+                SUM(CASE WHEN c.idcompra LIKE 'DS-%' THEN 1 ELSE 0 END) AS compras_x_cta_cobro,
+                SUM(
+                    CASE
+                        WHEN c.idcompra LIKE 'DS-%'
+                        THEN COALESCE(c.total_ajustado, c.total, 0)
+                        ELSE 0
+                    END
+                ) AS valor_compras_x_cta_cobro,
 
                 -- Auditoría de ajustes
-                SUM(total_ajustes_debito) AS total_notas_debito,
-                SUM(CASE WHEN ajustes_count > 0 THEN 1 ELSE 0 END) AS documentos_con_ajuste
+                SUM(COALESCE(c.total_ajustes_debito, 0)) AS total_notas_debito,
+                SUM(CASE WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1 ELSE 0 END) AS documentos_con_ajuste
 
-            FROM base
+            FROM siigo_compras c
+            WHERE {where_sql}
         """
 
         row_kpis = db.session.execute(text(query_kpis), params).mappings().first()
@@ -12126,10 +12134,7 @@ def create_app():
         ]
         params = {"idcliente": idcliente, "mes": mes}
 
-        # base_neta: total bruto menos la retención (ReteICA/ReteFuente) ya descontada
-        # por Siigo en el saldo de Documento Soporte desde el día en que se crea el
-        # documento (no es un pago real). Ver nota completa en query_kpis.
-        total_expr = "GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)"
+        total_expr = "COALESCE(c.total_ajustado, c.total, 0)"
 
         if estado == "pagado":
             condiciones.append(f"({total_expr} = 0 OR COALESCE(c.saldo,0) = 0)")
@@ -12162,37 +12167,36 @@ def create_app():
                 COALESCE(c.total_ajustes_debito,0) AS total_ajustes_debito,
                 COALESCE(c.total_ajustado, c.total, 0) AS total,
                 COALESCE(c.total_ajustado, c.total, 0) AS total_ajustado,
-                COALESCE(c.retencion_total, 0) AS retencion_total,
                 COALESCE(c.estado_ajuste, 'sin_ajuste') AS estado_ajuste,
                 COALESCE(c.ajustes_count,0) AS ajustes_count,
 
                 LEAST(
                     COALESCE(c.saldo,0),
-                    {total_expr}
+                    COALESCE(c.total_ajustado, c.total, 0)
                 ) AS saldo,
 
                 GREATEST(
-                    {total_expr} - COALESCE(c.saldo,0),
+                    COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.saldo,0),
                     0
                 ) AS pagado_calc,
 
                 CASE
-                    WHEN {total_expr} = 0 THEN 'pagado'
+                    WHEN COALESCE(c.total_ajustado, c.total, 0) = 0 THEN 'pagado'
                     WHEN COALESCE(c.saldo,0) = 0 THEN 'pagado'
-                    WHEN {total_expr} > 0
-                     AND COALESCE(c.saldo,0) >= {total_expr} THEN 'pendiente'
+                    WHEN COALESCE(c.total_ajustado, c.total, 0) > 0
+                     AND COALESCE(c.saldo,0) >= COALESCE(c.total_ajustado, c.total, 0) THEN 'pendiente'
                     WHEN COALESCE(c.saldo,0) > 0
-                     AND COALESCE(c.saldo,0) < {total_expr} THEN 'parcial'
+                     AND COALESCE(c.saldo,0) < COALESCE(c.total_ajustado, c.total, 0) THEN 'parcial'
                     ELSE 'pendiente'
                 END AS estado_calc,
-
+                   
                 CASE
-                    WHEN {total_expr} > 0
-                     AND COALESCE(c.saldo,0) > {total_expr}
+                    WHEN COALESCE(c.total_ajustado, c.total, 0) > 0
+                     AND COALESCE(c.saldo,0) > COALESCE(c.total_ajustado, c.total, 0)
                     THEN true
                     ELSE false
                 END AS anomalia_saldo_mayor_total,
-
+                   
                 CASE
                     WHEN c.idcompra ILIKE 'FC-%' THEN 'factura'
                     WHEN c.idcompra ILIKE 'DS-%' THEN 'documento_soporte'
@@ -12255,15 +12259,12 @@ def create_app():
         elif tipo_documento == "documento_soporte":
             condiciones.append("c.idcompra ILIKE 'DS-%'")
 
-        # base_neta: total bruto menos la retención (ReteICA/ReteFuente) ya descontada
-        # por Siigo en el saldo de Documento Soporte desde el día en que se crea el
-        # documento (no es un pago real). Ver nota completa en query_kpis.
-        total_expr = "GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)"
+        total_expr = "COALESCE(c.total_ajustado, c.total, 0)"
 
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
-            SELECT
+            SELECT 
                 c.id,
                 c.idcompra AS idcompra,
                 c.proveedor_nombre,
@@ -12275,32 +12276,31 @@ def create_app():
                 COALESCE(c.total_ajustes_debito,0) AS total_ajustes_debito,
                 COALESCE(c.total_ajustado, c.total, 0) AS total,
                 COALESCE(c.total_ajustado, c.total, 0) AS total_ajustado,
-                COALESCE(c.retencion_total, 0) AS retencion_total,
                 COALESCE(c.estado_ajuste, 'sin_ajuste') AS estado_ajuste,
                 COALESCE(c.ajustes_count,0) AS ajustes_count,
 
                 LEAST(
                     COALESCE(c.saldo,0),
-                    {total_expr}
+                    COALESCE(c.total_ajustado, c.total, 0)
                 ) AS saldo,
 
                 c.estado AS estado_raw,
 
                 GREATEST(
-                    {total_expr} - COALESCE(c.saldo,0),
+                    COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.saldo,0),
                     0
                 ) AS pagado_calc,
 
                 CASE
-                    WHEN {total_expr} = 0 THEN 'pagado'
+                    WHEN COALESCE(c.total_ajustado, c.total, 0) = 0 THEN 'pagado'
                     WHEN COALESCE(c.saldo,0) <= 0 THEN 'pagado'
-                    WHEN COALESCE(c.saldo,0) >= {total_expr} THEN 'pendiente'
+                    WHEN COALESCE(c.saldo,0) >= COALESCE(c.total_ajustado, c.total, 0) THEN 'pendiente'
                     ELSE 'parcial'
                 END AS estado_calc,
 
                 CASE
-                    WHEN {total_expr} > 0
-                     AND COALESCE(c.saldo,0) > {total_expr}
+                    WHEN COALESCE(c.total_ajustado, c.total, 0) > 0
+                     AND COALESCE(c.saldo,0) > COALESCE(c.total_ajustado, c.total, 0)
                     THEN true
                     ELSE false
                 END AS anomalia_saldo_mayor_total,

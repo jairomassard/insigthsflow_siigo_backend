@@ -550,6 +550,10 @@ class SiigoCompra(db.Model):
     cost_center = db.Column(db.Integer)
     creado = db.Column(db.DateTime)
     factura_proveedor = db.Column(db.String(100))  # nueva columna
+    # Retención (ReteICA/ReteFuente) descontada en el documento soporte al momento de crearlo.
+    # Siigo la resta del saldo desde el día 1 (no es un pago real), por eso hay que
+    # restarla del total bruto antes de comparar contra saldo. Solo se llena para DS.
+    retencion_total = db.Column(db.Numeric(15, 2), nullable=False, server_default="0")
 
     items = db.relationship(
         "SiigoCompraItem",
@@ -579,6 +583,7 @@ class SiigoCompra(db.Model):
             "cost_center": self.cost_center,
             "creado": self.creado.isoformat() if self.creado else None,
             "factura_proveedor": self.factura_proveedor,
+            "retencion_total": float(self.retencion_total or 0),
         }
 
 
