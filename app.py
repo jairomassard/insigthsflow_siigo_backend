@@ -714,7 +714,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
                     m.tipo_movimiento = 'FACTURA'
                     AND EXISTS (
                         SELECT 1
-                        FROM siigo_factura_items fi
+                        FROM factura_items_enriquecidos fi
                         WHERE fi.factura_id = m.movimiento_id
                           AND fi.idcliente = m.idcliente
                           AND ({' OR '.join(term_clauses_exists)})
@@ -854,7 +854,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
                     WHEN mv.tipo_movimiento = 'FACTURA' THEN
                         (
                             SELECT STRING_AGG(TRIM(fi2.descripcion), ' || ' ORDER BY TRIM(fi2.descripcion))
-                            FROM siigo_factura_items fi2
+                            FROM factura_items_enriquecidos fi2
                             WHERE fi2.factura_id = mv.movimiento_id
                               AND fi2.idcliente = mv.idcliente
                               {descripcion_filter}
