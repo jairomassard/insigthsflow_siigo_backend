@@ -10085,10 +10085,16 @@ def create_app():
 
         where_sql = " AND ".join(condiciones)
 
+        # Antes esto reconstruia el join a mano contra siigo_facturas (Siigo
+        # unicamente - dejaba el reporte completamente vacio para cualquier
+        # cliente Alegra, sin importar el rango de fechas o el saldo real
+        # existente, encontrado y corregido 2026-07-09). Ahora lee directo de
+        # facturas_enriquecidas, que ya trae la rama Alegra via UNION ALL y
+        # cliente_nombre/centro_costo_nombre/vendedor_nombre ya resueltos.
         facturas_base_cte = """
             WITH facturas_base AS (
                 SELECT
-                    f.id,
+                    f.factura_id AS id,
                     f.idcliente,
                     f.idfactura,
                     f.fecha,
@@ -10099,42 +10105,11 @@ def create_app():
                     f.pagos_total,
                     f.saldo,
                     f.public_url,
-                    f.customer_id,
                     f.cost_center,
-                    f.seller_id,
-
-                    REPLACE(
-                        REPLACE(
-                            REPLACE(
-                                REPLACE(
-                                    COALESCE(
-                                        NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
-                                        NULLIF(TRIM(BOTH '"' FROM c.name), ''),
-                                        'Sin cliente'
-                                    ),
-                                    '{', ''
-                                ),
-                                '}', ''
-                            ),
-                            '[', ''
-                        ),
-                        ']', ''
-                    ) AS cliente_nombre_ok,
-
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok,
-
-                    COALESCE(v.nombre, 'Sin vendedor') AS vendedor_nombre_ok
-
-                FROM siigo_facturas f
-                LEFT JOIN siigo_customers c
-                    ON c.id::text = f.customer_id::text
-                AND c.idcliente = f.idcliente
-                LEFT JOIN siigo_centros_costo cc
-                    ON cc.id = f.cost_center
-                AND cc.idcliente = f.idcliente
-                LEFT JOIN siigo_vendedores v
-                    ON v.id::text = f.seller_id::text
-                AND v.idcliente = f.idcliente
+                    f.cliente_nombre AS cliente_nombre_ok,
+                    f.centro_costo_nombre AS centro_costo_nombre_ok,
+                    f.vendedor_nombre AS vendedor_nombre_ok
+                FROM facturas_enriquecidas f
             )
         """
 
