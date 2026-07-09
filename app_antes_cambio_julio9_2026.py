@@ -13,9 +13,6 @@ from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_per
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
-from models_alegra import FuenteDatosCliente, AlegraCredencial
-from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
-from alegra.alegra_sync_all import sync_completo_desde_alegra
 from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
@@ -2320,9 +2317,6 @@ def _cliente_as_dict_con_paquete(cliente):
         data["paquete_nombre"] = paquete.nombre
         data["idpaquete"] = paquete.idpaquete
 
-    fuente = FuenteDatosCliente.query.filter_by(idcliente=cliente.idcliente).first()
-    data["proveedor_datos"] = fuente.proveedor if fuente else "siigo"
-
     return data
 
 
@@ -3719,37 +3713,6 @@ def create_app():
                 "indicadores_financieros_config",
                 "modulos_disponibles",
                 "system_notifications",
-
-                # Alegra (proveedor alterno) - agregado 2026-07-09. El borrado
-                # real ya ocurria automaticamente por ON DELETE CASCADE (ver
-                # alegra_create_tables.sql), asi que estas lineas no son
-                # necesarias para la integridad de los datos - son solo para
-                # que 'resumen' (la respuesta de este endpoint) refleje cuantas
-                # filas de Alegra se borraron, en vez de mostrar la tabla vacia
-                # como si nunca hubiera tenido datos. Hijas antes que padres.
-                "alegra_sync_metrics",
-                "alegra_sync_logs",
-                "alegra_sync_config",
-                "alegra_credenciales",
-                "alegra_movimientos",
-                "alegra_saldos_cuenta",
-                "alegra_cuentas_contables",
-                "alegra_factura_items",
-                "alegra_facturas",
-                "alegra_nota_credito_facturas",
-                "alegra_notas_credito",
-                "alegra_compra_items",
-                "alegra_compra_retenciones",
-                "alegra_compras",
-                "alegra_pago_facturas",
-                "alegra_pagos",
-                "alegra_terceros",
-                "alegra_productos",
-                "alegra_vendedores",
-                "alegra_centros_costo",
-                "alegra_retenciones_catalogo",
-                "alegra_impuestos_catalogo",
-                "fuente_datos_cliente",
             ]
 
             for tabla in tablas_ordenadas:
@@ -4326,31 +4289,11 @@ def create_app():
             )
 
             db.session.add(usuario_admin)
-
-            # =====================================================
-            # 9. Registrar el proveedor de datos elegido (Siigo/Alegra)
-            #    Determina que pagina de integracion (y en el futuro, que
-            #    logica de reportes) le corresponde a este cliente. Un
-            #    cliente tiene un unico proveedor (unique=True en idcliente
-            #    de fuente_datos_cliente) - no se soporta doble fuente.
-            # =====================================================
-            proveedor_datos = str(data.get("proveedor_datos") or "siigo").strip().lower()
-            if proveedor_datos not in ("siigo", "alegra"):
-                proveedor_datos = "siigo"
-
-            db.session.add(FuenteDatosCliente(
-                idcliente=cliente.idcliente,
-                proveedor=proveedor_datos,
-                activo=False,
-                fecha_conexion=None,
-            ))
-
             db.session.commit()
 
             return jsonify({
                 "message": "Cliente registrado correctamente con paquete contratado.",
                 "cliente": cliente.as_dict(),
-                "proveedor_datos": proveedor_datos,
                 "paquetes": [
                     {
                         "idpaquete": p.idpaquete,
@@ -4747,13 +4690,6 @@ def create_app():
                     "logo_url": cliente.logo_url,
                 }
 
-            fuente = FuenteDatosCliente.query.filter_by(idcliente=user.idcliente).first()
-            # Clientes creados antes de que existiera este registro no tienen
-            # fila propia todavia (ver backfill en Docs_integracion) - por
-            # defecto se asumen Siigo, que es el unico proveedor que existia
-            # antes de la integracion con Alegra.
-            data["proveedor_datos"] = fuente.proveedor if fuente else "siigo"
-
         return jsonify(data), 200
 
 
@@ -4963,19 +4899,6 @@ def create_app():
 
             db.session.add(sync_cfg)
 
-        # Simetrico con /config/alegra: registra/actualiza el proveedor real
-        # del cliente para que el menu de integraciones se pueda filtrar por
-        # dato real en vez de mostrar siempre ambos links.
-        fuente = FuenteDatosCliente.query.filter_by(idcliente=idcliente).first()
-        if not fuente:
-            fuente = FuenteDatosCliente(idcliente=idcliente, proveedor="siigo", activo=True, fecha_conexion=datetime.utcnow())
-            db.session.add(fuente)
-        else:
-            fuente.proveedor = "siigo"
-            fuente.activo = True
-            if not fuente.fecha_conexion:
-                fuente.fecha_conexion = datetime.utcnow()
-
         db.session.commit()
 
         return jsonify({
@@ -5164,121 +5087,6 @@ def create_app():
             "base_url_used": base_url,
         }), 502
 
-
-    # ==========================================================
-    # Integración Alegra (Fase 4 - flujo esencial de onboarding)
-    # Espejo simplificado del bloque de configuración Siigo de arriba.
-    # ==========================================================
-
-    def _resolver_idcliente_alegra(claims):
-        perfilid = claims["perfilid"]
-        idcliente = claims.get("idcliente")
-
-        q_idcliente = request.args.get("idcliente", type=int)
-        if perfilid == 0:
-            if not q_idcliente:
-                return None, (jsonify({"error": "Falta idcliente"}), 400)
-            return q_idcliente, None
-        else:
-            if not idcliente:
-                return None, (jsonify({"error": "No autorizado"}), 403)
-            return idcliente, None
-
-    @app.route("/config/alegra", methods=["GET"])
-    @jwt_required()
-    def get_alegra_config():
-        idcliente, error = _resolver_idcliente_alegra(get_jwt())
-        if error:
-            return error
-
-        cred = AlegraCredencial.query.filter_by(idcliente=idcliente).first()
-        fuente = FuenteDatosCliente.query.filter_by(idcliente=idcliente).first()
-
-        def mask(s: str | None):
-            if not s:
-                return None
-            return s[:2] + "•" * (max(0, len(s) - 4)) + s[-2:]
-
-        return jsonify({
-            "idcliente": idcliente,
-            "email": cred.email if cred else None,
-            "token_mask": mask(dec(cred.token)) if cred else None,
-            "updated_at": cred.updated_at.isoformat() if cred and cred.updated_at else None,
-            "conectado": bool(fuente and fuente.activo and fuente.proveedor == "alegra"),
-        })
-
-    @app.route("/config/alegra", methods=["PUT"])
-    @jwt_required()
-    def upsert_alegra_config():
-        idcliente, error = _resolver_idcliente_alegra(get_jwt())
-        if error:
-            return error
-
-        data = request.get_json() or {}
-        email = data.get("email")
-        token = data.get("token")
-
-        cred = AlegraCredencial.query.filter_by(idcliente=idcliente).first()
-        if not cred and not (email and token):
-            return jsonify({"error": "email y token son obligatorios para la primera conexión"}), 400
-        if not cred:
-            cred = AlegraCredencial(idcliente=idcliente)
-
-        if email is not None:
-            cred.email = email
-        if token:
-            cred.token = enc(token)
-
-        db.session.add(cred)
-
-        fuente = FuenteDatosCliente.query.filter_by(idcliente=idcliente).first()
-        if not fuente:
-            fuente = FuenteDatosCliente(idcliente=idcliente, proveedor="alegra", activo=True, fecha_conexion=datetime.utcnow())
-            db.session.add(fuente)
-        else:
-            fuente.proveedor = "alegra"
-            fuente.activo = True
-
-        db.session.commit()
-
-        return jsonify({"message": "Credenciales de Alegra guardadas correctamente."}), 200
-
-    @app.route("/alegra/test_auth", methods=["POST"])
-    @jwt_required()
-    def alegra_test_auth():
-        idcliente, error = _resolver_idcliente_alegra(get_jwt())
-        if error:
-            return error
-
-        cred = AlegraCredencial.query.filter_by(idcliente=idcliente).first()
-        if not cred:
-            return jsonify({"ok": False, "error": "No hay credenciales de Alegra guardadas para este cliente."}), 400
-
-        token = dec(cred.token)
-        if not token:
-            return jsonify({"ok": False, "error": "No se pudo desencriptar el token guardado."}), 500
-
-        try:
-            perfil = alegra_api_get(ALEGRA_BASE_URL_DEFAULT, cred.email, token, "users/self")
-            return jsonify({"ok": True, "usuario": perfil.get("name"), "email": perfil.get("email")}), 200
-        except AlegraError as e:
-            return jsonify({"ok": False, "error": f"No fue posible autenticar contra Alegra: {e}"}), 401
-
-    @app.route("/alegra/sync-all", methods=["POST"])
-    @jwt_required()
-    def alegra_sync_all_route():
-        idcliente, error = _resolver_idcliente_alegra(get_jwt())
-        if error:
-            return error
-
-        try:
-            resultados = sync_completo_desde_alegra(idcliente)
-            return jsonify({
-                "message": "Sincronización Alegra completada",
-                "detalle": "\n".join(resultados),
-            }), 200
-        except Exception as e:
-            return jsonify({"error": "Falló la sincronización con Alegra.", "detalle": str(e)}), 500
 
 
     # (Opcional) Endpoint de diagnóstico rápido
