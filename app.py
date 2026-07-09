@@ -15377,7 +15377,7 @@ def create_app():
                     ELSE 0
                 END AS ticket_promedio
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
             WHERE {where}
@@ -15387,7 +15387,7 @@ def create_app():
             db.session.execute(sql_kpis, params).mappings().first() or {}
         )
 
-        kpis["fuente"] = "ventas_movimientos_enriquecidos + siigo_factura_items"
+        kpis["fuente"] = "ventas_movimientos_enriquecidos + factura_items_enriquecidos"
         kpis["logica"] = (
             "Ventas facturadas por producto. No descuenta notas crédito porque "
             "las notas crédito no tienen detalle confiable de productos."
@@ -15396,20 +15396,17 @@ def create_app():
         # --- Top 10 ---
         sql_top = text(f"""
             SELECT
-                i.producto_id AS code,
-                COALESCE(p.name, i.producto_id) AS producto,
+                i.producto_code AS code,
+                i.producto_nombre AS producto,
                 COALESCE(SUM(i.cantidad), 0) AS cantidad,
                 COALESCE(SUM(i.total_item), 0) AS total,
                 COUNT(DISTINCT mb.movimiento_id) AS facturas
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
-            LEFT JOIN siigo_productos p
-                ON p.code = i.producto_id
-            AND p.idcliente = mb.idcliente
             WHERE {where}
-            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
+            GROUP BY i.producto_code, i.producto_nombre
             ORDER BY {columna_orden} DESC
             LIMIT 10
         """)
@@ -15422,20 +15419,17 @@ def create_app():
         # --- Bottom 10 ---
         sql_bottom = text(f"""
             SELECT
-                i.producto_id AS code,
-                COALESCE(p.name, i.producto_id) AS producto,
+                i.producto_code AS code,
+                i.producto_nombre AS producto,
                 COALESCE(SUM(i.cantidad), 0) AS cantidad,
                 COALESCE(SUM(i.total_item), 0) AS total,
                 COUNT(DISTINCT mb.movimiento_id) AS facturas
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
-            LEFT JOIN siigo_productos p
-                ON p.code = i.producto_id
-            AND p.idcliente = mb.idcliente
             WHERE {where}
-            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
+            GROUP BY i.producto_code, i.producto_nombre
             ORDER BY {columna_orden} ASC
             LIMIT 10
         """)
@@ -15464,18 +15458,15 @@ def create_app():
 
         sql = text("""
             SELECT DISTINCT
-                i.producto_id AS code,
-                COALESCE(p.name, i.producto_id) AS name
+                i.producto_code AS code,
+                i.producto_nombre AS name
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
-            LEFT JOIN siigo_productos p
-                ON p.code = i.producto_id
-            AND p.idcliente = mb.idcliente
             WHERE mb.idcliente = :idcliente
             AND mb.tipo_movimiento = 'FACTURA'
-            ORDER BY COALESCE(p.name, i.producto_id)
+            ORDER BY i.producto_nombre
         """)
 
         rows = db.session.execute(sql, {"idcliente": idcliente}).mappings().all()
@@ -15524,7 +15515,7 @@ def create_app():
         filtros = [
             "mb.idcliente = :idcliente",
             "mb.tipo_movimiento = 'FACTURA'",
-            "i.producto_id = :producto_code",
+            "i.producto_code = :producto_code",
         ]
 
         if desde:
@@ -15558,21 +15549,18 @@ def create_app():
         # --- Totales ---
         sql_totales = text(f"""
             SELECT
-                i.producto_id AS code,
-                COALESCE(p.name, i.producto_id) AS producto,
+                i.producto_code AS code,
+                i.producto_nombre AS producto,
                 COALESCE(SUM(i.cantidad), 0) AS cantidad,
                 COALESCE(SUM(i.total_item), 0) AS total,
                 COALESCE(SUM(i.total_item), 0) AS ventas_facturadas,
                 COUNT(DISTINCT mb.movimiento_id) AS facturas
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
-            LEFT JOIN siigo_productos p
-                ON p.code = i.producto_id
-            AND p.idcliente = mb.idcliente
             WHERE {where}
-            GROUP BY i.producto_id, COALESCE(p.name, i.producto_id)
+            GROUP BY i.producto_code, i.producto_nombre
         """)
 
         detalle = normalize_row(
@@ -15588,7 +15576,7 @@ def create_app():
                 COALESCE(SUM(i.total_item), 0) AS ventas_facturadas,
                 COUNT(DISTINCT mb.movimiento_id) AS facturas
             FROM ventas_movimientos_enriquecidos mb
-            JOIN siigo_factura_items i
+            JOIN factura_items_enriquecidos i
                 ON i.factura_id = mb.movimiento_id
             AND i.idcliente = mb.idcliente
             WHERE {where}
@@ -15602,7 +15590,7 @@ def create_app():
         ]
 
         detalle["historico"] = historico
-        detalle["fuente"] = "ventas_movimientos_enriquecidos + siigo_factura_items"
+        detalle["fuente"] = "ventas_movimientos_enriquecidos + factura_items_enriquecidos"
         detalle["logica"] = (
             "Detalle de productos facturados. No descuenta notas crédito porque "
             "las notas crédito no tienen detalle confiable de productos."
