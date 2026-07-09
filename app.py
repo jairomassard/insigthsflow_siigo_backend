@@ -7268,7 +7268,15 @@ def create_app():
         try:
             # ============================================================
             # 1) Detalle de facturas reales
-            #    Se mantiene desde siigo_facturas para no romper modales antiguos.
+            #    Usa la vista facturas_enriquecidas (rama Siigo + rama Alegra
+            #    via UNION ALL, ver Docs_integracion/alegra_extender_vistas_reporting.sql)
+            #    en vez de leer siigo_facturas directo - antes este bloque
+            #    dejaba en 0 la tarjeta "Facturas" y el detalle para todo
+            #    cliente Alegra, sin importar el rango de fechas (bug real,
+            #    encontrado y corregido 2026-07-09). La vista ya resuelve
+            #    centro_costo_nombre/vendedor_nombre para ambas fuentes, asi
+            #    que los joins manuales a siigo_vendedores/siigo_centros_costo/
+            #    siigo_customers sobran.
             # ============================================================
             wh_rows = ["f.idcliente = :idcliente"]
             params = {
@@ -7299,8 +7307,8 @@ def create_app():
             where_rows = " AND ".join(wh_rows)
 
             sql_rows = text(f"""
-                SELECT DISTINCT ON (f.id)
-                    f.id              AS factura_id,
+                SELECT DISTINCT ON (f.factura_id)
+                    f.factura_id      AS factura_id,
                     f.idcliente,
                     f.idfactura,
                     f.fecha,
@@ -7318,22 +7326,13 @@ def create_app():
                     f.observaciones,
                     f.public_url,
                     f.cost_center,
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre,
-                    cc.codigo AS centro_costo_codigo,
+                    f.centro_costo_nombre,
+                    f.centro_costo_codigo,
                     f.seller_id,
-                    v.nombre AS vendedor_nombre
-                FROM siigo_facturas f
-                LEFT JOIN siigo_vendedores v
-                    ON v.id = f.seller_id
-                AND v.idcliente = f.idcliente
-                LEFT JOIN siigo_centros_costo cc
-                    ON cc.id = f.cost_center
-                AND cc.idcliente = f.idcliente
-                LEFT JOIN siigo_customers c
-                    ON c.id::text = f.customer_id::text
-                AND c.idcliente = f.idcliente
+                    f.vendedor_nombre
+                FROM facturas_enriquecidas f
                 WHERE {where_rows}
-                ORDER BY f.id DESC
+                ORDER BY f.factura_id DESC
                 LIMIT :limit
             """)
 
