@@ -8252,7 +8252,7 @@ def create_app():
     # ENDPOINT: Clientes Insights
     # Alineado con Ingresos por Ventas:
     # - Ventas comerciales: ventas_movimientos_enriquecidos
-    # - Cartera / pagos / vencimientos: siigo_facturas
+    # - Cartera / pagos / vencimientos: facturas_enriquecidas (Siigo+Alegra)
     # ============================================================
     @app.route("/reportes/analisis_clientes", methods=["GET"])
     @jwt_required()
@@ -8404,28 +8404,30 @@ def create_app():
 
             where_fac = " AND ".join(wh_fac)
 
+            # Antes reconstruia el join a mano contra siigo_facturas (Siigo
+            # unicamente - dejaba las cifras de cartera de este reporte
+            # siempre en 0 para cualquier cliente Alegra, encontrado y
+            # corregido 2026-07-09, mismo patron que /reportes/cuentas-por-cobrar).
+            # Ahora lee directo de facturas_enriquecidas, que ya trae la rama
+            # Alegra y cliente_nombre/centro_costo_nombre ya resueltos.
             facturas_base_cte = """
                 WITH facturas_base AS (
                     SELECT
-                        f.*,
-                        regexp_replace(
-                            COALESCE(
-                                NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
-                                NULLIF(TRIM(BOTH '"' FROM c.name), ''),
-                                'Desconocido'
-                            ),
-                            '[\\{\\}\\[\\]\\"]',
-                            '',
-                            'g'
-                        ) AS cliente_nombre_ok,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_customers c
-                        ON c.id::text = f.customer_id::text
-                    AND c.idcliente = f.idcliente
-                    LEFT JOIN siigo_centros_costo cc
-                        ON cc.id = f.cost_center
-                    AND cc.idcliente = f.idcliente
+                        f.factura_id AS id,
+                        f.idcliente,
+                        f.idfactura,
+                        f.fecha,
+                        f.vencimiento,
+                        f.total,
+                        f.subtotal,
+                        f.impuestos_total,
+                        f.pagos_total,
+                        f.saldo,
+                        f.public_url,
+                        f.cost_center,
+                        f.cliente_nombre AS cliente_nombre_ok,
+                        f.centro_costo_nombre AS centro_costo_nombre_ok
+                    FROM facturas_enriquecidas f
                 )
             """
 
@@ -9102,21 +9104,11 @@ def create_app():
             sql_catalogo_clientes = text(f"""
                 WITH facturas_base AS (
                     SELECT
-                        f.*,
-                        regexp_replace(
-                            COALESCE(
-                                NULLIF(TRIM(BOTH '"' FROM f.cliente_nombre), ''),
-                                NULLIF(TRIM(BOTH '"' FROM c.name), ''),
-                                'Desconocido'
-                            ),
-                            '[\\{{\\}}\\[\\]\\"]',
-                            '',
-                            'g'
-                        ) AS cliente_nombre_ok
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_customers c
-                        ON c.id::text = f.customer_id::text
-                    AND c.idcliente = f.idcliente
+                        f.factura_id AS id,
+                        f.idcliente,
+                        f.fecha,
+                        f.cliente_nombre AS cliente_nombre_ok
+                    FROM facturas_enriquecidas f
                 ),
                 clientes AS (
                     SELECT DISTINCT
@@ -9147,12 +9139,12 @@ def create_app():
             sql_catalogo_cc = text(f"""
                 WITH facturas_base AS (
                     SELECT
-                        f.*,
-                        COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre_ok
-                    FROM siigo_facturas f
-                    LEFT JOIN siigo_centros_costo cc
-                        ON cc.id = f.cost_center
-                    AND cc.idcliente = f.idcliente
+                        f.factura_id AS id,
+                        f.idcliente,
+                        f.fecha,
+                        f.cost_center,
+                        f.centro_costo_nombre AS centro_costo_nombre_ok
+                    FROM facturas_enriquecidas f
                 ),
                 centros AS (
                     SELECT DISTINCT
@@ -9243,7 +9235,7 @@ def create_app():
                 },
                 "config": {
                     "fuente_ventas": "ventas_movimientos_enriquecidos",
-                    "fuente_cartera": "siigo_facturas_enriquecida_con_cliente",
+                    "fuente_cartera": "facturas_enriquecidas",
                     "fuente_movimientos_recientes": "ventas_movimientos_enriquecidos",
                     "logica_ventas": "ventas_netas = facturas_emitidas - notas_credito",
                     "ventas_netas": "con impuesto",
