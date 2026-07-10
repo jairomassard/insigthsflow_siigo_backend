@@ -465,6 +465,12 @@ class AlegraCompra(db.Model):
     proveedor_nombre = db.Column(db.String(255))
     centro_costo_id = db.Column(db.String(50))
 
+    # numberTemplate.fullNumber de /bills - confirmado con dato real 2026-07-10:
+    # es el numero/referencia de la factura del proveedor (formato libre, propio
+    # de cada proveedor, ej. "TC-455283", "EPU-395762"), equivalente a
+    # SiigoCompra.factura_proveedor - no el id interno de Alegra (alegra_id).
+    factura_proveedor = db.Column(db.String(100))
+
     total = db.Column(db.Numeric(18, 2))
     balance = db.Column(db.Numeric(18, 2))
     total_paid = db.Column(db.Numeric(18, 2))
@@ -501,6 +507,7 @@ class AlegraCompra(db.Model):
             "proveedor_id": self.proveedor_id,
             "proveedor_nombre": self.proveedor_nombre,
             "centro_costo_id": self.centro_costo_id,
+            "factura_proveedor": self.factura_proveedor,
             "total": float(self.total or 0),
             "balance": float(self.balance or 0),
             "total_paid": float(self.total_paid or 0),

@@ -79,12 +79,18 @@ def sync_compras_desde_alegra(idcliente: int) -> str:
 
         proveedor = bill.get("provider") or {}
         cc = bill.get("costCenter")
+        number_template = bill.get("numberTemplate") or {}
 
         compra.fecha = _parse_fecha(bill.get("date"))
         compra.vencimiento = _parse_fecha(bill.get("dueDate"))
         compra.proveedor_id = str(proveedor.get("id")) if proveedor.get("id") is not None else None
         compra.proveedor_nombre = proveedor.get("name")
         compra.centro_costo_id = str(cc.get("id")) if isinstance(cc, dict) and cc.get("id") is not None else None
+        # numberTemplate.fullNumber es el numero/referencia de la factura del
+        # proveedor (confirmado con dato real: formato libre por proveedor,
+        # ej. "TC-455283"), NO el id interno de Alegra - equivalente a
+        # SiigoCompra.factura_proveedor.
+        compra.factura_proveedor = number_template.get("fullNumber") or number_template.get("number")
         compra.total = bill.get("total")
         compra.balance = bill.get("balance")
         compra.total_paid = bill.get("totalPaid")
