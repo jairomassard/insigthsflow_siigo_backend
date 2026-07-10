@@ -12064,7 +12064,7 @@ def create_app():
                         COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0),
                         0
                     ) AS base_neta
-                FROM siigo_compras c
+                FROM compras_enriquecidas c
                 WHERE {where_sql}
             )
             SELECT
@@ -12105,7 +12105,7 @@ def create_app():
                         COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0),
                         0
                     ) AS base_neta
-                FROM siigo_compras c
+                FROM compras_enriquecidas c
                 WHERE {where_sql}
             )
             SELECT
@@ -12204,7 +12204,7 @@ def create_app():
                 SUM(COALESCE(c.total_ajustado, c.total, 0)) AS total_compras,
                 SUM(COALESCE(c.total_ajustes_debito, 0)) AS total_notas_debito,
                 SUM(CASE WHEN COALESCE(c.ajustes_count, 0) > 0 THEN 1 ELSE 0 END) AS documentos_con_ajuste
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             GROUP BY c.proveedor_nombre
             ORDER BY total_compras DESC
@@ -12248,7 +12248,7 @@ def create_app():
             SELECT
                 c.proveedor_nombre,
                 COUNT(*) AS num_facturas
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             GROUP BY c.proveedor_nombre
             ORDER BY num_facturas DESC
@@ -12357,11 +12357,8 @@ def create_app():
                     ELSE 'otro'
                 END AS tipo_documento,
 
-                sc.nombre AS centro_costo_nombre
-            FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo sc
-                ON c.cost_center = sc.id
-            AND sc.idcliente = c.idcliente
+                c.centro_costo_nombre
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
         """)
@@ -12469,11 +12466,8 @@ def create_app():
                     ELSE 'otro'
                 END AS tipo_documento,
 
-                sc.nombre AS centro_costo_nombre
-            FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo sc
-                ON c.cost_center = sc.id
-                AND sc.idcliente = c.idcliente
+                c.centro_costo_nombre
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
         """)
