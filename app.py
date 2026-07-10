@@ -8474,7 +8474,7 @@ def create_app():
 
             sql_resumen_cartera = text(facturas_base_cte + f"""
                 SELECT
-                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.pagos_total, 0)), 0) AS total_pagado,
                     COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente,
 
                     COALESCE(SUM(
@@ -8608,7 +8608,7 @@ def create_app():
                 SELECT
                     fb.cliente_nombre_ok AS cliente,
 
-                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.pagos_total, 0)), 0) AS total_pagado,
                     COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente,
 
                     COALESCE(SUM(
@@ -8694,7 +8694,7 @@ def create_app():
                     fb.centro_costo_nombre_ok AS centro_costo_nombre,
                     fb.cost_center,
 
-                    COALESCE(SUM(COALESCE(fb.total, 0) - COALESCE(fb.saldo, 0)), 0) AS total_pagado,
+                    COALESCE(SUM(COALESCE(fb.pagos_total, 0)), 0) AS total_pagado,
                     COALESCE(SUM(COALESCE(fb.saldo, 0)), 0) AS saldo_pendiente
 
                 FROM facturas_base fb
