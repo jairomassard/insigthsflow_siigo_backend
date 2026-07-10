@@ -11832,7 +11832,7 @@ def create_app():
                     END
                 ) AS documentos_con_ajuste
 
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             AND COALESCE(c.total_ajustado, c.total, 0) > 0
         """
@@ -11876,7 +11876,7 @@ def create_app():
 
                 MAX(c.fecha) AS ultima_fecha
 
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             GROUP BY c.proveedor_identificacion, c.proveedor_nombre
             HAVING SUM(COALESCE(c.total_ajustado, c.total, 0)) > 0
@@ -11928,12 +11928,9 @@ def create_app():
 
                     COALESCE(c.estado, '') AS estado_original,
 
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS centro_costo_nombre
+                    c.centro_costo_nombre
 
-                FROM siigo_compras c
-                LEFT JOIN siigo_centros_costo cc
-                    ON c.cost_center = cc.id
-                    AND cc.idcliente = c.idcliente
+                FROM compras_enriquecidas c
                 WHERE {where_sql}
                 ORDER BY c.proveedor_nombre, c.fecha DESC
             """
@@ -12676,7 +12673,7 @@ def create_app():
                     END
                 ) AS documentos_compra_con_ajuste
 
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_egr}
             GROUP BY date_trunc('month', c.fecha)::date
         """)
@@ -12924,7 +12921,7 @@ def create_app():
                     END
                 ) AS documentos_con_ajuste
 
-            FROM siigo_compras c
+            FROM compras_enriquecidas c
             WHERE {where_egr}
             GROUP BY COALESCE(c.proveedor_nombre, 'Sin proveedor')
             ORDER BY total DESC
@@ -12942,7 +12939,7 @@ def create_app():
             "top_proveedores": top_proveedores,
             "config": {
                 "fuente_ingresos": "ventas_movimientos_enriquecidos",
-                "fuente_egresos": "siigo_compras",
+                "fuente_egresos": "compras_enriquecidas",
                 "ingresos": "ventas_netas_con_impuesto",
                 "logica": "ingresos = facturas_emitidas - notas_credito"
             }
@@ -13154,15 +13151,12 @@ def create_app():
                 c.total,
                 c.saldo,
                 c.cost_center,
-                cc.nombre AS centro_costo_nombre,
+                c.centro_costo_nombre,
                 CASE
                     WHEN LOWER(COALESCE(c.estado, '')) = 'pagado' THEN 'Pagada'
                     ELSE 'No Pagada'
                 END AS estado
-            FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo cc
-                ON cc.id = c.cost_center
-            AND cc.idcliente = c.idcliente
+            FROM compras_enriquecidas c
             WHERE {where_sql}
             ORDER BY c.fecha DESC, c.proveedor_nombre ASC, c.idcompra ASC, c.id ASC
             LIMIT :limit
@@ -18300,7 +18294,7 @@ def create_app():
                             ELSE 0
                         END
                     ) AS documentos_con_ajuste
-                FROM siigo_compras c
+                FROM compras_enriquecidas c
                 WHERE {where_egr}
                 GROUP BY COALESCE(NULLIF(TRIM(c.proveedor_nombre), ''), 'Sin proveedor')
                 ORDER BY total DESC
