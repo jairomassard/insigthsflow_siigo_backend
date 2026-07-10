@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraPago, AlegraPagoFactura
@@ -90,8 +91,20 @@ def _sync_pagos_por_tipo(idcliente: int, email: str, token: str, tipo: str) -> t
         is_new = pago is None
         if is_new:
             pago = AlegraPago(idcliente=idcliente, alegra_id=alegra_id, tipo=tipo)
-            db.session.add(pago)
-            db.session.flush()  # necesita pago.id para el puente
+            try:
+                # SAVEPOINT propio: si el insert choca contra la restriccion
+                # de unicidad (confirmado con dato real 2026-07-10: Alegra
+                # puede repetir el mismo id en dos paginas distintas de
+                # /payments), solo se deshace este intento puntual, no todo
+                # lo que ya se proceso en esta pasada.
+                with db.session.begin_nested():
+                    db.session.add(pago)
+                    db.session.flush()  # necesita pago.id para el puente
+            except IntegrityError:
+                pago = AlegraPago.query.filter_by(
+                    idcliente=idcliente, alegra_id=alegra_id, tipo=tipo
+                ).first()
+                is_new = False
             existentes[alegra_id] = pago
 
         banco = p.get("bankAccount") or {}

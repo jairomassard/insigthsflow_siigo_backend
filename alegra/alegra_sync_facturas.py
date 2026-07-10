@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraFactura, AlegraFacturaItem
@@ -77,8 +78,18 @@ def sync_facturas_desde_alegra(idcliente: int) -> str:
         is_new = factura is None
         if is_new:
             factura = AlegraFactura(idcliente=idcliente, alegra_id=alegra_id)
-            db.session.add(factura)
-            db.session.flush()  # necesita factura.id para los items
+            try:
+                # SAVEPOINT propio: ver nota igual en alegra_sync_pagos.py -
+                # un id repetido en dos paginas de la misma paginacion no debe
+                # tumbar todo lo ya procesado en esta pasada.
+                with db.session.begin_nested():
+                    db.session.add(factura)
+                    db.session.flush()  # necesita factura.id para los items
+            except IntegrityError:
+                factura = AlegraFactura.query.filter_by(
+                    idcliente=idcliente, alegra_id=alegra_id
+                ).first()
+                is_new = False
             existentes[alegra_id] = factura
 
         cliente = inv.get("client") or {}

@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraCompra, AlegraCompraItem, AlegraCompraRetencion
@@ -73,8 +74,16 @@ def sync_compras_desde_alegra(idcliente: int) -> str:
         is_new = compra is None
         if is_new:
             compra = AlegraCompra(idcliente=idcliente, alegra_id=alegra_id)
-            db.session.add(compra)
-            db.session.flush()  # necesita compra.id para items/retenciones
+            try:
+                # SAVEPOINT propio: ver nota igual en alegra_sync_pagos.py.
+                with db.session.begin_nested():
+                    db.session.add(compra)
+                    db.session.flush()  # necesita compra.id para items/retenciones
+            except IntegrityError:
+                compra = AlegraCompra.query.filter_by(
+                    idcliente=idcliente, alegra_id=alegra_id
+                ).first()
+                is_new = False
             existentes[alegra_id] = compra
 
         proveedor = bill.get("provider") or {}

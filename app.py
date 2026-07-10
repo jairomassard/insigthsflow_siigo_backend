@@ -13,9 +13,9 @@ from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_per
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
-from models_alegra import FuenteDatosCliente, AlegraCredencial
+from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
-from alegra.alegra_sync_all import sync_completo_desde_alegra
+from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
 from flask_cors import CORS
 import os
 from cryptography.fernet import Fernet, InvalidToken
@@ -5264,21 +5264,122 @@ def create_app():
         except AlegraError as e:
             return jsonify({"ok": False, "error": f"No fue posible autenticar contra Alegra: {e}"}), 401
 
+    def _hora_local_cliente(idcliente):
+        cliente = db.session.get(Cliente, idcliente)
+        tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
+        try:
+            import pytz
+            return datetime.now(pytz.timezone(tz_str))
+        except Exception:
+            return datetime.utcnow()
+
+    def _correr_alegra_sync_en_segundo_plano(idcliente, log_id):
+        # Corre en un thread aparte, fuera del ciclo de vida de la peticion
+        # HTTP original - evita que un proxy/gateway corte la conexion antes
+        # de que termine (confirmado 2026-07-10: paso exactamente eso con un
+        # cliente de volumen grande, el sync moria junto con la conexion).
+        # Necesita su propio app context porque el de la request original no
+        # sobrevive al cambio de thread.
+        with app.app_context():
+            try:
+                resumen = sync_completo_desde_alegra_con_log(idcliente)
+            except Exception as e:
+                resumen = {
+                    "resultado": "ERROR",
+                    "detalle": f"Excepción no controlada: {e}",
+                    "total_pasos": 0,
+                    "pasos_ok": 0,
+                    "pasos_error": 1,
+                    "endpoint_fallido": "sync-all",
+                }
+
+            logrec = db.session.get(AlegraSyncLog, log_id)
+            if logrec:
+                logrec.resultado = resumen["resultado"]
+                logrec.detalle = resumen["detalle"][:10000]
+                logrec.total_pasos = resumen["total_pasos"]
+                logrec.pasos_ok = resumen["pasos_ok"]
+                logrec.pasos_error = resumen["pasos_error"]
+                logrec.endpoint_fallido = resumen["endpoint_fallido"]
+                logrec.ejecutado_en = _hora_local_cliente(idcliente)
+                db.session.commit()
+
     @app.route("/alegra/sync-all", methods=["POST"])
     @jwt_required()
     def alegra_sync_all_route():
+        import threading
+
         idcliente, error = _resolver_idcliente_alegra(get_jwt())
         if error:
             return error
 
-        try:
-            resultados = sync_completo_desde_alegra(idcliente)
+        # No permitir dos sincronizaciones en paralelo para el mismo cliente.
+        en_curso = AlegraSyncLog.query.filter_by(
+            idcliente=idcliente, resultado="EN_EJECUCION"
+        ).first()
+        if en_curso:
             return jsonify({
-                "message": "Sincronización Alegra completada",
-                "detalle": "\n".join(resultados),
-            }), 200
-        except Exception as e:
-            return jsonify({"error": "Falló la sincronización con Alegra.", "detalle": str(e)}), 500
+                "error": "Ya hay una sincronización en curso para este cliente.",
+                "log_id": en_curso.id,
+            }), 409
+
+        ahora_local = _hora_local_cliente(idcliente)
+
+        logrec = AlegraSyncLog(
+            idcliente=idcliente,
+            fecha_programada=ahora_local,
+            ejecutado_en=None,
+            resultado="EN_EJECUCION",
+            detalle="Sincronización en curso...",
+            origen="manual",
+            total_pasos=0,
+            pasos_ok=0,
+            pasos_error=0,
+        )
+        db.session.add(logrec)
+        db.session.commit()
+
+        hilo = threading.Thread(
+            target=_correr_alegra_sync_en_segundo_plano,
+            args=(idcliente, logrec.id),
+            daemon=True,
+        )
+        hilo.start()
+
+        return jsonify({
+            "message": "Sincronización Alegra iniciada en segundo plano. Consulta el historial para ver el resultado.",
+            "log_id": logrec.id,
+        }), 202
+
+
+    @app.route("/config/alegra-sync-history", methods=["GET"])
+    @jwt_required()
+    def get_alegra_sync_history():
+        idcliente, error = _resolver_idcliente_alegra(get_jwt())
+        if error:
+            return error
+
+        limit = request.args.get("limit", default=10, type=int)
+        if limit < 1:
+            limit = 10
+        if limit > 50:
+            limit = 50
+
+        cliente = db.session.get(Cliente, idcliente)
+        tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
+
+        logs = (
+            AlegraSyncLog.query
+            .filter_by(idcliente=idcliente)
+            .order_by(AlegraSyncLog.ejecutado_en.desc().nullslast(), AlegraSyncLog.creado_en.desc())
+            .limit(limit)
+            .all()
+        )
+
+        return jsonify({
+            "timezone": tz_str,
+            "items": [log.as_dict() for log in logs],
+        }), 200
 
 
     # (Opcional) Endpoint de diagnóstico rápido
