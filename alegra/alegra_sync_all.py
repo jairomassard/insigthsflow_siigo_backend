@@ -28,6 +28,7 @@ from alegra.alegra_sync_facturas import sync_facturas_desde_alegra
 from alegra.alegra_sync_notas_credito import sync_notas_credito_desde_alegra
 from alegra.alegra_sync_compras import sync_compras_desde_alegra
 from alegra.alegra_sync_pagos import sync_pagos_desde_alegra
+from alegra.alegra_transform_contable import transform_auxiliar_contable_desde_alegra
 
 
 def sync_completo_desde_alegra(idcliente: int) -> list[str]:
@@ -37,6 +38,13 @@ def sync_completo_desde_alegra(idcliente: int) -> list[str]:
     resultados.append(sync_notas_credito_desde_alegra(idcliente))
     resultados.append(sync_compras_desde_alegra(idcliente))
     resultados.append(sync_pagos_desde_alegra(idcliente))
+    # Antes habia que correr esto a mano (script aparte) despues de cada
+    # sync - encontrado 2026-07-10 probando con un segundo cliente real
+    # (Maslux LED) que nunca quedo conectado al flujo automatico. A
+    # diferencia de Siigo (donde el auxiliar contable se carga por Excel
+    # manual), en Alegra el dato sale de /journals via la API, asi que este
+    # paso final SI puede (y debe) ser automatico.
+    resultados.append(transform_auxiliar_contable_desde_alegra(idcliente))
     return resultados
 
 
@@ -61,6 +69,7 @@ def sync_completo_desde_alegra_con_log(idcliente: int) -> dict:
         ("notas_credito", lambda: sync_notas_credito_desde_alegra(idcliente)),
         ("compras", lambda: sync_compras_desde_alegra(idcliente)),
         ("pagos", lambda: sync_pagos_desde_alegra(idcliente)),
+        ("auxiliar_contable", lambda: transform_auxiliar_contable_desde_alegra(idcliente)),
     ]
 
     log_parts = []

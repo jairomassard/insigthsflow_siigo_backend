@@ -1254,6 +1254,306 @@ def construir_pnl_auxiliares(idcliente, desde, hasta):
     }
 
 
+def _proveedor_datos_cliente(idcliente):
+    fuente = FuenteDatosCliente.query.filter_by(idcliente=idcliente).first()
+    return fuente.proveedor if fuente else "siigo"
+
+
+def construir_pnl_alegra_facturas(idcliente, desde, hasta):
+    """Version Alegra del Estado de Resultados.
+
+    Los ingresos operacionales se calculan desde alegra_facturas /
+    alegra_notas_credito (campo subtotal, pre-IVA) en vez de auxiliar_contable
+    (cuenta 41xx): confirmado 2026-07-09 con dos cuentas Alegra reales que
+    /journals NO trae el asiento automatico de venta salvo que el cliente
+    haya activado "Parametrizacion contable" en su propia cuenta Alegra, asi
+    que la cuenta 41xx casi siempre queda vacia aunque haya facturacion real.
+    Costos, gastos operacionales/no operacionales y depreciacion SI se
+    confirmaron confiables via auxiliar_contable (alimentado por /journals) y
+    se calculan exactamente igual que en construir_pnl_auxiliares.
+    """
+    from sqlalchemy import text
+
+    sql_ingresos_evo = text("""
+        SELECT
+            EXTRACT(YEAR FROM fecha)::int AS periodo_anio,
+            EXTRACT(MONTH FROM fecha)::int AS periodo_mes,
+            SUM(monto) AS ingresos_operacionales
+        FROM (
+            SELECT fecha, subtotal AS monto
+            FROM alegra_facturas
+            WHERE idcliente = :idc
+              AND fecha BETWEEN :d AND :h
+              AND (estado IS NULL OR estado NOT IN ('draft', 'void'))
+            UNION ALL
+            SELECT fecha, -subtotal AS monto
+            FROM alegra_notas_credito
+            WHERE idcliente = :idc
+              AND fecha BETWEEN :d AND :h
+              AND (estado IS NULL OR estado NOT IN ('draft', 'void'))
+        ) t
+        GROUP BY periodo_anio, periodo_mes
+        ORDER BY periodo_anio, periodo_mes
+    """)
+
+    sql_aux_evo = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '42%' THEN (credito - debito)
+                ELSE 0
+            END) AS ingresos_no_operacionales,
+
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '6%' OR cuenta_codigo LIKE '7%' THEN (debito - credito)
+                ELSE 0
+            END) AS costos_venta,
+
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN (debito - credito)
+                ELSE 0
+            END) AS gastos_operacionales,
+
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN (debito - credito)
+                ELSE 0
+            END) AS gastos_no_operacionales,
+
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '5160%'
+                OR cuenta_codigo LIKE '5165%'
+                OR cuenta_codigo LIKE '5260%'
+                OR cuenta_codigo LIKE '5265%'
+                THEN (debito - credito)
+                ELSE 0
+            END) AS dep_amort
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        GROUP BY periodo_anio, periodo_mes
+        ORDER BY periodo_anio, periodo_mes
+    """)
+
+    sql_comp = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+            cuenta_codigo,
+            LEFT(cuenta_codigo, 4) AS cuenta_padre,
+            MAX(cuenta_nombre) AS nombre_cuenta,
+
+            CASE
+                WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
+                WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN 'GASTOS_NO_OPERACIONALES'
+                ELSE 'OTROS'
+            END AS seccion,
+
+            CASE
+                WHEN LEFT(cuenta_codigo, 1) = '4' THEN 'CREDITO_MENOS_DEBITO'
+                ELSE 'DEBITO_MENOS_CREDITO'
+            END AS naturaleza,
+
+            SUM(
+                CASE
+                    WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito)
+                    ELSE (debito - credito)
+                END
+            ) AS saldo
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
+        AND cuenta_codigo NOT LIKE '41%'
+        GROUP BY
+            periodo_anio,
+            periodo_mes,
+            cuenta_codigo,
+            LEFT(cuenta_codigo, 4),
+            CASE
+                WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
+                WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '53%' OR cuenta_codigo LIKE '54%' THEN 'GASTOS_NO_OPERACIONALES'
+                ELSE 'OTROS'
+            END,
+            CASE
+                WHEN LEFT(cuenta_codigo, 1) = '4' THEN 'CREDITO_MENOS_DEBITO'
+                ELSE 'DEBITO_MENOS_CREDITO'
+            END
+        HAVING SUM(
+            CASE
+                WHEN LEFT(cuenta_codigo, 1) = '4' THEN (credito - debito)
+                ELSE (debito - credito)
+            END
+        ) <> 0
+        ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+    """)
+
+    res_ingresos = db.session.execute(sql_ingresos_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_aux = db.session.execute(sql_aux_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_comp = db.session.execute(sql_comp, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+    ingresos_por_periodo = {
+        (int(r["periodo_anio"]), int(r["periodo_mes"])): float(r["ingresos_operacionales"] or 0)
+        for r in res_ingresos
+    }
+
+    aux_por_periodo = {
+        (int(r["periodo_anio"]), int(r["periodo_mes"])): r
+        for r in res_aux
+    }
+
+    periodos = sorted(set(aux_por_periodo.keys()) | set(ingresos_por_periodo.keys()))
+
+    evolucion = []
+    totales = {
+        "ingresos_operacionales": 0.0,
+        "ingresos_no_operacionales": 0.0,
+        "costos_venta": 0.0,
+        "gastos_operacionales": 0.0,
+        "gastos_no_operacionales": 0.0,
+        "dep_amort": 0.0,
+    }
+
+    for periodo in periodos:
+        r = aux_por_periodo.get(periodo)
+        ing_op = ingresos_por_periodo.get(periodo, 0.0)
+        ing_no_op = float(r["ingresos_no_operacionales"] or 0) if r else 0.0
+        costos = float(r["costos_venta"] or 0) if r else 0.0
+        gastos_op = float(r["gastos_operacionales"] or 0) if r else 0.0
+        gastos_no_op = float(r["gastos_no_operacionales"] or 0) if r else 0.0
+        dep_amort = float(r["dep_amort"] or 0) if r else 0.0
+
+        ingresos_totales = ing_op + ing_no_op
+        utilidad_bruta = ing_op - costos
+        utilidad_operativa = utilidad_bruta - gastos_op
+        ebitda = utilidad_operativa + dep_amort
+        utilidad_antes_impuestos = utilidad_operativa + ing_no_op - gastos_no_op
+        utilidad_neta = utilidad_antes_impuestos
+
+        totales["ingresos_operacionales"] += ing_op
+        totales["ingresos_no_operacionales"] += ing_no_op
+        totales["costos_venta"] += costos
+        totales["gastos_operacionales"] += gastos_op
+        totales["gastos_no_operacionales"] += gastos_no_op
+        totales["dep_amort"] += dep_amort
+
+        base_margen = ingresos_totales if ingresos_totales != 0 else 0
+
+        anio, mes = periodo
+        evolucion.append({
+            "label": f"{anio}-{mes:02d}",
+            "ingresos_operacionales": ing_op,
+            "ingresos_no_operacionales": ing_no_op,
+            "ingresos_totales": ingresos_totales,
+            "costos_venta": costos,
+            "gastos_operacionales": gastos_op,
+            "gastos_no_operacionales": gastos_no_op,
+            "utilidad_bruta": utilidad_bruta,
+            "utilidad_operativa": utilidad_operativa,
+            "ebitda": ebitda,
+            "utilidad_antes_impuestos": utilidad_antes_impuestos,
+            "utilidad_neta": utilidad_neta,
+            "costos_gastos": costos + gastos_op + gastos_no_op,
+            "margen_bruto": round((utilidad_bruta / base_margen) * 100, 2) if base_margen else 0,
+            "margen_operativo": round((utilidad_operativa / base_margen) * 100, 2) if base_margen else 0,
+            "margen_ebitda": round((ebitda / base_margen) * 100, 2) if base_margen else 0,
+            "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
+        })
+
+    ingresos_operacionales = totales["ingresos_operacionales"]
+    ingresos_no_operacionales = totales["ingresos_no_operacionales"]
+    ingresos_totales = ingresos_operacionales + ingresos_no_operacionales
+    costos_venta = totales["costos_venta"]
+    gastos_operacionales = totales["gastos_operacionales"]
+    gastos_no_operacionales = totales["gastos_no_operacionales"]
+    dep_amort = totales["dep_amort"]
+
+    utilidad_bruta = ingresos_operacionales - costos_venta
+    utilidad_operativa = utilidad_bruta - gastos_operacionales
+    ebitda = utilidad_operativa + dep_amort
+    utilidad_antes_impuestos = utilidad_operativa + ingresos_no_operacionales - gastos_no_operacionales
+    utilidad_neta = utilidad_antes_impuestos
+
+    base_margen = ingresos_totales if ingresos_totales != 0 else 0
+
+    cuentas_dict = {}
+    for c in res_comp:
+        cuenta_codigo = str(c["cuenta_codigo"])
+        periodo = f"{c['periodo_anio']}-{int(c['periodo_mes']):02d}"
+
+        if cuenta_codigo not in cuentas_dict:
+            cuentas_dict[cuenta_codigo] = {
+                "cuenta": cuenta_codigo,
+                "cuenta_padre": str(c["cuenta_padre"]),
+                "nombre": str(c["nombre_cuenta"]).strip().title(),
+                "seccion": str(c["seccion"]),
+                "naturaleza": str(c["naturaleza"]),
+                "valores_mes": {},
+                "total": 0.0,
+            }
+
+        val = float(c["saldo"] or 0)
+        cuentas_dict[cuenta_codigo]["valores_mes"][periodo] = val
+        cuentas_dict[cuenta_codigo]["total"] += val
+
+    # Fila sintetica de ingresos operacionales: no viene de una cuenta PUC
+    # real (ver docstring), se agrega solo si hay algun valor distinto de
+    # cero para no ensuciar la composicion con una fila en ceros.
+    if any(v != 0 for v in ingresos_por_periodo.values()):
+        cuentas_dict["ALEGRA-VENTAS"] = {
+            "cuenta": "ALEGRA-VENTAS",
+            "cuenta_padre": "ALEGRA-VENTAS",
+            "nombre": "Ventas (Facturación Alegra)",
+            "seccion": "INGRESOS_OPERACIONALES",
+            "naturaleza": "CREDITO_MENOS_DEBITO",
+            "valores_mes": {
+                f"{anio}-{mes:02d}": val
+                for (anio, mes), val in ingresos_por_periodo.items()
+            },
+            "total": ingresos_operacionales,
+        }
+
+    composicion = list(cuentas_dict.values())
+    composicion.sort(key=lambda x: x["cuenta"])
+
+    return {
+        "kpis": {
+            "ingresos_operacionales": ingresos_operacionales,
+            "ingresos_no_operacionales": ingresos_no_operacionales,
+            "ingresos_totales": ingresos_totales,
+            "costos_venta": costos_venta,
+            "utilidad_bruta": utilidad_bruta,
+            "gastos_operacionales": gastos_operacionales,
+            "utilidad_operativa": utilidad_operativa,
+            "ebitda": ebitda,
+            "gastos_no_operacionales": gastos_no_operacionales,
+            "utilidad_antes_impuestos": utilidad_antes_impuestos,
+            "utilidad_neta": utilidad_neta,
+            "margen_bruto": round((utilidad_bruta / base_margen) * 100, 2) if base_margen else 0,
+            "margen_operativo": round((utilidad_operativa / base_margen) * 100, 2) if base_margen else 0,
+            "margen_ebitda": round((ebitda / base_margen) * 100, 2) if base_margen else 0,
+            "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
+        },
+        "evolucion": evolucion,
+        "composicion": composicion,
+    }
+
+
+def construir_pnl(idcliente, desde, hasta):
+    """Router segun proveedor_datos del cliente: Siigo sigue usando
+    auxiliar_contable completo (construir_pnl_auxiliares), Alegra usa la
+    version que deriva ingresos de facturas reales
+    (construir_pnl_alegra_facturas) - ver docstring de esa funcion."""
+    if _proveedor_datos_cliente(idcliente) == "alegra":
+        return construir_pnl_alegra_facturas(idcliente, desde, hasta)
+    return construir_pnl_auxiliares(idcliente, desde, hasta)
+
+
 
 # =========================================================
 # HELPERS DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
@@ -16824,7 +17124,7 @@ def create_app():
             return jsonify({"error": "Debes enviar desde y hasta"}), 400
 
         try:
-            data = construir_pnl_auxiliares(idcliente, desde, hasta)
+            data = construir_pnl(idcliente, desde, hasta)
             return jsonify(data), 200
         except Exception as e:
             return jsonify({
@@ -17582,7 +17882,7 @@ def create_app():
             # 3) P&L del período seleccionado
             #    Esto sí va únicamente entre fecha_desde y fecha_hasta.
             # --------------------------------------------------
-            pnl = construir_pnl_auxiliares(idcliente, str(fecha_desde), str(fecha_hasta))
+            pnl = construir_pnl(idcliente, str(fecha_desde), str(fecha_hasta))
             pk = pnl.get("kpis", {})
             evolucion_pnl = pnl.get("evolucion", [])
 
@@ -18186,7 +18486,7 @@ def create_app():
             # =========================================================
             # 1. P&L ACTUAL
             # =========================================================
-            pnl_actual = construir_pnl_auxiliares(idcliente, desde, hasta)
+            pnl_actual = construir_pnl(idcliente, desde, hasta)
             kpis_actual = pnl_actual.get("kpis", {})
             evolucion_actual = pnl_actual.get("evolucion", [])
             composicion_actual = pnl_actual.get("composicion", [])
@@ -18227,7 +18527,7 @@ def create_app():
             prev_hasta = fecha_desde - timedelta(days=1)
             prev_desde = prev_hasta - delta
 
-            pnl_anterior = construir_pnl_auxiliares(
+            pnl_anterior = construir_pnl(
                 idcliente,
                 prev_desde.strftime("%Y-%m-%d"),
                 prev_hasta.strftime("%Y-%m-%d"),
@@ -18243,7 +18543,7 @@ def create_app():
             hasta_nm = fecha_hasta_ajustada
             desde_nm = _first_day_of_month(_shift_months(fecha_hasta_ajustada, -(meses_grafica - 1)))
 
-            pnl_nm = construir_pnl_auxiliares(
+            pnl_nm = construir_pnl(
                 idcliente,
                 desde_nm.strftime("%Y-%m-%d"),
                 hasta_nm.strftime("%Y-%m-%d"),

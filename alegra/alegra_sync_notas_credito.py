@@ -7,11 +7,15 @@ amount, total, balance}) - una nota puede aplicar a varias facturas, de ahi
 la tabla puente. NO existe date_after/date_before para este endpoint, solo
 'date' exacto.
 
-NOTA - no confirmado con JSON crudo: el nombre literal del campo
-'totalApplied' (columna total_applied) se asume por convencion camelCase de
-Alegra. Tampoco esta confirmado que /credit-notes acepte order_field/
-order_direction como /journals y /bills - se asume por el mismo patron de
-la API, a verificar si el stop-early de abajo no funciona como se espera.
+CONFIRMADO con dato real 2026-07-10 (idcliente=15, alegra_id=5): la cabecera
+SI trae 'subtotal' y 'tax' (numerico, no array), mismo shape que /invoices -
+de ahi columnas subtotal/impuestos_total, usadas para netear ingresos
+operacionales pre-IVA en construir_pnl_alegra_facturas (app.py). El campo
+'totalApplied' tambien se confirmo con ese mismo JSON.
+
+NOTA - no confirmado: que /credit-notes acepte order_field/order_direction
+como /journals y /bills - se asume por el mismo patron de la API, a
+verificar si el stop-early de abajo no funciona como se espera.
 
 INCREMENTAL (2026-07-09): como no hay date_after, se pide ordenado DESC por
 fecha y se para de paginar al llegar a la ultima nota ya sincronizada (mismo
@@ -89,6 +93,8 @@ def sync_notas_credito_desde_alegra(idcliente: int) -> str:
         cliente = cn.get("client") or {}
 
         nota.fecha = _parse_fecha(cn.get("date"))
+        nota.subtotal = cn.get("subtotal")
+        nota.impuestos_total = cn.get("tax")
         nota.total = cn.get("total")
         nota.balance = cn.get("balance")
         nota.total_applied = cn.get("totalApplied")

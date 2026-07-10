@@ -397,6 +397,8 @@ class AlegraNotaCredito(db.Model):
     alegra_id = db.Column(db.String(50), nullable=False)
 
     fecha = db.Column(db.Date)
+    subtotal = db.Column(db.Numeric(18, 2))          # confirmado con dato real 2026-07-10: 'subtotal' de cabecera, mismo shape que alegra_facturas
+    impuestos_total = db.Column(db.Numeric(18, 2))    # confirmado con dato real 2026-07-10: campo 'tax' de cabecera (numerico, no array)
     total = db.Column(db.Numeric(18, 2))
     balance = db.Column(db.Numeric(18, 2))
     total_applied = db.Column(db.Numeric(18, 2))
@@ -422,6 +424,8 @@ class AlegraNotaCredito(db.Model):
             "idcliente": self.idcliente,
             "alegra_id": self.alegra_id,
             "fecha": self.fecha.isoformat() if self.fecha else None,
+            "subtotal": float(self.subtotal or 0),
+            "impuestos_total": float(self.impuestos_total or 0),
             "total": float(self.total or 0),
             "balance": float(self.balance or 0),
             "total_applied": float(self.total_applied or 0),
