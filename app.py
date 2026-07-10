@@ -1271,8 +1271,31 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     Costos, gastos operacionales/no operacionales y depreciacion SI se
     confirmaron confiables via auxiliar_contable (alimentado por /journals) y
     se calculan exactamente igual que en construir_pnl_auxiliares.
-    """
+
+    EXCEPCION (2026-07-10): si el cliente sube su propio "Libro Diario" real
+    desde Alegra (ver /alegra/cargar_libro_diario, mismo mecanismo que el
+    cargue manual de auxiliar de Siigo), esos meses SI tienen cuenta 41xx
+    real y confiable en auxiliar_contable - en ese caso se prefiere ese
+    valor sobre el derivado de facturas (es la version que el contador ya
+    revisó y puede incluir ajustes/reclasificaciones que las facturas crudas
+    no reflejan). El primer digito de la cuenta (41 = ingreso operacional)
+    es un estandar PUC nacional, a diferencia de los sub-codigos de 4+
+    digitos (los que sí varian por cliente y por eso Cruce de IVA y
+    Retenciones no hacen todavia este mismo cruce - ver sus docstrings)."""
     from sqlalchemy import text
+
+    sql_ingresos_reales_evo = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+            SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) AS ingresos_reales
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND cuenta_codigo LIKE '41%'
+        GROUP BY periodo_anio, periodo_mes
+        HAVING SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) <> 0
+    """)
 
     sql_ingresos_evo = text("""
         SELECT
@@ -1345,6 +1368,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             MAX(cuenta_nombre) AS nombre_cuenta,
 
             CASE
+                WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
                 WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
@@ -1367,13 +1391,13 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
         AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
-        AND cuenta_codigo NOT LIKE '41%'
         GROUP BY
             periodo_anio,
             periodo_mes,
             cuenta_codigo,
             LEFT(cuenta_codigo, 4),
             CASE
+                WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
                 WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
@@ -1393,13 +1417,34 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         ORDER BY periodo_anio, periodo_mes, cuenta_codigo
     """)
 
+    res_ingresos_reales = db.session.execute(sql_ingresos_reales_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_ingresos = db.session.execute(sql_ingresos_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_aux = db.session.execute(sql_aux_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_comp = db.session.execute(sql_comp, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
 
-    ingresos_por_periodo = {
+    ingresos_derivados_por_periodo = {
         (int(r["periodo_anio"]), int(r["periodo_mes"])): float(r["ingresos_operacionales"] or 0)
         for r in res_ingresos
+    }
+
+    ingresos_reales_por_periodo = {
+        (int(r["periodo_anio"]), int(r["periodo_mes"])): float(r["ingresos_reales"] or 0)
+        for r in res_ingresos_reales
+    }
+
+    # Preferir el valor real (Libro Diario subido) sobre el derivado de
+    # facturas para cualquier mes donde exista - ver docstring.
+    ingresos_por_periodo = dict(ingresos_derivados_por_periodo)
+    ingresos_por_periodo.update(ingresos_reales_por_periodo)
+
+    # Solo los meses que TODAVIA dependen del valor derivado necesitan la
+    # fila sintetica "ALEGRA-VENTAS" en la composicion (los meses con Libro
+    # Diario real ya traen su propia cuenta 41xx real, agregada arriba en
+    # sql_comp).
+    ingresos_derivados_sin_ledger_real = {
+        periodo: valor
+        for periodo, valor in ingresos_derivados_por_periodo.items()
+        if periodo not in ingresos_reales_por_periodo
     }
 
     aux_por_periodo = {
@@ -1502,9 +1547,10 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         cuentas_dict[cuenta_codigo]["total"] += val
 
     # Fila sintetica de ingresos operacionales: no viene de una cuenta PUC
-    # real (ver docstring), se agrega solo si hay algun valor distinto de
-    # cero para no ensuciar la composicion con una fila en ceros.
-    if any(v != 0 for v in ingresos_por_periodo.values()):
+    # real (ver docstring), se agrega solo para los meses que aun dependen
+    # del valor derivado de facturas (los meses con Libro Diario real ya
+    # traen su propia cuenta 41xx real en cuentas_dict, arriba).
+    if any(v != 0 for v in ingresos_derivados_sin_ledger_real.values()):
         cuentas_dict["ALEGRA-VENTAS"] = {
             "cuenta": "ALEGRA-VENTAS",
             "cuenta_padre": "ALEGRA-VENTAS",
@@ -1513,9 +1559,9 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             "naturaleza": "CREDITO_MENOS_DEBITO",
             "valores_mes": {
                 f"{anio}-{mes:02d}": val
-                for (anio, mes), val in ingresos_por_periodo.items()
+                for (anio, mes), val in ingresos_derivados_sin_ledger_real.items()
             },
-            "total": ingresos_operacionales,
+            "total": sum(ingresos_derivados_sin_ledger_real.values()),
         }
 
     composicion = list(cuentas_dict.values())
@@ -1837,6 +1883,414 @@ def construir_cruce_iva(idcliente, desde, hasta, inc_19, inc_5):
     if _proveedor_datos_cliente(idcliente) == "alegra":
         return construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5)
     return construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5)
+
+
+def construir_retenciones_siigo(idcliente, desde, hasta):
+    """Version Siigo del reporte de Retenciones (logica original, extraida
+    tal cual del endpoint /reportes/retenciones_v1 sin cambios de
+    comportamiento). Cubre solo el lado compras (retenciones que la propia
+    empresa practica a sus proveedores, cuentas 2365%/236805% "por pagar" a
+    la DIAN) - el mismo alcance se mantiene en la version Alegra."""
+    from sqlalchemy import text
+
+    sql_evolucion = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+            SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
+            SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND (
+                cuenta_codigo LIKE '2365%'
+                OR cuenta_codigo LIKE '236805%'
+        )
+        GROUP BY periodo_anio, periodo_mes
+        ORDER BY periodo_anio, periodo_mes
+    """)
+
+    sql_composicion = text("""
+        SELECT
+            cuenta_codigo AS cuenta,
+            cuenta_nombre AS concepto_original,
+            CASE
+                WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente'
+                WHEN cuenta_codigo LIKE '236805%' THEN 'ReteICA'
+                ELSE 'Otros'
+            END AS tipo,
+            SUM(credito - debito) AS valor
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND (
+                cuenta_codigo LIKE '2365%'
+                OR cuenta_codigo LIKE '236805%'
+        )
+        GROUP BY cuenta_codigo, cuenta_nombre
+        HAVING SUM(credito - debito) <> 0
+        ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
+    """)
+
+    sql_ica_detalle_mensual = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+            cuenta_codigo,
+            cuenta_nombre,
+            SUM(credito - debito) AS valor
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND cuenta_codigo LIKE '236805%'
+        GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
+        HAVING SUM(credito - debito) <> 0
+        ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+    """)
+
+    sql_retefuente_detalle_mensual = text("""
+        SELECT
+            periodo_anio,
+            periodo_mes,
+            cuenta_codigo,
+            cuenta_nombre,
+            SUM(credito - debito) AS valor
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND cuenta_codigo LIKE '2365%'
+        GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
+        HAVING SUM(credito - debito) <> 0
+        ORDER BY periodo_anio, periodo_mes, cuenta_codigo
+    """)
+
+    sql_referencia_236898 = text("""
+        SELECT
+            SUM(credito - debito) AS valor_236898
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+        AND fecha_contable BETWEEN :d AND :h
+        AND cuenta_codigo = '236898'
+    """)
+
+    res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_ica_det = db.session.execute(sql_ica_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_rf_det = db.session.execute(sql_retefuente_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    ref_236898 = db.session.execute(sql_referencia_236898, {"idc": idcliente, "d": desde, "h": hasta}).mappings().first()
+
+    def normalizar_concepto(cuenta: str, nombre: str) -> str:
+        nombre_l = (nombre or "").strip().lower()
+
+        if cuenta == "23680505":
+            return "ReteICA 9,66"
+        if cuenta == "23680501":
+            return "ReteICA 11,04"
+        if cuenta == "23680507":
+            return "ReteICA 8,66"
+
+        if cuenta.startswith("236805"):
+            if "devol" in nombre_l and "11" in nombre_l:
+                return "Devolución ReteICA 11,04"
+            if "devol" in nombre_l and ("8,66" in nombre_l or "8.66" in nombre_l or "866" in nombre_l):
+                return "Devolución ReteICA 8,66"
+            if "devol" in nombre_l and ("9,66" in nombre_l or "9.66" in nombre_l or "966" in nombre_l):
+                return "Devolución ReteICA 9,66"
+            if "devol" in nombre_l:
+                return f"Devolución ICA ({cuenta})"
+
+        if cuenta.startswith("2365"):
+            return (nombre or cuenta).strip().title()
+
+        return (nombre or cuenta).strip().title()
+
+    def clasificar_visual(cuenta: str, nombre: str) -> str:
+        nombre_l = (nombre or "").strip().lower()
+
+        if cuenta.startswith("236805"):
+            if "devol" in nombre_l:
+                return "ReteICA_Devolucion"
+            return "ReteICA"
+
+        if cuenta.startswith("2365"):
+            return "ReteFuente"
+
+        return "Otros"
+
+    evolucion = []
+    resumen_por_periodo = []
+    total_rf = 0.0
+    total_ica_conceptos = 0.0
+
+    for r in res_evo:
+        periodo = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
+        rf = float(r["retefuente"] or 0)
+        ica_conceptos = float(r["reteica_conceptos"] or 0)
+        total_periodo = rf + ica_conceptos
+
+        total_rf += rf
+        total_ica_conceptos += ica_conceptos
+
+        evolucion.append({"label": periodo, "retefuente": rf, "reteica_conceptos": ica_conceptos})
+        resumen_por_periodo.append({
+            "periodo": periodo,
+            "retefuente": rf,
+            "reteica_conceptos": ica_conceptos,
+            "total_periodo": total_periodo
+        })
+
+    composicion = []
+    for c in res_comp:
+        cuenta = str(c["cuenta"])
+        concepto_original = str(c["concepto_original"] or "")
+        valor = float(c["valor"] or 0)
+        composicion.append({
+            "cuenta": cuenta,
+            "concepto": normalizar_concepto(cuenta, concepto_original),
+            "tipo": clasificar_visual(cuenta, concepto_original),
+            "valor": valor
+        })
+
+    ica_detalle_mensual = []
+    for r in res_ica_det:
+        cuenta = str(r["cuenta_codigo"])
+        nombre = str(r["cuenta_nombre"] or "")
+        valor = float(r["valor"] or 0)
+        ica_detalle_mensual.append({
+            "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+            "cuenta": cuenta,
+            "concepto": normalizar_concepto(cuenta, nombre),
+            "tipo": clasificar_visual(cuenta, nombre),
+            "valor": valor
+        })
+
+    retefuente_detalle_mensual = []
+    for r in res_rf_det:
+        cuenta = str(r["cuenta_codigo"])
+        nombre = str(r["cuenta_nombre"] or "")
+        valor = float(r["valor"] or 0)
+        retefuente_detalle_mensual.append({
+            "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+            "cuenta": cuenta,
+            "concepto": normalizar_concepto(cuenta, nombre),
+            "tipo": clasificar_visual(cuenta, nombre),
+            "valor": valor
+        })
+
+    def construir_totales_por_periodo(rows):
+        acumulado = {}
+        for row in rows:
+            periodo = row["label"]
+            cuenta = row["cuenta"]
+            concepto = row["concepto"]
+            valor = float(row["valor"] or 0)
+
+            if periodo not in acumulado:
+                acumulado[periodo] = {
+                    "periodo": periodo,
+                    "valor": 0.0,
+                    "conceptos_count": 0,
+                    "cuentas_count": 0,
+                    "_conceptos": set(),
+                    "_cuentas": set()
+                }
+
+            acumulado[periodo]["valor"] += valor
+            acumulado[periodo]["_conceptos"].add(concepto)
+            acumulado[periodo]["_cuentas"].add(cuenta)
+
+        salida = []
+        for periodo in sorted(acumulado.keys()):
+            item = acumulado[periodo]
+            salida.append({
+                "periodo": periodo,
+                "valor": item["valor"],
+                "conceptos_count": len(item["_conceptos"]),
+                "cuentas_count": len(item["_cuentas"])
+            })
+        return salida
+
+    totales_ica_por_periodo = construir_totales_por_periodo(ica_detalle_mensual)
+    totales_retefuente_por_periodo = construir_totales_por_periodo(retefuente_detalle_mensual)
+
+    valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
+
+    return {
+        "kpis": {
+            "total_retefuente": total_rf,
+            "total_reteica_conceptos": total_ica_conceptos,
+            "total_general": total_rf + total_ica_conceptos
+        },
+        "evolucion": evolucion,
+        "resumen_por_periodo": resumen_por_periodo,
+        "composicion": composicion,
+        "ica_detalle_mensual": ica_detalle_mensual,
+        "retefuente_detalle_mensual": retefuente_detalle_mensual,
+        "totales_ica_por_periodo": totales_ica_por_periodo,
+        "totales_retefuente_por_periodo": totales_retefuente_por_periodo,
+        "referencias_contables": {
+            "cuenta_236898": valor_236898,
+            "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
+        },
+        "metadata": {
+            "desde": desde,
+            "hasta": hasta,
+            "nota_alcance": "Reporte gerencial basado en auxiliares contables cargados. No reemplaza la liquidación tributaria oficial ni la validación del contador."
+        }
+    }
+
+
+def construir_retenciones_alegra(idcliente, desde, hasta):
+    """Version Alegra del reporte de Retenciones (lado compras: lo que la
+    empresa practica a sus proveedores, ReteFuente + ReteICA).
+
+    A diferencia de la version Siigo (que adivina codigos de cuenta
+    2365%/236805% en auxiliar_contable, fragil porque cada cliente Alegra
+    numera esas sub-cuentas distinto - mismo hallazgo que en Cruce de IVA),
+    aca se usa alegra_compra_retenciones (viene de bill.retentions[], ya
+    sincronizado) filtrado por alegra_retenciones_catalogo.type IN ('FUENTE',
+    'ICA'). Esto da retention_id/nombre/tarifa REALES del catalogo del
+    cliente en vez de tener que inferir la tarifa desde el nombre de una
+    cuenta contable - mas preciso que la version Siigo, no una aproximacion.
+
+    LIMITACION CONOCIDA: no incluye retenciones que el cliente reciba de sus
+    PROPIOS clientes al vender (alegra_facturas.retenciones, confirmado
+    poblado con datos reales) - la version Siigo tampoco cubre ese lado (solo
+    compras/pagar a la DIAN), asi que el alcance se mantiene simetrico."""
+    from sqlalchemy import text
+
+    sql = text("""
+        SELECT
+            EXTRACT(YEAR FROM c.fecha)::int AS anio,
+            EXTRACT(MONTH FROM c.fecha)::int AS mes,
+            r.retention_id,
+            cat.name AS nombre,
+            cat.percentage AS tarifa,
+            cat.type AS tipo,
+            SUM(r.amount) AS valor
+        FROM alegra_compra_retenciones r
+        JOIN alegra_compras c ON c.id = r.compra_id
+        JOIN alegra_retenciones_catalogo cat
+            ON cat.idcliente = r.idcliente AND cat.alegra_id = r.retention_id
+        WHERE c.idcliente = :idc
+          AND c.fecha BETWEEN :d AND :h
+          AND (c.estado IS NULL OR c.estado NOT IN ('draft', 'void'))
+          AND cat.type IN ('FUENTE', 'ICA')
+        GROUP BY 1, 2, 3, 4, 5, 6
+        ORDER BY 1, 2, 3
+    """)
+
+    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+    evolucion_dict = {}
+    composicion_dict = {}
+    ica_detalle_mensual = []
+    retefuente_detalle_mensual = []
+
+    for r in rows:
+        periodo = f"{int(r['anio'])}-{int(r['mes']):02d}"
+        valor = float(r["valor"] or 0)
+        tipo = r["tipo"]
+        nombre = r["nombre"] or f"Retencion {r['retention_id']}"
+        tarifa = float(r["tarifa"] or 0)
+        concepto = f"{nombre} ({tarifa:g}%)" if tarifa else nombre
+        cuenta = f"ALEGRA-RET-{r['retention_id']}"
+
+        ev = evolucion_dict.setdefault(periodo, {"retefuente": 0.0, "reteica_conceptos": 0.0})
+        if tipo == "FUENTE":
+            ev["retefuente"] += valor
+        elif tipo == "ICA":
+            ev["reteica_conceptos"] += valor
+
+        comp_key = (cuenta, concepto, tipo)
+        composicion_dict[comp_key] = composicion_dict.get(comp_key, 0.0) + valor
+
+        fila_detalle = {
+            "label": periodo,
+            "cuenta": cuenta,
+            "concepto": concepto,
+            "tipo": "ReteFuente" if tipo == "FUENTE" else "ReteICA",
+            "valor": valor,
+        }
+        if tipo == "FUENTE":
+            retefuente_detalle_mensual.append(fila_detalle)
+        elif tipo == "ICA":
+            ica_detalle_mensual.append(fila_detalle)
+
+    evolucion = []
+    resumen_por_periodo = []
+    total_rf = 0.0
+    total_ica_conceptos = 0.0
+    for periodo in sorted(evolucion_dict.keys()):
+        v = evolucion_dict[periodo]
+        rf = v["retefuente"]
+        ica = v["reteica_conceptos"]
+        total_rf += rf
+        total_ica_conceptos += ica
+        evolucion.append({"label": periodo, "retefuente": rf, "reteica_conceptos": ica})
+        resumen_por_periodo.append({
+            "periodo": periodo,
+            "retefuente": rf,
+            "reteica_conceptos": ica,
+            "total_periodo": rf + ica
+        })
+
+    composicion = [
+        {"cuenta": cuenta, "concepto": concepto, "tipo": "ReteFuente" if tipo == "FUENTE" else "ReteICA", "valor": valor}
+        for (cuenta, concepto, tipo), valor in composicion_dict.items()
+        if valor != 0
+    ]
+    composicion.sort(key=lambda x: -abs(x["valor"]))
+
+    def construir_totales_por_periodo(rows_detalle):
+        acumulado = {}
+        for row in rows_detalle:
+            periodo = row["label"]
+            acumulado.setdefault(periodo, {"valor": 0.0, "_conceptos": set(), "_cuentas": set()})
+            acumulado[periodo]["valor"] += row["valor"]
+            acumulado[periodo]["_conceptos"].add(row["concepto"])
+            acumulado[periodo]["_cuentas"].add(row["cuenta"])
+        salida = []
+        for periodo in sorted(acumulado.keys()):
+            item = acumulado[periodo]
+            salida.append({
+                "periodo": periodo,
+                "valor": item["valor"],
+                "conceptos_count": len(item["_conceptos"]),
+                "cuentas_count": len(item["_cuentas"]),
+            })
+        return salida
+
+    return {
+        "kpis": {
+            "total_retefuente": total_rf,
+            "total_reteica_conceptos": total_ica_conceptos,
+            "total_general": total_rf + total_ica_conceptos
+        },
+        "evolucion": evolucion,
+        "resumen_por_periodo": resumen_por_periodo,
+        "composicion": composicion,
+        "ica_detalle_mensual": ica_detalle_mensual,
+        "retefuente_detalle_mensual": retefuente_detalle_mensual,
+        "totales_ica_por_periodo": construir_totales_por_periodo(ica_detalle_mensual),
+        "totales_retefuente_por_periodo": construir_totales_por_periodo(retefuente_detalle_mensual),
+        "referencias_contables": {
+            "cuenta_236898": 0.0,
+            "nota": "No aplica para clientes Alegra (concepto especifico del auxiliar contable Siigo)."
+        },
+        "metadata": {
+            "desde": desde,
+            "hasta": hasta,
+            "nota_alcance": "Retenciones que la empresa practica a sus proveedores, derivadas directo de la API de Alegra (bill.retentions[]), no del auxiliar contable."
+        }
+    }
+
+
+def construir_retenciones(idcliente, desde, hasta):
+    """Router segun proveedor_datos del cliente, mismo patron que construir_pnl."""
+    if _proveedor_datos_cliente(idcliente) == "alegra":
+        return construir_retenciones_alegra(idcliente, desde, hasta)
+    return construir_retenciones_siigo(idcliente, desde, hasta)
 
 
 
@@ -16979,7 +17433,96 @@ def create_app():
         except Exception as e:
             db.session.rollback()
             return jsonify({"error": str(e)}), 500
-        
+
+
+    # Carga del "Libro Diario" exportado desde Alegra (mismo destino que el
+    # auxiliar de Siigo - auxiliar_contable - pero shape de columnas distinto:
+    # confirmado con archivo real 2026-07-10 (IMPORTADORA NGC S.A.S.) que
+    # Alegra exporta encabezado en la fila 0 (no fila 4 como Siigo) con
+    # columnas Asiento/Fecha/Tercero/Identificación/Documento/Código/Cuenta
+    # contable/Débito/Crédito/Estado. Reemplaza por rango de fechas igual que
+    # el cargador de Siigo - subir el mismo periodo dos veces sobreescribe
+    # con la version mas reciente.
+    @app.route("/alegra/cargar_libro_diario", methods=["POST"])
+    @jwt_required()
+    def importar_libro_diario_alegra_desde_excel():
+        import pandas as pd
+
+        idcliente = get_jwt().get("idcliente")
+        file = request.files.get("archivo")
+        if not file:
+            return jsonify({"error": "No hay archivo"}), 400
+
+        try:
+            from models import AuxiliarContable
+            df = pd.read_excel(file, header=0, engine="calamine")
+            df.columns = [str(c).strip() for c in df.columns]
+
+            lista_mapeada = []
+            fechas_procesadas = []
+
+            def clean_num(val):
+                if val is None or pd.isna(val):
+                    return 0.0
+                return float(val)
+
+            def clean_codigo(val):
+                if val is None or pd.isna(val):
+                    return None
+                s = str(val).strip()
+                return s[:-2] if s.endswith(".0") else s
+
+            for _, row in df.iterrows():
+                cta_raw = row.get("Código")
+                if cta_raw is None or pd.isna(cta_raw):
+                    continue
+                codigo_limpio = clean_codigo(cta_raw)
+
+                f_raw = row.get("Fecha")
+                if f_raw is None or pd.isna(f_raw):
+                    continue
+                f_dt = pd.to_datetime(f_raw, dayfirst=True)
+                fechas_procesadas.append(f_dt)
+
+                estado = row.get("Estado")
+                estado_l = str(estado).strip().lower() if estado is not None and not pd.isna(estado) else ""
+                if any(p in estado_l for p in ("anulad", "cancel", "void")):
+                    continue
+
+                tercero = row.get("Tercero")
+                identificacion = row.get("Identificación")
+
+                lista_mapeada.append({
+                    "idcliente": idcliente,
+                    "fecha_contable": f_dt.date(),
+                    "comprobante_tipo": str(row.get("Asiento") or "").strip() or None,
+                    "comprobante_numero": str(row.get("Documento") or "").strip() or None,
+                    "cuenta_codigo": codigo_limpio,
+                    "cuenta_nombre": str(row.get("Cuenta contable") or "").strip(),
+                    "tercero_nit": clean_codigo(identificacion),
+                    "tercero_nombre": str(tercero).strip() if tercero is not None and not pd.isna(tercero) else None,
+                    "debito": clean_num(row.get("Débito")),
+                    "credito": clean_num(row.get("Crédito")),
+                    "periodo_anio": f_dt.year,
+                    "periodo_mes": f_dt.month
+                })
+
+            if lista_mapeada:
+                f_min, f_max = min(fechas_procesadas), max(fechas_procesadas)
+                AuxiliarContable.query.filter(
+                    AuxiliarContable.idcliente == idcliente,
+                    AuxiliarContable.fecha_contable >= f_min,
+                    AuxiliarContable.fecha_contable <= f_max
+                ).delete()
+                db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
+                db.session.commit()
+
+            return jsonify({"detalles": {"registros_procesados": len(lista_mapeada)}}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": str(e)}), 500
+
+
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
@@ -17000,8 +17543,6 @@ def create_app():
     @app.route("/reportes/retenciones_v1", methods=["GET"])
     @jwt_required()
     def get_retenciones_v1():
-        from sqlalchemy import text
-
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde", "2026-01-01")
         hasta = request.args.get("hasta", "2026-12-31")
@@ -17009,296 +17550,7 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        # 1) EVOLUCIÓN MENSUAL
-        # - retefuente: todo 2365%
-        # - reteica_conceptos: solo ICA operativo del período (236805%)
-        # - 236898 NO participa en KPIs ni neteos del período
-        sql_evolucion = text("""
-            SELECT
-                periodo_anio,
-                periodo_mes,
-                SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
-                SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-            AND fecha_contable BETWEEN :d AND :h
-            AND (
-                    cuenta_codigo LIKE '2365%'
-                    OR cuenta_codigo LIKE '236805%'
-            )
-            GROUP BY periodo_anio, periodo_mes
-            ORDER BY periodo_anio, periodo_mes
-        """)
-
-        # 2) COMPOSICIÓN DETALLADA POR CUENTA REAL
-        sql_composicion = text("""
-            SELECT
-                cuenta_codigo AS cuenta,
-                cuenta_nombre AS concepto_original,
-                CASE
-                    WHEN cuenta_codigo LIKE '2365%' THEN 'ReteFuente'
-                    WHEN cuenta_codigo LIKE '236805%' THEN 'ReteICA'
-                    ELSE 'Otros'
-                END AS tipo,
-                SUM(credito - debito) AS valor
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-            AND fecha_contable BETWEEN :d AND :h
-            AND (
-                    cuenta_codigo LIKE '2365%'
-                    OR cuenta_codigo LIKE '236805%'
-            )
-            GROUP BY cuenta_codigo, cuenta_nombre
-            HAVING SUM(credito - debito) <> 0
-            ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
-        """)
-
-        # 3) DETALLE MENSUAL SOLO DE ICA OPERATIVO
-        sql_ica_detalle_mensual = text("""
-            SELECT
-                periodo_anio,
-                periodo_mes,
-                cuenta_codigo,
-                cuenta_nombre,
-                SUM(credito - debito) AS valor
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-            AND fecha_contable BETWEEN :d AND :h
-            AND cuenta_codigo LIKE '236805%'
-            GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
-            HAVING SUM(credito - debito) <> 0
-            ORDER BY periodo_anio, periodo_mes, cuenta_codigo
-        """)
-
-        # 4) DETALLE MENSUAL DE RETEFUENTE
-        sql_retefuente_detalle_mensual = text("""
-            SELECT
-                periodo_anio,
-                periodo_mes,
-                cuenta_codigo,
-                cuenta_nombre,
-                SUM(credito - debito) AS valor
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-            AND fecha_contable BETWEEN :d AND :h
-            AND cuenta_codigo LIKE '2365%'
-            GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
-            HAVING SUM(credito - debito) <> 0
-            ORDER BY periodo_anio, periodo_mes, cuenta_codigo
-        """)
-
-        # 5) REFERENCIA CONTABLE OPCIONAL DE 236898
-        sql_referencia_236898 = text("""
-            SELECT
-                SUM(credito - debito) AS valor_236898
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-            AND fecha_contable BETWEEN :d AND :h
-            AND cuenta_codigo = '236898'
-        """)
-
-        res_evo = db.session.execute(
-            sql_evolucion,
-            {"idc": idcliente, "d": desde, "h": hasta}
-        ).mappings().all()
-
-        res_comp = db.session.execute(
-            sql_composicion,
-            {"idc": idcliente, "d": desde, "h": hasta}
-        ).mappings().all()
-
-        res_ica_det = db.session.execute(
-            sql_ica_detalle_mensual,
-            {"idc": idcliente, "d": desde, "h": hasta}
-        ).mappings().all()
-
-        res_rf_det = db.session.execute(
-            sql_retefuente_detalle_mensual,
-            {"idc": idcliente, "d": desde, "h": hasta}
-        ).mappings().all()
-
-        ref_236898 = db.session.execute(
-            sql_referencia_236898,
-            {"idc": idcliente, "d": desde, "h": hasta}
-        ).mappings().first()
-
-        def normalizar_concepto(cuenta: str, nombre: str) -> str:
-            nombre_l = (nombre or "").strip().lower()
-
-            # --- ICA DETALLADO ---
-            if cuenta == "23680505":
-                return "ReteICA 9,66"
-            if cuenta == "23680501":
-                return "ReteICA 11,04"
-            if cuenta == "23680507":
-                return "ReteICA 8,66"
-
-            # Detectar devoluciones ICA por nombre
-            if cuenta.startswith("236805"):
-                if "devol" in nombre_l and "11" in nombre_l:
-                    return "Devolución ReteICA 11,04"
-                if "devol" in nombre_l and ("8,66" in nombre_l or "8.66" in nombre_l or "866" in nombre_l):
-                    return "Devolución ReteICA 8,66"
-                if "devol" in nombre_l and ("9,66" in nombre_l or "9.66" in nombre_l or "966" in nombre_l):
-                    return "Devolución ReteICA 9,66"
-                if "devol" in nombre_l:
-                    return f"Devolución ICA ({cuenta})"
-
-            # --- RETEFUENTE ---
-            if cuenta.startswith("2365"):
-                return (nombre or cuenta).strip().title()
-
-            return (nombre or cuenta).strip().title()
-
-        def clasificar_visual(cuenta: str, nombre: str) -> str:
-            nombre_l = (nombre or "").strip().lower()
-
-            if cuenta.startswith("236805"):
-                if "devol" in nombre_l:
-                    return "ReteICA_Devolucion"
-                return "ReteICA"
-
-            if cuenta.startswith("2365"):
-                return "ReteFuente"
-
-            return "Otros"
-
-        # --- EVOLUCIÓN + RESUMEN POR PERIODO ---
-        evolucion = []
-        resumen_por_periodo = []
-        total_rf = 0.0
-        total_ica_conceptos = 0.0
-
-        for r in res_evo:
-            periodo = f"{r['periodo_anio']}-{r['periodo_mes']:02d}"
-            rf = float(r["retefuente"] or 0)
-            ica_conceptos = float(r["reteica_conceptos"] or 0)
-            total_periodo = rf + ica_conceptos
-
-            total_rf += rf
-            total_ica_conceptos += ica_conceptos
-
-            evolucion.append({
-                "label": periodo,
-                "retefuente": rf,
-                "reteica_conceptos": ica_conceptos
-            })
-
-            resumen_por_periodo.append({
-                "periodo": periodo,
-                "retefuente": rf,
-                "reteica_conceptos": ica_conceptos,
-                "total_periodo": total_periodo
-            })
-
-        # --- COMPOSICIÓN / TABLA PRINCIPAL ---
-        composicion = []
-        for c in res_comp:
-            cuenta = str(c["cuenta"])
-            concepto_original = str(c["concepto_original"] or "")
-            valor = float(c["valor"] or 0)
-
-            composicion.append({
-                "cuenta": cuenta,
-                "concepto": normalizar_concepto(cuenta, concepto_original),
-                "tipo": clasificar_visual(cuenta, concepto_original),
-                "valor": valor
-            })
-
-        # --- DETALLE ICA MENSUAL ---
-        ica_detalle_mensual = []
-        for r in res_ica_det:
-            cuenta = str(r["cuenta_codigo"])
-            nombre = str(r["cuenta_nombre"] or "")
-            valor = float(r["valor"] or 0)
-
-            ica_detalle_mensual.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-                "cuenta": cuenta,
-                "concepto": normalizar_concepto(cuenta, nombre),
-                "tipo": clasificar_visual(cuenta, nombre),
-                "valor": valor
-            })
-
-        # --- DETALLE RETEFUENTE MENSUAL ---
-        retefuente_detalle_mensual = []
-        for r in res_rf_det:
-            cuenta = str(r["cuenta_codigo"])
-            nombre = str(r["cuenta_nombre"] or "")
-            valor = float(r["valor"] or 0)
-
-            retefuente_detalle_mensual.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-                "cuenta": cuenta,
-                "concepto": normalizar_concepto(cuenta, nombre),
-                "tipo": clasificar_visual(cuenta, nombre),
-                "valor": valor
-            })
-
-        # --- TOTALES POR PERIODO PARA TARJETAS ---
-        def construir_totales_por_periodo(rows):
-            acumulado = {}
-
-            for row in rows:
-                periodo = row["label"]
-                cuenta = row["cuenta"]
-                concepto = row["concepto"]
-                valor = float(row["valor"] or 0)
-
-                if periodo not in acumulado:
-                    acumulado[periodo] = {
-                        "periodo": periodo,
-                        "valor": 0.0,
-                        "conceptos_count": 0,
-                        "cuentas_count": 0,
-                        "_conceptos": set(),
-                        "_cuentas": set()
-                    }
-
-                acumulado[periodo]["valor"] += valor
-                acumulado[periodo]["_conceptos"].add(concepto)
-                acumulado[periodo]["_cuentas"].add(cuenta)
-
-            salida = []
-            for periodo in sorted(acumulado.keys()):
-                item = acumulado[periodo]
-                salida.append({
-                    "periodo": periodo,
-                    "valor": item["valor"],
-                    "conceptos_count": len(item["_conceptos"]),
-                    "cuentas_count": len(item["_cuentas"])
-                })
-
-            return salida
-
-        totales_ica_por_periodo = construir_totales_por_periodo(ica_detalle_mensual)
-        totales_retefuente_por_periodo = construir_totales_por_periodo(retefuente_detalle_mensual)
-
-        valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
-
-        return jsonify({
-            "kpis": {
-                "total_retefuente": total_rf,
-                "total_reteica_conceptos": total_ica_conceptos,
-                "total_general": total_rf + total_ica_conceptos
-            },
-            "evolucion": evolucion,
-            "resumen_por_periodo": resumen_por_periodo,
-            "composicion": composicion,
-            "ica_detalle_mensual": ica_detalle_mensual,
-            "retefuente_detalle_mensual": retefuente_detalle_mensual,
-            "totales_ica_por_periodo": totales_ica_por_periodo,
-            "totales_retefuente_por_periodo": totales_retefuente_por_periodo,
-            "referencias_contables": {
-                "cuenta_236898": valor_236898,
-                "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
-            },
-            "metadata": {
-                "desde": desde,
-                "hasta": hasta,
-                "nota_alcance": "Reporte gerencial basado en auxiliares contables cargados. No reemplaza la liquidación tributaria oficial ni la validación del contador."
-            }
-        }), 200
+        return jsonify(construir_retenciones(idcliente, desde, hasta)), 200
 
 
     #ENDPOINT PARA EL CALCULO DEL ESTADO DE RESULTADOS (P&L)
