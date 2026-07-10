@@ -538,6 +538,9 @@ class AlegraCompraItem(db.Model):
     precio = db.Column(db.Numeric(18, 2))
     subtotal = db.Column(db.Numeric(18, 2))
     total = db.Column(db.Numeric(18, 2))
+    tax = db.Column(JSONB)  # array rico, mismo shape que AlegraFacturaItem.tax - confirmado
+    # con dato real 2026-07-10 vía API directa en categories[] Y items[] de /bills
+    # (puede venir null si la línea no tiene impuesto, ej. bienes exentos/importados)
 
     def as_dict(self):
         return {
@@ -552,6 +555,7 @@ class AlegraCompraItem(db.Model):
             "precio": float(self.precio or 0),
             "subtotal": float(self.subtotal or 0),
             "total": float(self.total or 0),
+            "tax": self.tax,
         }
 
 

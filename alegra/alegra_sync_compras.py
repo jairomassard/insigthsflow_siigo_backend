@@ -122,6 +122,7 @@ def sync_compras_desde_alegra(idcliente: int) -> str:
                 precio=cat.get("price"),
                 subtotal=None,
                 total=cat.get("total"),
+                tax=cat.get("tax"),
             ))
 
         for it in purchases.get("items") or []:
@@ -135,6 +136,7 @@ def sync_compras_desde_alegra(idcliente: int) -> str:
                 precio=it.get("price"),
                 subtotal=it.get("subtotal"),
                 total=it.get("total"),
+                tax=it.get("tax"),
             ))
 
         AlegraCompraRetencion.query.filter_by(compra_id=compra.id).delete()

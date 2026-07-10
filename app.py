@@ -1554,6 +1554,291 @@ def construir_pnl(idcliente, desde, hasta):
     return construir_pnl_auxiliares(idcliente, desde, hasta)
 
 
+def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
+    """Version Siigo del Cruce de IVAs (logica original, extraida tal cual
+    del endpoint /reportes/cruce_iva_v2 sin cambios de comportamiento)."""
+    from sqlalchemy import text
+
+    f_vtas = []
+    f_comps = []
+
+    if inc_19:
+        f_vtas.append("(cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%')")
+        f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081002%'",
+                        "cuenta_codigo LIKE '24081501%'", "cuenta_codigo LIKE '24081502%'"])
+
+    if inc_5:
+        f_vtas.append("cuenta_codigo LIKE '24080603%'")
+        f_comps.extend(["cuenta_codigo LIKE '24081003%'", "cuenta_codigo LIKE '24081503%'"])
+
+    sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
+    sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
+
+    sql = text(f"""
+        SELECT
+            periodo_anio, periodo_mes,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%') THEN (credito - debito) ELSE 0 END) AS v19,
+            SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081002%' OR cuenta_codigo LIKE '24081501%' OR cuenta_codigo LIKE '24081502%') THEN (debito - credito) ELSE 0 END) AS c19,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
+
+            SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
+            SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
+
+            SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
+        FROM auxiliar_contable
+        WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
+        GROUP BY 1, 2 ORDER BY 1, 2
+    """)
+
+    res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+    series_mensuales = []
+    for r in res:
+        f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
+        mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
+
+        series_mensuales.append({
+            "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
+            "iva_v19": float(r['v19'] or 0),
+            "iva_v5": float(r['v5'] or 0),
+            "iva_c19": float(r['c19'] or 0),
+            "iva_c5": float(r['c5'] or 0),
+            "iva_ventas": float(r['v_total'] or 0),
+            "iva_compras": float(r['c_total'] or 0),
+            "reteiva_favor": float(r['rete'] or 0),
+            "saldo_iva": float(r['v_total'] or 0) - float(r['c_total'] or 0) - float(r['rete'] or 0),
+            "mes_presentacion": mes_pres
+        })
+
+    return _empaquetar_cruce_iva(series_mensuales)
+
+
+def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
+    """Version Alegra del Cruce de IVAs.
+
+    IVA generado (ventas) se deriva de alegra_factura_items.tax (array por
+    item; confirmado con datos reales 2026-07-10 en los 2 clientes Alegra
+    reales que cada elemento trae 'type'/'percentage'/'amount' reales, con
+    tasas 0/5/19 vistas) en vez de auxiliar_contable: igual que en el PyG,
+    /journals de Alegra no trae el asiento automatico de venta salvo que el
+    cliente active "Parametrizacion contable" en su cuenta, asi que la
+    cuenta 2408 casi siempre queda vacia del lado ventas aunque haya
+    facturacion real. Notas credito no traen desglose de impuesto por item
+    (solo impuestos_total de cabecera, ver AlegraNotaCredito - y una nota
+    puede afectar varias facturas de tasas distintas, ver
+    AlegraNotaCreditoFactura), asi que su monto se neta contra las tasas del
+    mismo mes en proporcion al peso bruto de cada tasa: aproximacion
+    aceptada a falta de detalle por item en las notas credito.
+
+    IVA descontable (compras) y ReteIVA de compras NO usan auxiliar_contable
+    (a diferencia del PyG, donde compras/costos SI son confiables ahi): se
+    confirmo con dato real 2026-07-10 que cada cliente Alegra numera sus
+    sub-cuentas de IVA (2408xx) de forma distinta segun su propio contador -
+    idcliente=15 usa 240802/24080201 para "IVA descontable", idcliente=16 no
+    tiene ninguna cuenta con ese patron - asi que no hay codigo generico que
+    sirva para todos los clientes. En su lugar, IVA descontable se deriva de
+    alegra_compra_items.tax (mismo array rico que en facturas, confirmado con
+    dato real 2026-07-10 via llamada directa a /bills que categories[] e
+    items[] SI lo traen, solo no se capturaba - ver
+    Docs_integracion/alegra_agregar_tax_compra_items.sql) y ReteIVA de
+    alegra_compra_retenciones filtrado por alegra_retenciones_catalogo.type
+    = 'IVA' (en vez de adivinar el codigo de cuenta 135517, que tampoco es
+    consistente entre clientes).
+
+    LIMITACION CONOCIDA (2026-07-10): para idcliente=16 (Maslux LED),
+    auxiliar_contable muestra ~$20M reales en la cuenta 135517 (ReteIVA a
+    favor) que NO aparecen via este metodo - alegra_compra_retenciones (que
+    viene de bill.retentions[]) no tiene ninguna fila con retention_id del
+    tipo IVA para ese cliente, asi que esa retencion se esta aplicando por
+    otra via en Alegra (probablemente al momento del pago, no en la factura
+    de compra misma) que este conector todavia no captura. No se investigo
+    mas a fondo por alcance de tiempo - queda pendiente si se necesita
+    ReteIVA de compras exacto."""
+    from sqlalchemy import text
+
+    sql_items = text("""
+        SELECT
+            EXTRACT(YEAR FROM f.fecha)::int AS anio,
+            EXTRACT(MONTH FROM f.fecha)::int AS mes,
+            (t->>'percentage')::numeric AS pct,
+            SUM((t->>'amount')::numeric) AS monto
+        FROM alegra_factura_items i
+        JOIN alegra_facturas f ON f.id = i.factura_id
+        CROSS JOIN LATERAL jsonb_array_elements(i.tax) AS t
+        WHERE f.idcliente = :idc
+          AND f.fecha BETWEEN :d AND :h
+          AND (f.estado IS NULL OR f.estado NOT IN ('draft', 'void'))
+          AND jsonb_typeof(i.tax) = 'array'
+          AND t->>'type' = 'IVA'
+        GROUP BY 1, 2, 3
+    """)
+
+    sql_nc = text("""
+        SELECT
+            EXTRACT(YEAR FROM fecha)::int AS anio,
+            EXTRACT(MONTH FROM fecha)::int AS mes,
+            SUM(impuestos_total) AS monto
+        FROM alegra_notas_credito
+        WHERE idcliente = :idc
+          AND fecha BETWEEN :d AND :h
+          AND (estado IS NULL OR estado NOT IN ('draft', 'void'))
+        GROUP BY 1, 2
+    """)
+
+    sql_comp_items = text("""
+        SELECT
+            EXTRACT(YEAR FROM c.fecha)::int AS anio,
+            EXTRACT(MONTH FROM c.fecha)::int AS mes,
+            (t->>'percentage')::numeric AS pct,
+            SUM((t->>'amount')::numeric) AS monto
+        FROM alegra_compra_items i
+        JOIN alegra_compras c ON c.id = i.compra_id
+        CROSS JOIN LATERAL jsonb_array_elements(i.tax) AS t
+        WHERE c.idcliente = :idc
+          AND c.fecha BETWEEN :d AND :h
+          AND (c.estado IS NULL OR c.estado NOT IN ('draft', 'void'))
+          AND jsonb_typeof(i.tax) = 'array'
+          AND t->>'type' = 'IVA'
+        GROUP BY 1, 2, 3
+    """)
+
+    sql_comp_rete = text("""
+        SELECT
+            EXTRACT(YEAR FROM c.fecha)::int AS anio,
+            EXTRACT(MONTH FROM c.fecha)::int AS mes,
+            SUM(r.amount) AS monto
+        FROM alegra_compra_retenciones r
+        JOIN alegra_compras c ON c.id = r.compra_id
+        JOIN alegra_retenciones_catalogo cat
+            ON cat.idcliente = r.idcliente AND cat.alegra_id = r.retention_id
+        WHERE c.idcliente = :idc
+          AND c.fecha BETWEEN :d AND :h
+          AND (c.estado IS NULL OR c.estado NOT IN ('draft', 'void'))
+          AND cat.type = 'IVA'
+        GROUP BY 1, 2
+    """)
+
+    items_rows = db.session.execute(sql_items, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    nc_rows = db.session.execute(sql_nc, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    comp_items_rows = db.session.execute(sql_comp_items, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    comp_rete_rows = db.session.execute(sql_comp_rete, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+    def _distribuir_por_tasa(rows):
+        bruto = {}
+        for r in rows:
+            key = (int(r["anio"]), int(r["mes"]))
+            bruto.setdefault(key, {})
+            pct = float(r["pct"] or 0)
+            bruto[key][pct] = bruto[key].get(pct, 0.0) + float(r["monto"] or 0)
+        return bruto
+
+    bruto_por_periodo = _distribuir_por_tasa(items_rows)
+    bruto_compras_por_periodo = _distribuir_por_tasa(comp_items_rows)
+
+    nc_por_periodo = {(int(r["anio"]), int(r["mes"])): float(r["monto"] or 0) for r in nc_rows}
+    rete_compras_por_periodo = {(int(r["anio"]), int(r["mes"])): float(r["monto"] or 0) for r in comp_rete_rows}
+
+    def _netear(bruto, notas):
+        resultado = {}
+        for key, tasas in bruto.items():
+            total_bruto = sum(tasas.values())
+            nota_mes = notas.get(key, 0.0)
+            t19 = t5 = 0.0
+            for pct, monto in tasas.items():
+                proporcion = (monto / total_bruto) if total_bruto else 0.0
+                neto = monto - (nota_mes * proporcion)
+                if pct == 19:
+                    t19 = neto
+                elif pct == 5:
+                    t5 = neto
+            resultado[key] = {"t19": t19, "t5": t5}
+        return resultado
+
+    ventas_por_periodo = _netear(bruto_por_periodo, nc_por_periodo)
+    # Compras no tienen "nota debito" capturada aparte todavia (no hay
+    # concepto de ajuste por nota debito en Alegra para este reporte) - se
+    # distribuye tal cual, sin netear contra nada.
+    compras_por_periodo = _netear(bruto_compras_por_periodo, {})
+
+    periodos = sorted(
+        set(ventas_por_periodo.keys())
+        | set(compras_por_periodo.keys())
+        | set(rete_compras_por_periodo.keys())
+    )
+
+    series_mensuales = []
+    for anio, mes in periodos:
+        v = ventas_por_periodo.get((anio, mes), {"t19": 0.0, "t5": 0.0})
+        c = compras_por_periodo.get((anio, mes), {"t19": 0.0, "t5": 0.0})
+        c19 = c["t19"]
+        c5 = c["t5"]
+        rete = rete_compras_por_periodo.get((anio, mes), 0.0)
+
+        v_total = (v["t19"] if inc_19 else 0.0) + (v["t5"] if inc_5 else 0.0)
+        c_total = (c19 if inc_19 else 0.0) + (c5 if inc_5 else 0.0)
+
+        f_actual = datetime(anio, mes, 1)
+        mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
+
+        series_mensuales.append({
+            "label": f"{anio}-{mes:02d}",
+            "iva_v19": v["t19"],
+            "iva_v5": v["t5"],
+            "iva_c19": c19,
+            "iva_c5": c5,
+            "iva_ventas": v_total,
+            "iva_compras": c_total,
+            "reteiva_favor": rete,
+            "saldo_iva": v_total - c_total - rete,
+            "mes_presentacion": mes_pres,
+        })
+
+    return _empaquetar_cruce_iva(series_mensuales)
+
+
+def _empaquetar_cruce_iva(series_mensuales):
+    def agrupar(datos, salto):
+        agrupados = []
+        for i in range(0, len(datos), salto):
+            g = datos[i: i + salto]
+            if not g:
+                continue
+            v_s = sum(x['iva_ventas'] for x in g)
+            c_s = sum(x['iva_compras'] for x in g)
+            r_s = sum(x['reteiva_favor'] for x in g)
+            agrupados.append({
+                "label": " + ".join([x['label'] for x in g]),
+                "iva_ventas": v_s,
+                "iva_compras": c_s,
+                "reteiva_favor": r_s,
+                "saldo_iva": v_s - c_s - r_s,
+                "mes_presentacion": g[-1]['mes_presentacion']
+            })
+        return agrupados
+
+    return {
+        "series": series_mensuales,
+        "kpis": {
+            "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
+            "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
+            "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
+            "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
+        },
+        "series_agrupadas": {
+            "bimensual": agrupar(series_mensuales, 2),
+            "cuatrimestral": agrupar(series_mensuales, 4)
+        }
+    }
+
+
+def construir_cruce_iva(idcliente, desde, hasta, inc_19, inc_5):
+    """Router segun proveedor_datos del cliente, mismo patron que construir_pnl."""
+    if _proveedor_datos_cliente(idcliente) == "alegra":
+        return construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5)
+    return construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5)
+
+
 
 # =========================================================
 # HELPERS DASHBOARD / RESUMEN EJECUTIVO INTELIGENTE
@@ -16699,109 +16984,14 @@ def create_app():
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
     @jwt_required()
     def get_cruce_iva_v2():
-        from datetime import datetime, timedelta
-        from sqlalchemy import text
-        
         idcliente = get_jwt().get("idcliente")
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        
-        # Parámetros de filtro de tasa
+
         inc_19 = request.args.get("inc19", "true").lower() == "true"
         inc_5 = request.args.get("inc5", "false").lower() == "true"
 
-        # 1. Filtros dinámicos para Totales (KPIs) - Mapeo exacto según tu Excel
-        f_vtas = []
-        f_comps = []
-        
-        if inc_19:
-            # Ventas 19% (Generado 01 + Devoluciones 02)
-            f_vtas.append("(cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%')")
-            # Compras 19% (Descontable 1001/02 + Servicios 1501/02)
-            f_comps.extend(["cuenta_codigo LIKE '24081001%'", "cuenta_codigo LIKE '24081002%'", 
-                            "cuenta_codigo LIKE '24081501%'", "cuenta_codigo LIKE '24081502%'"])
-        
-        if inc_5:
-            # Ventas 5% (Generado 03)
-            f_vtas.append("cuenta_codigo LIKE '24080603%'")
-            # Compras 5% (Descontable 1003 + Servicios 1503)
-            f_comps.extend(["cuenta_codigo LIKE '24081003%'", "cuenta_codigo LIKE '24081503%'"])
-
-        sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
-        sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
-
-        # 2. SQL Corregido: Calculamos NETOS reales (Crédito - Débito para ventas)
-        sql = text(f"""
-            SELECT 
-                periodo_anio, periodo_mes,
-                -- Apertura para barras del gráfico (Individuales)
-                SUM(CASE WHEN (cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%') THEN (credito - debito) ELSE 0 END) AS v19,
-                SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081002%' OR cuenta_codigo LIKE '24081501%' OR cuenta_codigo LIKE '24081502%') THEN (debito - credito) ELSE 0 END) AS c19,
-                SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
-                
-                -- Totales calculados según selectores (KPIs y Tabla)
-                SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
-                SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
-                
-                -- ReteIVA (Cálculo Neto: Débito - Crédito)
-                SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
-            FROM auxiliar_contable
-            WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
-            GROUP BY 1, 2 ORDER BY 1, 2
-        """)
-        
-        res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-        
-        series_mensuales = []
-        for r in res:
-            f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
-            mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
-
-            series_mensuales.append({
-                "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-                "iva_v19": float(r['v19'] or 0),
-                "iva_v5": float(r['v5'] or 0),
-                "iva_c19": float(r['c19'] or 0),
-                "iva_c5": float(r['c5'] or 0),
-                "iva_ventas": float(r['v_total'] or 0),
-                "iva_compras": float(r['c_total'] or 0),
-                "reteiva_favor": float(r['rete'] or 0),
-                "saldo_iva": float(r['v_total'] or 0) - float(r['c_total'] or 0) - float(r['rete'] or 0),
-                "mes_presentacion": mes_pres
-            })
-
-        def agrupar(datos, salto):
-            agrupados = []
-            for i in range(0, len(datos), salto):
-                g = datos[i : i + salto]
-                if not g: continue
-                v_s = sum(x['iva_ventas'] for x in g)
-                c_s = sum(x['iva_compras'] for x in g)
-                r_s = sum(x['reteiva_favor'] for x in g)
-                agrupados.append({
-                    "label": " + ".join([x['label'] for x in g]),
-                    "iva_ventas": v_s, 
-                    "iva_compras": c_s, 
-                    "reteiva_favor": r_s,
-                    "saldo_iva": v_s - c_s - r_s,
-                    "mes_presentacion": g[-1]['mes_presentacion']
-                })
-            return agrupados
-
-        return jsonify({
-            "series": series_mensuales,
-            "kpis": {
-                "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
-                "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
-                "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
-                "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
-            },
-            "series_agrupadas": {
-                "bimensual": agrupar(series_mensuales, 2),
-                "cuatrimestral": agrupar(series_mensuales, 4)
-            }
-        }), 200
+        return jsonify(construir_cruce_iva(idcliente, desde, hasta, inc_19, inc_5)), 200
 
 
 
