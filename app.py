@@ -1281,7 +1281,20 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     no reflejan). El primer digito de la cuenta (41 = ingreso operacional)
     es un estandar PUC nacional, a diferencia de los sub-codigos de 4+
     digitos (los que sí varian por cliente y por eso Cruce de IVA y
-    Retenciones no hacen todavia este mismo cruce - ver sus docstrings)."""
+    Retenciones no hacen todavia este mismo cruce - ver sus docstrings).
+
+    GOTCHA real confirmado 2026-07-10 con el Libro Diario 2024 de
+    Importadora NGC: al cierre del año fiscal, el contador postea un
+    asiento de cierre contable (comprobante_tipo 'CC-CA-N' en este cliente)
+    que lleva TODAS las cuentas nominales (4/5/6/7 - ingresos, costos,
+    gastos) a cero, transfiriendo el neto a patrimonio. Sin excluirlo, sumar
+    un rango que incluya el cierre (ej. el año completo) casi anula la
+    actividad real del período - se detectó porque diciembre 2024 mostraba
+    -$902M en Ventas, casi la negación exacta del resto del año. El nombre
+    del comprobante es una convención de ESTE cliente/contador, no
+    necesariamente universal - si otro cliente Alegra muestra el mismo
+    patrón de un mes con auxiliar_contable casi opuesto al resto del año,
+    revisar su propio comprobante_tipo de cierre y extender el filtro."""
     from sqlalchemy import text
 
     sql_ingresos_reales_evo = text("""
@@ -1293,6 +1306,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
         AND cuenta_codigo LIKE '41%'
+        AND (comprobante_tipo IS NULL OR comprobante_tipo NOT LIKE 'CC-CA%')
         GROUP BY periodo_anio, periodo_mes
         HAVING SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) <> 0
     """)
@@ -1351,10 +1365,23 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
                 OR cuenta_codigo LIKE '5265%'
                 THEN (debito - credito)
                 ELSE 0
-            END) AS dep_amort
+            END) AS dep_amort,
+
+            -- "Gastos por impuestos" (ICA/Industria y Comercio, cuenta PUC
+            -- 5115) ya incluido arriba en gastos_operacionales (correcto
+            -- segun PUC/NIIF - ver docstring), pero se expone aparte para
+            -- que el frontend pueda ofrecer la vista alternativa "como lo
+            -- muestra Alegra nativo" (que lo resta despues de Utilidad
+            -- Antes de Impuestos en vez de como gasto operacional) sin
+            -- tener que duplicar esta consulta.
+            SUM(CASE
+                WHEN cuenta_codigo LIKE '5115%' THEN (debito - credito)
+                ELSE 0
+            END) AS impuestos_operativos
         FROM auxiliar_contable
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
+        AND (comprobante_tipo IS NULL OR comprobante_tipo NOT LIKE 'CC-CA%')
         GROUP BY periodo_anio, periodo_mes
         ORDER BY periodo_anio, periodo_mes
     """)
@@ -1391,6 +1418,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
         AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
+        AND (comprobante_tipo IS NULL OR comprobante_tipo NOT LIKE 'CC-CA%')
         GROUP BY
             periodo_anio,
             periodo_mes,
@@ -1462,6 +1490,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         "gastos_operacionales": 0.0,
         "gastos_no_operacionales": 0.0,
         "dep_amort": 0.0,
+        "impuestos_operativos": 0.0,
     }
 
     for periodo in periodos:
@@ -1472,6 +1501,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         gastos_op = float(r["gastos_operacionales"] or 0) if r else 0.0
         gastos_no_op = float(r["gastos_no_operacionales"] or 0) if r else 0.0
         dep_amort = float(r["dep_amort"] or 0) if r else 0.0
+        impuestos_op = float(r["impuestos_operativos"] or 0) if r else 0.0
 
         ingresos_totales = ing_op + ing_no_op
         utilidad_bruta = ing_op - costos
@@ -1486,6 +1516,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         totales["gastos_operacionales"] += gastos_op
         totales["gastos_no_operacionales"] += gastos_no_op
         totales["dep_amort"] += dep_amort
+        totales["impuestos_operativos"] += impuestos_op
 
         base_margen = ingresos_totales if ingresos_totales != 0 else 0
 
@@ -1498,6 +1529,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             "costos_venta": costos,
             "gastos_operacionales": gastos_op,
             "gastos_no_operacionales": gastos_no_op,
+            "impuestos_operativos": impuestos_op,
             "utilidad_bruta": utilidad_bruta,
             "utilidad_operativa": utilidad_operativa,
             "ebitda": ebitda,
@@ -1517,6 +1549,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     gastos_operacionales = totales["gastos_operacionales"]
     gastos_no_operacionales = totales["gastos_no_operacionales"]
     dep_amort = totales["dep_amort"]
+    impuestos_operativos = totales["impuestos_operativos"]
 
     utilidad_bruta = ingresos_operacionales - costos_venta
     utilidad_operativa = utilidad_bruta - gastos_operacionales
@@ -1584,6 +1617,13 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             "margen_operativo": round((utilidad_operativa / base_margen) * 100, 2) if base_margen else 0,
             "margen_ebitda": round((ebitda / base_margen) * 100, 2) if base_margen else 0,
             "margen_neto": round((utilidad_neta / base_margen) * 100, 2) if base_margen else 0,
+            # Ya incluido dentro de gastos_operacionales arriba (correcto
+            # segun PUC/NIIF - ICA es gasto operativo, no impuesto sobre la
+            # utilidad). Se expone aparte solo para que el frontend pueda
+            # ofrecer la vista alternativa "como lo presenta Alegra nativo"
+            # (que resta este monto despues de Utilidad Antes de Impuestos
+            # en vez de como gasto operacional) sin cambiar el calculo base.
+            "impuestos_operativos": impuestos_operativos,
         },
         "evolucion": evolucion,
         "composicion": composicion,
@@ -17455,8 +17495,26 @@ def create_app():
 
         try:
             from models import AuxiliarContable
+            from models_alegra import AlegraCuentaContable
             df = pd.read_excel(file, header=0, engine="calamine")
             df.columns = [str(c).strip() for c in df.columns]
+
+            # Fallback por nombre de cuenta cuando el Excel trae "Código" en
+            # blanco: confirmado con dato real 2026-07-10 que el catalogo de
+            # cuentas (alegra_cuentas_contables) puede tener un codigo PUC
+            # asignado a mano (ver Fase 3 del plan maestro) que el Libro
+            # Diario nativo de Alegra no expone - sin este fallback, subir
+            # un Libro Diario completo borra ese trabajo de codificacion
+            # manual para el rango de fechas reemplazado.
+            codigos_por_nombre = {
+                nombre: codigo
+                for nombre, codigo in db.session.query(
+                    AlegraCuentaContable.name, AlegraCuentaContable.code
+                ).filter(
+                    AlegraCuentaContable.idcliente == idcliente,
+                    AlegraCuentaContable.code.isnot(None),
+                ).all()
+            }
 
             lista_mapeada = []
             fechas_procesadas = []
@@ -17474,9 +17532,10 @@ def create_app():
 
             for _, row in df.iterrows():
                 cta_raw = row.get("Código")
-                if cta_raw is None or pd.isna(cta_raw):
+                nombre_cuenta = str(row.get("Cuenta contable") or "").strip()
+                codigo_limpio = clean_codigo(cta_raw) or codigos_por_nombre.get(nombre_cuenta)
+                if not codigo_limpio:
                     continue
-                codigo_limpio = clean_codigo(cta_raw)
 
                 f_raw = row.get("Fecha")
                 if f_raw is None or pd.isna(f_raw):
@@ -17498,7 +17557,7 @@ def create_app():
                     "comprobante_tipo": str(row.get("Asiento") or "").strip() or None,
                     "comprobante_numero": str(row.get("Documento") or "").strip() or None,
                     "cuenta_codigo": codigo_limpio,
-                    "cuenta_nombre": str(row.get("Cuenta contable") or "").strip(),
+                    "cuenta_nombre": nombre_cuenta,
                     "tercero_nit": clean_codigo(identificacion),
                     "tercero_nombre": str(tercero).strip() if tercero is not None and not pd.isna(tercero) else None,
                     "debito": clean_num(row.get("Débito")),
