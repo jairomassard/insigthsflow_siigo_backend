@@ -16424,6 +16424,111 @@ def create_app():
         })
 
 
+    # --- Detalle vendedor con histórico mensual ---
+    @app.route("/reportes/vendedores/detalle", methods=["GET"])
+    @jwt_required()
+    def detalle_vendedor():
+        from sqlalchemy.sql import text
+        from decimal import Decimal
+
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        vendedor = request.args.get("vendedor")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+
+        centro_costos = (
+            request.args.get("centro_costo")
+            or request.args.get("centro_costos")
+        )
+
+        if not vendedor:
+            return jsonify({"error": "Falta vendedor"}), 400
+
+        params = {"idcliente": idcliente, "vendedor": vendedor}
+
+        filtros = [
+            "m.idcliente = :idcliente",
+            "COALESCE(m.vendedor_nombre, 'Sin asignar') = :vendedor",
+        ]
+
+        if desde:
+            filtros.append("m.fecha >= :desde")
+            params["desde"] = desde
+
+        if hasta:
+            filtros.append("m.fecha <= :hasta")
+            params["hasta"] = hasta
+
+        if centro_costos:
+            filtros.append("""
+                (
+                    CAST(m.cost_center AS TEXT) = :centro_costos
+                    OR m.centro_costo_nombre = :centro_costos
+                    OR m.centro_costo_codigo = :centro_costos
+                )
+            """)
+            params["centro_costos"] = centro_costos
+
+        where = " AND ".join(filtros)
+
+        def norm_decimal(value):
+            if isinstance(value, Decimal):
+                return float(value)
+            return value
+
+        def normalize_row(row):
+            return {k: norm_decimal(v) for k, v in dict(row).items()}
+
+        # --- Totales ---
+        sql_totales = text(f"""
+            SELECT
+                COALESCE(SUM(m.total), 0) AS total,
+                COALESCE(SUM(m.total), 0) AS ventas_netas,
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'FACTURA'
+                ) AS facturas,
+                ABS(COALESCE(SUM(CASE
+                    WHEN m.tipo_movimiento = 'NOTA_CREDITO'
+                    THEN m.total ELSE 0
+                END), 0)) AS notas_credito
+            FROM ventas_movimientos_enriquecidos m
+            WHERE {where}
+        """)
+
+        detalle = normalize_row(
+            db.session.execute(sql_totales, params).mappings().first() or {}
+        )
+        detalle["vendedor_nombre"] = vendedor
+
+        # --- Histórico mensual ---
+        sql_hist = text(f"""
+            SELECT
+                DATE_TRUNC('month', m.fecha) AS mes,
+                COALESCE(SUM(m.total), 0) AS total,
+                COUNT(*) FILTER (
+                    WHERE m.tipo_movimiento = 'FACTURA'
+                ) AS facturas
+            FROM ventas_movimientos_enriquecidos m
+            WHERE {where}
+            GROUP BY DATE_TRUNC('month', m.fecha)
+            ORDER BY mes
+        """)
+
+        historico = [
+            normalize_row(r)
+            for r in db.session.execute(sql_hist, params).mappings().all()
+        ]
+
+        detalle["historico"] = historico
+        detalle["fuente"] = "ventas_movimientos_enriquecidos"
+        detalle["logica"] = "ventas_netas = facturas_emitidas - notas_credito"
+
+        return jsonify(detalle)
 
 
 
