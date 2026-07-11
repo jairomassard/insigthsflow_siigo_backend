@@ -16574,10 +16574,33 @@ def create_app():
             for r in db.session.execute(sql_bottom, params).mappings().all()
         ]
 
+        # --- Todos los productos (para tabla completa buscable/ordenable) ---
+        sql_todos = text(f"""
+            SELECT
+                i.producto_code AS code,
+                i.producto_nombre AS producto,
+                COALESCE(SUM(i.cantidad), 0) AS cantidad,
+                COALESCE(SUM(i.total_item), 0) AS total,
+                COUNT(DISTINCT mb.movimiento_id) AS facturas
+            FROM ventas_movimientos_enriquecidos mb
+            JOIN factura_items_enriquecidos i
+                ON i.factura_id = mb.movimiento_id
+            AND i.idcliente = mb.idcliente
+            WHERE {where}
+            GROUP BY i.producto_code, i.producto_nombre
+            ORDER BY {columna_orden} DESC
+        """)
+
+        todos = [
+            normalize_row(r)
+            for r in db.session.execute(sql_todos, params).mappings().all()
+        ]
+
         return jsonify({
             "kpis": kpis,
             "top10": top10,
             "bottom10": bottom10,
+            "todos": todos,
         })
 
 
