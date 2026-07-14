@@ -28,7 +28,6 @@ from alegra.alegra_sync_facturas import sync_facturas_desde_alegra
 from alegra.alegra_sync_notas_credito import sync_notas_credito_desde_alegra
 from alegra.alegra_sync_compras import sync_compras_desde_alegra
 from alegra.alegra_sync_pagos import sync_pagos_desde_alegra
-from alegra.alegra_transform_contable import transform_auxiliar_contable_desde_alegra
 
 
 def sync_completo_desde_alegra(idcliente: int) -> list[str]:
@@ -38,13 +37,19 @@ def sync_completo_desde_alegra(idcliente: int) -> list[str]:
     resultados.append(sync_notas_credito_desde_alegra(idcliente))
     resultados.append(sync_compras_desde_alegra(idcliente))
     resultados.append(sync_pagos_desde_alegra(idcliente))
-    # Antes habia que correr esto a mano (script aparte) despues de cada
-    # sync - encontrado 2026-07-10 probando con un segundo cliente real
-    # (Maslux LED) que nunca quedo conectado al flujo automatico. A
-    # diferencia de Siigo (donde el auxiliar contable se carga por Excel
-    # manual), en Alegra el dato sale de /journals via la API, asi que este
-    # paso final SI puede (y debe) ser automatico.
-    resultados.append(transform_auxiliar_contable_desde_alegra(idcliente))
+    # SACADO 2026-07-14 (antes llamaba transform_auxiliar_contable_desde_alegra
+    # aqui): confirmado con datos reales de Maslux LED que /journals via API
+    # no es confiable para reconstruir auxiliar_contable (revenue/costo de
+    # venta casi siempre ausentes, ver docstring de construir_pnl_alegra_facturas
+    # y el hallazgo de coleccion en Docs_integracion). El Libro Diario Excel
+    # (/alegra/cargar_libro_diario) es la fuente confiable establecida para
+    # PyG/Cruce IVA/Retenciones/Balance/Indicadores. Este paso quedo
+    # deshabilitado porque su DELETE FROM auxiliar_contable WHERE idcliente=
+    # (sin acotar por fecha) borraba el Libro Diario real ya cargado en
+    # cualquier sync-all posterior - riesgo real de perdida de datos
+    # validados. transform_auxiliar_contable_desde_alegra sigue existiendo
+    # como script standalone por si se necesita a mano, pero ya no se
+    # dispara automaticamente.
     return resultados
 
 
@@ -69,7 +74,8 @@ def sync_completo_desde_alegra_con_log(idcliente: int) -> dict:
         ("notas_credito", lambda: sync_notas_credito_desde_alegra(idcliente)),
         ("compras", lambda: sync_compras_desde_alegra(idcliente)),
         ("pagos", lambda: sync_pagos_desde_alegra(idcliente)),
-        ("auxiliar_contable", lambda: transform_auxiliar_contable_desde_alegra(idcliente)),
+        # "auxiliar_contable" (transform_auxiliar_contable_desde_alegra) se
+        # saco de aqui 2026-07-14 - ver comentario en sync_completo_desde_alegra.
     ]
 
     log_parts = []
