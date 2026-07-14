@@ -19170,11 +19170,29 @@ def create_app():
                     return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
 
             # 2) Ajuste según modo
-            if modo_periodo == "manual":
+            tipo_corte = "al_dia" if modo_periodo == "manual" else "cerrado"
+            limite_confiable = ultima_fecha_auxiliar if modo_periodo == "manual" else fecha_corte_confiable
+
+            # Si el usuario pidio un rango explicito (no automatico) que
+            # arranca DESPUES de la ultima fecha confiable, el rango no se
+            # cruza en absoluto con ningun dato real. Antes esto sustituia
+            # silenciosamente el rango pedido por otro periodo (ej. pedir
+            # 2026 en un cliente sin datos de 2026 terminaba mostrando
+            # diciembre 2025 sin avisar) - feedback real del usuario
+            # 2026-07-14: mostrar datos de un periodo distinto disfrazados
+            # del rango pedido es peor que mostrar vacio. Se deja el rango
+            # tal cual el usuario lo pidio (sin sustituir) para que
+            # construir_pnl devuelva vacio de forma honesta, y el mensaje
+            # de "no hay informacion" de mas abajo se dispare solo. Aplica
+            # igual para Siigo y Alegra (mismo endpoint, sin distincion de
+            # proveedor). El modo automatico (rango_auto, el usuario no puso
+            # fechas) NO cambia - ahi si tiene sentido elegir un default
+            # razonable porque el usuario no pidio nada especifico.
+            if not rango_auto and fecha_desde > limite_confiable:
+                pass
+            elif modo_periodo == "manual":
                 # Vista al día: permite mes parcial, pero no permite pasar
                 # de la última fecha realmente cargada en auxiliares.
-                tipo_corte = "al_dia"
-
                 if fecha_hasta > ultima_fecha_auxiliar:
                     fecha_hasta = ultima_fecha_auxiliar
                     ajuste_por_corte = True
@@ -19184,8 +19202,6 @@ def create_app():
 
             else:
                 # Vista cerrada: no permite pasar del último corte mensual confiable.
-                tipo_corte = "cerrado"
-
                 if fecha_hasta > fecha_corte_confiable:
                     fecha_hasta = fecha_corte_confiable
                     ajuste_por_corte = True
