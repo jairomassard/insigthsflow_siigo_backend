@@ -1270,17 +1270,28 @@ def calcular_cobertura_alegra(idcliente, desde, hasta):
     parte del Estado de Resultados y dominarian el indicador en volumen sin
     aportar nada util - confirmado con datos reales de idcliente=16,
     2026-07-14 (Inventarios/Bancos = type asset, mueven miles de millones,
-    vs. ~$76M reales de gasto/costo sin clasificar en 2025)."""
+    vs. ~$76M reales de gasto/costo sin clasificar en 2025).
+
+    El detalle se separa en dos grupos, porque requieren acciones distintas
+    del contador (feedback real del usuario 2026-07-14 probando el reporte
+    como gerente: "verifica con tu contador" no decia que hacer):
+    - cuentas_existentes: la cuenta SI existe en el plan de cuentas del
+      cliente en Alegra (alegra_cuentas_contables) pero sin codigo PUC -
+      se arregla asignando el codigo en Alegra mismo.
+    - cuentas_no_existentes: el nombre no corresponde a ninguna cuenta real
+      del catalogo (ej. subrenglones de nomina como "Cesantias" que solo
+      aparecen como etiqueta en el Libro Diario) - requiere confirmar con
+      el contador si debe crearse como cuenta propia."""
     from sqlalchemy import text
 
     TIPOS_BALANCE = ("asset", "liability", "equity")
 
     filas = db.session.execute(text("""
-        SELECT cuenta_nombre, tipo_cuenta,
+        SELECT cuenta_nombre, tipo_cuenta, en_catalogo,
                SUM(debito) AS debito, SUM(credito) AS credito, SUM(n_filas) AS n_filas
         FROM alegra_cobertura_contable
         WHERE idcliente = :idc AND fecha BETWEEN :d AND :h
-        GROUP BY cuenta_nombre, tipo_cuenta
+        GROUP BY cuenta_nombre, tipo_cuenta, en_catalogo
     """), {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
 
     # Neto (|debito - credito|), no bruto (debito + credito): una cuenta con
@@ -1305,24 +1316,24 @@ def calcular_cobertura_alegra(idcliente, desde, hasta):
     )
 
     total = monto_codificado + monto_sin_codigo
-    detalle = sorted(
-        (
+
+    def _detalle(filas_grupo):
+        items = (
             {
                 "cuenta_nombre": f["cuenta_nombre"],
                 "monto": round(abs(float(f["debito"] or 0) - float(f["credito"] or 0)), 2),
                 "n_filas": int(f["n_filas"] or 0),
             }
-            for f in relevantes
-        ),
-        key=lambda x: x["monto"],
-        reverse=True,
-    )[:15]
+            for f in filas_grupo
+        )
+        return sorted((i for i in items if i["monto"] > 0), key=lambda x: x["monto"], reverse=True)[:15]
 
     return {
         "pct_cobertura": round(monto_codificado / total, 4) if total else 1.0,
         "monto_codificado": round(monto_codificado, 2),
         "monto_sin_codigo": round(monto_sin_codigo, 2),
-        "detalle": detalle,
+        "detalle_cuentas_existentes": _detalle(f for f in relevantes if f["en_catalogo"]),
+        "detalle_cuentas_no_existentes": _detalle(f for f in relevantes if not f["en_catalogo"]),
     }
 
 
@@ -17773,6 +17784,7 @@ def create_app():
                     acc = sin_codigo_acumulado.setdefault(clave, {
                         "debito": 0.0, "credito": 0.0, "n": 0,
                         "tipo": catalogo_cuentas.get(nombre_cuenta, {}).get("type"),
+                        "en_catalogo": nombre_cuenta in catalogo_cuentas,
                     })
                     acc["debito"] += clean_num(row.get("Débito"))
                     acc["credito"] += clean_num(row.get("Crédito"))
@@ -17819,6 +17831,7 @@ def create_app():
                         "fecha": fecha,
                         "cuenta_nombre": nombre,
                         "tipo_cuenta": v["tipo"],
+                        "en_catalogo": v["en_catalogo"],
                         "debito": v["debito"],
                         "credito": v["credito"],
                         "n_filas": v["n"],

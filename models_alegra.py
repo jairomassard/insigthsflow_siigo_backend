@@ -195,6 +195,7 @@ class AlegraCoberturaContable(db.Model):
     fecha = db.Column(db.Date, nullable=False)
     cuenta_nombre = db.Column(db.String(255), nullable=False)
     tipo_cuenta = db.Column(db.String(30))  # AlegraCuentaContable.type en el momento de la carga; None si no hay match en el catalogo
+    en_catalogo = db.Column(db.Boolean, default=False)  # True: la cuenta existe en alegra_cuentas_contables (falta codigo). False: el nombre no existe como cuenta real del cliente en Alegra (ej. subrenglones de nomina)
     debito = db.Column(db.Numeric(18, 2), default=0)
     credito = db.Column(db.Numeric(18, 2), default=0)
     n_filas = db.Column(db.Integer, default=0)
