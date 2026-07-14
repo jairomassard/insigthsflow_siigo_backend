@@ -1662,22 +1662,38 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     ingresos_por_periodo = dict(ingresos_derivados_por_periodo)
     ingresos_por_periodo.update(ingresos_reales_por_periodo)
 
-    # Solo los meses que TODAVIA dependen del valor derivado necesitan la
-    # fila sintetica "ALEGRA-VENTAS" en la composicion (los meses con Libro
-    # Diario real ya traen su propia cuenta 41xx real, agregada arriba en
-    # sql_comp).
-    ingresos_derivados_sin_ledger_real = {
-        periodo: valor
-        for periodo, valor in ingresos_derivados_por_periodo.items()
-        if periodo not in ingresos_reales_por_periodo
-    }
-
     aux_por_periodo = {
         (int(r["periodo_anio"]), int(r["periodo_mes"])): r
         for r in res_aux
     }
 
-    periodos = sorted(set(aux_por_periodo.keys()) | set(ingresos_por_periodo.keys()) | set(sin_codigo_por_periodo.keys()))
+    # Un mes solo entra al reporte si tiene Libro Diario real cargado
+    # (codificado o sin codigo) - NO basta con tener facturas. Alegra es el
+    # unico caso con esta asimetria: los ingresos se derivan de
+    # alegra_facturas (fuente siempre disponible, independiente de si se
+    # subio el Libro Diario) mientras costos/gastos SOLO existen si se
+    # cargo el Libro Diario. Sin este filtro, un mes con facturas pero sin
+    # Libro Diario mostraria ingresos reales con costos/gastos en cero -
+    # una utilidad artificialmente alta y enganosa, no un cero honesto.
+    # Siigo nunca tuvo este problema porque construir_pnl_auxiliares saca
+    # ingresos Y costos de la misma tabla (auxiliar_contable): un mes sin
+    # cargar simplemente no genera fila en el SQL, se excluye solo. Aqui se
+    # replica ese mismo comportamiento explicitamente - feedback real del
+    # usuario 2026-07-14, comparando contra como ya funciona Siigo.
+    periodos_con_ledger_real = set(aux_por_periodo.keys()) | set(sin_codigo_por_periodo.keys())
+
+    # Solo los meses CON ledger real y que TODAVIA dependen del valor
+    # derivado necesitan la fila sintetica "ALEGRA-VENTAS" en la
+    # composicion (los meses con Libro Diario real ya traen su propia
+    # cuenta 41xx real, agregada arriba en sql_comp; los meses sin ningun
+    # ledger real quedan fuera del reporte, ver periodos_con_ledger_real).
+    ingresos_derivados_sin_ledger_real = {
+        periodo: valor
+        for periodo, valor in ingresos_derivados_por_periodo.items()
+        if periodo not in ingresos_reales_por_periodo and periodo in periodos_con_ledger_real
+    }
+
+    periodos = sorted(periodos_con_ledger_real)
 
     evolucion = []
     totales = {
