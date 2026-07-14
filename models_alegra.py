@@ -181,6 +181,26 @@ class AlegraCuentaContable(db.Model):
         }
 
 
+class AlegraCoberturaContable(db.Model):
+    """Snapshot de lo que /alegra/cargar_libro_diario descarta por no poder
+    resolver un codigo PUC (ni directo del Excel ni por fallback de nombre
+    contra AlegraCuentaContable.code). Se captura EN EL MOMENTO de la carga
+    porque las filas descartadas nunca llegan a auxiliar_contable - despues
+    de ese punto la informacion ya no existe en ningun lado. Reemplazo por
+    rango de fechas igual que auxiliar_contable (ver cargar_libro_diario)."""
+    __tablename__ = "alegra_cobertura_contable"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+    fecha = db.Column(db.Date, nullable=False)
+    cuenta_nombre = db.Column(db.String(255), nullable=False)
+    tipo_cuenta = db.Column(db.String(30))  # AlegraCuentaContable.type en el momento de la carga; None si no hay match en el catalogo
+    debito = db.Column(db.Numeric(18, 2), default=0)
+    credito = db.Column(db.Numeric(18, 2), default=0)
+    n_filas = db.Column(db.Integer, default=0)
+    fecha_carga = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class AlegraMovimiento(db.Model):
     __tablename__ = "alegra_movimientos"
 

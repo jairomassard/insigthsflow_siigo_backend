@@ -1259,6 +1259,63 @@ def _proveedor_datos_cliente(idcliente):
     return fuente.proveedor if fuente else "siigo"
 
 
+def calcular_cobertura_alegra(idcliente, desde, hasta):
+    """Cobertura de codificacion contable Alegra: que % del movimiento del
+    periodo tiene un codigo PUC real vs. cuanto se descarto al cargar el
+    Libro Diario por no poder resolverlo (ver AlegraCoberturaContable y
+    /alegra/cargar_libro_diario). El monto "sin codigo" se filtra a cuentas
+    de tipo income/expense/cost (o sin match en el catalogo, por seguridad -
+    no se descarta nada por default). Las de tipo asset/liability/equity
+    (Inventarios, Bancos, Cuentas por pagar...) se excluyen porque no son
+    parte del Estado de Resultados y dominarian el indicador en volumen sin
+    aportar nada util - confirmado con datos reales de idcliente=16,
+    2026-07-14 (Inventarios/Bancos = type asset, mueven miles de millones,
+    vs. ~$146M reales de gasto/costo sin clasificar)."""
+    from sqlalchemy import text
+
+    TIPOS_BALANCE = ("asset", "liability", "equity")
+
+    filas = db.session.execute(text("""
+        SELECT cuenta_nombre, tipo_cuenta,
+               SUM(debito) AS debito, SUM(credito) AS credito, SUM(n_filas) AS n_filas
+        FROM alegra_cobertura_contable
+        WHERE idcliente = :idc AND fecha BETWEEN :d AND :h
+        GROUP BY cuenta_nombre, tipo_cuenta
+    """), {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+
+    relevantes = [f for f in filas if f["tipo_cuenta"] not in TIPOS_BALANCE]
+    monto_sin_codigo = sum(float(f["debito"] or 0) + float(f["credito"] or 0) for f in relevantes)
+
+    monto_codificado = db.session.execute(text("""
+        SELECT COALESCE(SUM(debito + credito), 0) AS total
+        FROM auxiliar_contable
+        WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
+        AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
+    """), {"idc": idcliente, "d": desde, "h": hasta}).scalar() or 0
+    monto_codificado = float(monto_codificado)
+
+    total = monto_codificado + monto_sin_codigo
+    detalle = sorted(
+        (
+            {
+                "cuenta_nombre": f["cuenta_nombre"],
+                "monto": round(float(f["debito"] or 0) + float(f["credito"] or 0), 2),
+                "n_filas": int(f["n_filas"] or 0),
+            }
+            for f in relevantes
+        ),
+        key=lambda x: x["monto"],
+        reverse=True,
+    )[:15]
+
+    return {
+        "pct_cobertura": round(monto_codificado / total, 4) if total else 1.0,
+        "monto_codificado": round(monto_codificado, 2),
+        "monto_sin_codigo": round(monto_sin_codigo, 2),
+        "detalle": detalle,
+    }
+
+
 def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     """Version Alegra del Estado de Resultados.
 
@@ -1627,6 +1684,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         },
         "evolucion": evolucion,
         "composicion": composicion,
+        "cobertura": calcular_cobertura_alegra(idcliente, desde, hasta),
     }
 
 
@@ -6459,6 +6517,25 @@ def create_app():
             "timezone": tz_str,
             "items": [log.as_dict() for log in logs],
         }), 200
+
+    @app.route("/alegra/cobertura-contable", methods=["GET"])
+    @jwt_required()
+    def get_cobertura_contable_alegra():
+        """Cobertura de codificacion contable para un cliente Alegra en un
+        rango de fechas - reutiliza calcular_cobertura_alegra, la misma
+        funcion que alimenta el campo "cobertura" del Estado de Resultados
+        (/reportes/pnl_v1). Sirve tambien como herramienta de auditoria al
+        conectar un cliente Alegra nuevo, sin duplicar logica."""
+        idcliente, error = _resolver_idcliente_alegra(get_jwt())
+        if error:
+            return error
+
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        if not desde or not hasta:
+            return jsonify({"error": "Faltan parametros desde/hasta"}), 400
+
+        return jsonify(calcular_cobertura_alegra(idcliente, desde, hasta)), 200
 
 
     # (Opcional) Endpoint de diagnóstico rápido
@@ -17623,29 +17700,32 @@ def create_app():
 
         try:
             from models import AuxiliarContable
-            from models_alegra import AlegraCuentaContable
+            from models_alegra import AlegraCuentaContable, AlegraCoberturaContable
             df = pd.read_excel(file, header=0, engine="calamine")
             df.columns = [str(c).strip() for c in df.columns]
 
-            # Fallback por nombre de cuenta cuando el Excel trae "Código" en
-            # blanco: confirmado con dato real 2026-07-10 que el catalogo de
-            # cuentas (alegra_cuentas_contables) puede tener un codigo PUC
-            # asignado a mano (ver Fase 3 del plan maestro) que el Libro
-            # Diario nativo de Alegra no expone - sin este fallback, subir
-            # un Libro Diario completo borra ese trabajo de codificacion
-            # manual para el rango de fechas reemplazado.
+            # Catalogo completo de cuentas del cliente (nombre -> code/type).
+            # "code" alimenta el fallback ya existente (Excel trae "Código" en
+            # blanco pero el catalogo si tiene un codigo PUC asignado a mano,
+            # ver Fase 3 del plan maestro). "type" (asset/liability/equity/
+            # income/expense/cost) lo expone Alegra incluso para cuentas SIN
+            # code (confirmado con datos reales 2026-07-14, idcliente=16) y es
+            # lo que permite, para las filas que de verdad quedan sin codigo,
+            # distinguir ruido de balance (Inventarios, Bancos...) de un
+            # gasto/costo real sin clasificar - ver AlegraCoberturaContable.
+            catalogo_cuentas = {
+                nombre: {"code": codigo, "type": tipo}
+                for nombre, codigo, tipo in db.session.query(
+                    AlegraCuentaContable.name, AlegraCuentaContable.code, AlegraCuentaContable.type
+                ).filter(AlegraCuentaContable.idcliente == idcliente).all()
+            }
             codigos_por_nombre = {
-                nombre: codigo
-                for nombre, codigo in db.session.query(
-                    AlegraCuentaContable.name, AlegraCuentaContable.code
-                ).filter(
-                    AlegraCuentaContable.idcliente == idcliente,
-                    AlegraCuentaContable.code.isnot(None),
-                ).all()
+                nombre: v["code"] for nombre, v in catalogo_cuentas.items() if v["code"]
             }
 
             lista_mapeada = []
-            fechas_procesadas = []
+            sin_codigo_acumulado = {}  # (fecha, cuenta_nombre) -> {debito, credito, n, tipo}
+            fechas_todas = []
 
             def clean_num(val):
                 if val is None or pd.isna(val):
@@ -17659,21 +17739,34 @@ def create_app():
                 return s[:-2] if s.endswith(".0") else s
 
             for _, row in df.iterrows():
-                cta_raw = row.get("Código")
-                nombre_cuenta = str(row.get("Cuenta contable") or "").strip()
-                codigo_limpio = clean_codigo(cta_raw) or codigos_por_nombre.get(nombre_cuenta)
-                if not codigo_limpio:
-                    continue
-
                 f_raw = row.get("Fecha")
                 if f_raw is None or pd.isna(f_raw):
                     continue
                 f_dt = pd.to_datetime(f_raw, dayfirst=True)
-                fechas_procesadas.append(f_dt)
 
                 estado = row.get("Estado")
                 estado_l = str(estado).strip().lower() if estado is not None and not pd.isna(estado) else ""
                 if any(p in estado_l for p in ("anulad", "cancel", "void")):
+                    continue
+
+                fechas_todas.append(f_dt)
+
+                cta_raw = row.get("Código")
+                nombre_cuenta = str(row.get("Cuenta contable") or "").strip()
+                codigo_limpio = clean_codigo(cta_raw) or codigos_por_nombre.get(nombre_cuenta)
+
+                if not codigo_limpio:
+                    # Antes: estas filas se descartaban sin dejar rastro
+                    # (ver hallazgo 2026-07-14). Ahora se acumulan para poder
+                    # mostrar cobertura contable en el reporte.
+                    clave = (f_dt.date(), nombre_cuenta)
+                    acc = sin_codigo_acumulado.setdefault(clave, {
+                        "debito": 0.0, "credito": 0.0, "n": 0,
+                        "tipo": catalogo_cuentas.get(nombre_cuenta, {}).get("type"),
+                    })
+                    acc["debito"] += clean_num(row.get("Débito"))
+                    acc["credito"] += clean_num(row.get("Crédito"))
+                    acc["n"] += 1
                     continue
 
                 tercero = row.get("Tercero")
@@ -17694,17 +17787,53 @@ def create_app():
                     "periodo_mes": f_dt.month
                 })
 
-            if lista_mapeada:
-                f_min, f_max = min(fechas_procesadas), max(fechas_procesadas)
+            if fechas_todas:
+                f_min, f_max = min(fechas_todas), max(fechas_todas)
+
                 AuxiliarContable.query.filter(
                     AuxiliarContable.idcliente == idcliente,
                     AuxiliarContable.fecha_contable >= f_min,
                     AuxiliarContable.fecha_contable <= f_max
                 ).delete()
-                db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
+                if lista_mapeada:
+                    db.session.bulk_insert_mappings(AuxiliarContable, lista_mapeada)
+
+                AlegraCoberturaContable.query.filter(
+                    AlegraCoberturaContable.idcliente == idcliente,
+                    AlegraCoberturaContable.fecha >= f_min,
+                    AlegraCoberturaContable.fecha <= f_max
+                ).delete()
+                cobertura_mapeada = [
+                    {
+                        "idcliente": idcliente,
+                        "fecha": fecha,
+                        "cuenta_nombre": nombre,
+                        "tipo_cuenta": v["tipo"],
+                        "debito": v["debito"],
+                        "credito": v["credito"],
+                        "n_filas": v["n"],
+                    }
+                    for (fecha, nombre), v in sin_codigo_acumulado.items()
+                ]
+                if cobertura_mapeada:
+                    db.session.bulk_insert_mappings(AlegraCoberturaContable, cobertura_mapeada)
+
                 db.session.commit()
 
-            return jsonify({"detalles": {"registros_procesados": len(lista_mapeada)}}), 200
+            TIPOS_BALANCE = ("asset", "liability", "equity")
+            filas_sin_codigo_relevante = sum(
+                v["n"] for v in sin_codigo_acumulado.values() if v["tipo"] not in TIPOS_BALANCE
+            )
+            monto_sin_codigo_relevante = sum(
+                v["debito"] + v["credito"]
+                for v in sin_codigo_acumulado.values() if v["tipo"] not in TIPOS_BALANCE
+            )
+
+            return jsonify({"detalles": {
+                "registros_procesados": len(lista_mapeada),
+                "filas_sin_codigo": filas_sin_codigo_relevante,
+                "monto_sin_codigo_relevante": round(monto_sin_codigo_relevante, 2),
+            }}), 200
         except Exception as e:
             db.session.rollback()
             return jsonify({"error": str(e)}), 500
