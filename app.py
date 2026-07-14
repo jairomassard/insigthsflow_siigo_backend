@@ -1586,11 +1586,34 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         "gastos_operacionales": "GASTOS_OPERACIONALES",
     }
 
+    # Overrides por nombre, confirmados 2026-07-14 contra el Estado de
+    # Resultados NATIVO real de Alegra (Maslux LED 2025) - el "type" de la
+    # API no siempre coincide con como Alegra presenta la cuenta en su
+    # propio reporte:
+    # - "Costos del inventario" trae type=expense pero Alegra la anida bajo
+    #   "611105 Costos de la mercancia vendida", dentro de "61 Costos de
+    #   ventas y operacion" - es su cuenta automatica de costeo de
+    #   inventario (se genera sola por cada factura de venta), no un gasto.
+    # - "Gastos por impuestos" (pagos a la DIAN) tambien trae type=expense,
+    #   pero Alegra la sube al residuo de su seccion "Gastos por impuestos"
+    #   (misma seccion que Industria y Comercio/Impuesto Vehicular),
+    #   DESPUES de Utilidad Antes de Impuestos - confirmado reconciliando
+    #   el total de esa seccion ($40.051.000) contra sus hijos visibles
+    #   ($1.708.003) - el residuo exacto es $38.343.000.
+    # Ninguno de los dos cambia la Utilidad Neta (misma logica que ICA/5115
+    # - solo afina en que punto de la cascada se ve restado). Nombres
+    # confirmados en un solo cliente real - si aparecen en otro cliente
+    # Alegra con estos mismos nombres (son cuentas de sistema/convencion
+    # comun, no propias de Maslux), aplica el mismo criterio.
+    OVERRIDE_BUCKET_POR_NOMBRE = {"Costos del inventario": "costos_venta"}
+    NOMBRES_IMPUESTOS_OPERATIVOS_SIN_CODIGO = {"Gastos por impuestos"}
+
     sin_codigo_por_periodo = {}
     sin_codigo_detalle = {}
     for r in res_sin_codigo:
         periodo = (int(r["periodo_anio"]), int(r["periodo_mes"]))
-        bucket = BUCKET_POR_TIPO_SIN_CODIGO.get(r["tipo_cuenta"], "gastos_operacionales")
+        nombre = r["cuenta_nombre"]
+        bucket = OVERRIDE_BUCKET_POR_NOMBRE.get(nombre) or BUCKET_POR_TIPO_SIN_CODIGO.get(r["tipo_cuenta"], "gastos_operacionales")
         debito = float(r["debito"] or 0)
         credito = float(r["credito"] or 0)
         monto = (credito - debito) if bucket == "ingresos_operacionales" else (debito - credito)
@@ -1598,12 +1621,14 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             continue
 
         sin_codigo_por_periodo.setdefault(periodo, {
-            "ingresos_operacionales": 0.0, "costos_venta": 0.0, "gastos_operacionales": 0.0,
+            "ingresos_operacionales": 0.0, "costos_venta": 0.0, "gastos_operacionales": 0.0, "impuestos_operativos": 0.0,
         })
         sin_codigo_por_periodo[periodo][bucket] += monto
+        if nombre in NOMBRES_IMPUESTOS_OPERATIVOS_SIN_CODIGO:
+            sin_codigo_por_periodo[periodo]["impuestos_operativos"] += monto
 
         label = f"{periodo[0]}-{periodo[1]:02d}"
-        det = sin_codigo_detalle.setdefault(r["cuenta_nombre"], {"bucket": bucket, "valores_mes": {}, "total": 0.0})
+        det = sin_codigo_detalle.setdefault(nombre, {"bucket": bucket, "valores_mes": {}, "total": 0.0})
         det["valores_mes"][label] = det["valores_mes"].get(label, 0.0) + monto
         det["total"] += monto
 
@@ -1661,7 +1686,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         gastos_op = (float(r["gastos_operacionales"] or 0) if r else 0.0) + sc.get("gastos_operacionales", 0.0)
         gastos_no_op = float(r["gastos_no_operacionales"] or 0) if r else 0.0
         dep_amort = float(r["dep_amort"] or 0) if r else 0.0
-        impuestos_op = float(r["impuestos_operativos"] or 0) if r else 0.0
+        impuestos_op = (float(r["impuestos_operativos"] or 0) if r else 0.0) + sc.get("impuestos_operativos", 0.0)
 
         ingresos_totales = ing_op + ing_no_op
         utilidad_bruta = ing_op - costos
