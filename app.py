@@ -1813,6 +1813,12 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             "naturaleza": "CREDITO_MENOS_DEBITO" if det["bucket"] == "ingresos_operacionales" else "DEBITO_MENOS_CREDITO",
             "valores_mes": det["valores_mes"],
             "total": det["total"],
+            # El frontend mueve las cuentas 5115xx (ICA) a su propia seccion
+            # en modo "Ver como Alegra" filtrando por prefijo de codigo PUC -
+            # esta fila sintetica no tiene un codigo PUC real que matchee ese
+            # patron, asi que se marca explicitamente para que el frontend
+            # la mueva igual (ver impuestosOpCuentas en estado-resultados/page.tsx).
+            "es_impuesto_operativo": nombre in NOMBRES_IMPUESTOS_OPERATIVOS_SIN_CODIGO,
         }
 
     composicion = list(cuentas_dict.values())
