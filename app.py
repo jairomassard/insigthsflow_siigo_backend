@@ -1270,7 +1270,7 @@ def calcular_cobertura_alegra(idcliente, desde, hasta):
     parte del Estado de Resultados y dominarian el indicador en volumen sin
     aportar nada util - confirmado con datos reales de idcliente=16,
     2026-07-14 (Inventarios/Bancos = type asset, mueven miles de millones,
-    vs. ~$146M reales de gasto/costo sin clasificar)."""
+    vs. ~$76M reales de gasto/costo sin clasificar en 2025)."""
     from sqlalchemy import text
 
     TIPOS_BALANCE = ("asset", "liability", "equity")
@@ -1283,23 +1283,33 @@ def calcular_cobertura_alegra(idcliente, desde, hasta):
         GROUP BY cuenta_nombre, tipo_cuenta
     """), {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
 
+    # Neto (|debito - credito|), no bruto (debito + credito): una cuenta con
+    # movimiento en ambos lados (ej. "Costos del inventario", que tiene
+    # facturas de venta a debito Y notas credito a credito) mostraria el
+    # doble de su impacto real si se sumaran ambos lados en vez de netearlos
+    # - confirmado con dato real 2026-07-14, idcliente=16 (bruto $61.27M vs
+    # neto real $32.47M para esa cuenta). Se aplica igual a ambos lados
+    # (codificado y sin codigo) para que el % de cobertura sea comparable.
     relevantes = [f for f in filas if f["tipo_cuenta"] not in TIPOS_BALANCE]
-    monto_sin_codigo = sum(float(f["debito"] or 0) + float(f["credito"] or 0) for f in relevantes)
+    monto_sin_codigo = sum(abs(float(f["debito"] or 0) - float(f["credito"] or 0)) for f in relevantes)
 
-    monto_codificado = db.session.execute(text("""
-        SELECT COALESCE(SUM(debito + credito), 0) AS total
+    filas_codificadas = db.session.execute(text("""
+        SELECT cuenta_codigo, SUM(debito) AS debito, SUM(credito) AS credito
         FROM auxiliar_contable
         WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
         AND LEFT(cuenta_codigo, 1) IN ('4', '5', '6', '7')
-    """), {"idc": idcliente, "d": desde, "h": hasta}).scalar() or 0
-    monto_codificado = float(monto_codificado)
+        GROUP BY cuenta_codigo
+    """), {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    monto_codificado = sum(
+        abs(float(f["debito"] or 0) - float(f["credito"] or 0)) for f in filas_codificadas
+    )
 
     total = monto_codificado + monto_sin_codigo
     detalle = sorted(
         (
             {
                 "cuenta_nombre": f["cuenta_nombre"],
-                "monto": round(float(f["debito"] or 0) + float(f["credito"] or 0), 2),
+                "monto": round(abs(float(f["debito"] or 0) - float(f["credito"] or 0)), 2),
                 "n_filas": int(f["n_filas"] or 0),
             }
             for f in relevantes
