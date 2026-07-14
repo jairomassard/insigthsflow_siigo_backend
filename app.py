@@ -1382,18 +1382,31 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
     revisar su propio comprobante_tipo de cierre y extender el filtro."""
     from sqlalchemy import text
 
-    sql_ingresos_reales_evo = text("""
+    # "Devoluciones en Ventas" se incluye aqui por NOMBRE, sin importar el
+    # codigo PUC que le haya puesto el contador: confirmado 2026-07-14
+    # contra 2 clientes Alegra reales que Alegra SIEMPRE resta esta cuenta
+    # directo de Ventas en su propio reporte nativo, pero el codigo que le
+    # asignan varia por contador (Maslux: 42980501, "42%" -> quedaria en
+    # ingresos NO operacionales con la regla vieja; Importadora NGC:
+    # 41750501, "41%" -> ya quedaba bien). Verificado al centavo: sumar
+    # Ventas + esta cuenta da exacto la "Utilidad Bruta" real de Alegra
+    # para Maslux ($7.943.167.01). Es una regla de PRESENTACION de Alegra
+    # (por nombre/rol de cuenta), no del codigo PUC - por eso se generaliza
+    # por nombre y no por rango de codigo.
+    DEVOLUCIONES_VENTAS_LIKE = "cuenta_nombre ILIKE '%devoluci%vent%'"
+
+    sql_ingresos_reales_evo = text(f"""
         SELECT
             periodo_anio,
             periodo_mes,
-            SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) AS ingresos_reales
+            SUM(CASE WHEN cuenta_codigo LIKE '41%' OR {DEVOLUCIONES_VENTAS_LIKE} THEN (credito - debito) ELSE 0 END) AS ingresos_reales
         FROM auxiliar_contable
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
-        AND cuenta_codigo LIKE '41%'
+        AND (cuenta_codigo LIKE '41%' OR {DEVOLUCIONES_VENTAS_LIKE})
         AND (comprobante_tipo IS NULL OR comprobante_tipo NOT LIKE 'CC-CA%')
         GROUP BY periodo_anio, periodo_mes
-        HAVING SUM(CASE WHEN cuenta_codigo LIKE '41%' THEN (credito - debito) ELSE 0 END) <> 0
+        HAVING SUM(CASE WHEN cuenta_codigo LIKE '41%' OR {DEVOLUCIONES_VENTAS_LIKE} THEN (credito - debito) ELSE 0 END) <> 0
     """)
 
     sql_ingresos_evo = text("""
@@ -1418,13 +1431,13 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         ORDER BY periodo_anio, periodo_mes
     """)
 
-    sql_aux_evo = text("""
+    sql_aux_evo = text(f"""
         SELECT
             periodo_anio,
             periodo_mes,
 
             SUM(CASE
-                WHEN cuenta_codigo LIKE '42%' THEN (credito - debito)
+                WHEN cuenta_codigo LIKE '42%' AND NOT ({DEVOLUCIONES_VENTAS_LIKE}) THEN (credito - debito)
                 ELSE 0
             END) AS ingresos_no_operacionales,
 
@@ -1471,7 +1484,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         ORDER BY periodo_anio, periodo_mes
     """)
 
-    sql_comp = text("""
+    sql_comp = text(f"""
         SELECT
             periodo_anio,
             periodo_mes,
@@ -1480,7 +1493,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             MAX(cuenta_nombre) AS nombre_cuenta,
 
             CASE
-                WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '41%' OR {DEVOLUCIONES_VENTAS_LIKE} THEN 'INGRESOS_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
                 WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
@@ -1510,7 +1523,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             cuenta_codigo,
             LEFT(cuenta_codigo, 4),
             CASE
-                WHEN cuenta_codigo LIKE '41%' THEN 'INGRESOS_OPERACIONALES'
+                WHEN cuenta_codigo LIKE '41%' OR {DEVOLUCIONES_VENTAS_LIKE} THEN 'INGRESOS_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '42%' THEN 'INGRESOS_NO_OPERACIONALES'
                 WHEN cuenta_codigo LIKE '6%'  OR cuenta_codigo LIKE '7%' THEN 'COSTOS_VENTA'
                 WHEN cuenta_codigo LIKE '51%' OR cuenta_codigo LIKE '52%' THEN 'GASTOS_OPERACIONALES'
