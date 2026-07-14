@@ -1261,11 +1261,18 @@ def _proveedor_datos_cliente(idcliente):
 
 def calcular_cobertura_alegra(idcliente, desde, hasta):
     """Cobertura de codificacion contable Alegra: que % del movimiento del
-    periodo tiene un codigo PUC real vs. cuanto se descarto al cargar el
-    Libro Diario por no poder resolverlo (ver AlegraCoberturaContable y
-    /alegra/cargar_libro_diario). El monto "sin codigo" se filtra a cuentas
-    de tipo income/expense/cost (o sin match en el catalogo, por seguridad -
-    no se descarta nada por default). Las de tipo asset/liability/equity
+    periodo tiene un codigo PUC real vs. cuanto se clasifico automaticamente
+    por "type" al no tener codigo (ver AlegraCoberturaContable y
+    /alegra/cargar_libro_diario). IMPORTANTE (cambio 2026-07-14): este monto
+    YA esta incluido en los KPIs de construir_pnl_alegra_facturas - no es
+    "plata perdida", es plata clasificada con menos precision (no distingue
+    operacional/no-operacional ni te da el detalle por sub-cuenta). El
+    usuario, pensando como gerente cliente, señalo que excluirla dejaba nuestro
+    reporte peor que el P&G nativo de Alegra (que tampoco exige codigo, usa
+    "type" igual que aqui) - se corrigio para nunca mostrar menos plata de
+    la que Alegra ya muestra. El monto se filtra a cuentas de tipo
+    income/expense/cost (o sin match en el catalogo, por seguridad - no se
+    descarta nada por default). Las de tipo asset/liability/equity
     (Inventarios, Bancos, Cuentas por pagar...) se excluyen porque no son
     parte del Estado de Resultados y dominarian el indicador en volumen sin
     aportar nada util - confirmado con datos reales de idcliente=16,
@@ -1523,10 +1530,36 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         ORDER BY periodo_anio, periodo_mes, cuenta_codigo
     """)
 
+    # Filas del Libro Diario sin codigo PUC (ver AlegraCoberturaContable):
+    # antes se excluian del reporte por completo. Alegra nativo no exige
+    # codigo para su propio P&G porque clasifica por "type" (income/expense/
+    # cost), no por PUC - asi que excluir esta plata nos deja peor que el
+    # reporte nativo sin necesidad. Se incluyen aqui usando "type" como
+    # respaldo (misma logica que Alegra), en el balde correspondiente,
+    # marcadas como composicion sintetica "sin codigo, clasificacion
+    # automatica" - ver seccion mas abajo. Cuentas tipo asset/liability/
+    # equity (o "type" desconocido pero claramente de balance) NO entran
+    # aqui, igual que en calcular_cobertura_alegra.
+    sql_sin_codigo_evo = text("""
+        SELECT
+            EXTRACT(YEAR FROM fecha)::int AS periodo_anio,
+            EXTRACT(MONTH FROM fecha)::int AS periodo_mes,
+            cuenta_nombre,
+            tipo_cuenta,
+            SUM(debito) AS debito,
+            SUM(credito) AS credito
+        FROM alegra_cobertura_contable
+        WHERE idcliente = :idc
+        AND fecha BETWEEN :d AND :h
+        AND (tipo_cuenta IS NULL OR tipo_cuenta NOT IN ('asset', 'liability', 'equity'))
+        GROUP BY periodo_anio, periodo_mes, cuenta_nombre, tipo_cuenta
+    """)
+
     res_ingresos_reales = db.session.execute(sql_ingresos_reales_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_ingresos = db.session.execute(sql_ingresos_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_aux = db.session.execute(sql_aux_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
     res_comp = db.session.execute(sql_comp, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_sin_codigo = db.session.execute(sql_sin_codigo_evo, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
 
     ingresos_derivados_por_periodo = {
         (int(r["periodo_anio"]), int(r["periodo_mes"])): float(r["ingresos_operacionales"] or 0)
@@ -1538,8 +1571,56 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         for r in res_ingresos_reales
     }
 
-    # Preferir el valor real (Libro Diario subido) sobre el derivado de
-    # facturas para cualquier mes donde exista - ver docstring.
+    # "type" income -> ingresos operacionales (credito - debito, igual que
+    # 41xx). "type" cost -> costos de venta. "type" expense O desconocido
+    # (sin match en el catalogo de Alegra) -> gastos operacionales, el
+    # balde mas comun en la practica y el default conservador cuando no se
+    # sabe mas. Da igual el balde exacto para la Utilidad Neta final (todos
+    # los costos/gastos restan con el mismo signo antes de llegar ahi) -
+    # solo afina Utilidad Bruta/Operativa/EBITDA, que si dependen de en
+    # cual balde cae cada cuenta.
+    BUCKET_POR_TIPO_SIN_CODIGO = {"income": "ingresos_operacionales", "cost": "costos_venta"}
+    SECCION_POR_BUCKET_SIN_CODIGO = {
+        "ingresos_operacionales": "INGRESOS_OPERACIONALES",
+        "costos_venta": "COSTOS_VENTA",
+        "gastos_operacionales": "GASTOS_OPERACIONALES",
+    }
+
+    sin_codigo_por_periodo = {}
+    sin_codigo_detalle = {}
+    for r in res_sin_codigo:
+        periodo = (int(r["periodo_anio"]), int(r["periodo_mes"]))
+        bucket = BUCKET_POR_TIPO_SIN_CODIGO.get(r["tipo_cuenta"], "gastos_operacionales")
+        debito = float(r["debito"] or 0)
+        credito = float(r["credito"] or 0)
+        monto = (credito - debito) if bucket == "ingresos_operacionales" else (debito - credito)
+        if monto == 0:
+            continue
+
+        sin_codigo_por_periodo.setdefault(periodo, {
+            "ingresos_operacionales": 0.0, "costos_venta": 0.0, "gastos_operacionales": 0.0,
+        })
+        sin_codigo_por_periodo[periodo][bucket] += monto
+
+        label = f"{periodo[0]}-{periodo[1]:02d}"
+        det = sin_codigo_detalle.setdefault(r["cuenta_nombre"], {"bucket": bucket, "valores_mes": {}, "total": 0.0})
+        det["valores_mes"][label] = det["valores_mes"].get(label, 0.0) + monto
+        det["total"] += monto
+
+    # Los ingresos "income" sin codigo son asientos reales del Libro Diario
+    # (igual que la cuenta 41xx codificada) - se fusionan en
+    # ingresos_reales_por_periodo ANTES de decidir real-vs-derivado, no se
+    # suman aparte en el loop de abajo. Si se sumaran aparte, un mes que ya
+    # tiene ingreso real sin codigo terminaria contando ESE mismo ingreso
+    # dos veces: una via el derivado de facturas (alegra_facturas) y otra
+    # via esta linea del ledger - mismo hecho economico, dos fuentes.
+    for periodo, montos in sin_codigo_por_periodo.items():
+        monto_ing = montos.get("ingresos_operacionales", 0.0)
+        if monto_ing:
+            ingresos_reales_por_periodo[periodo] = ingresos_reales_por_periodo.get(periodo, 0.0) + monto_ing
+
+    # Preferir el valor real (Libro Diario subido, con o sin codigo) sobre
+    # el derivado de facturas para cualquier mes donde exista - ver docstring.
     ingresos_por_periodo = dict(ingresos_derivados_por_periodo)
     ingresos_por_periodo.update(ingresos_reales_por_periodo)
 
@@ -1558,7 +1639,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
         for r in res_aux
     }
 
-    periodos = sorted(set(aux_por_periodo.keys()) | set(ingresos_por_periodo.keys()))
+    periodos = sorted(set(aux_por_periodo.keys()) | set(ingresos_por_periodo.keys()) | set(sin_codigo_por_periodo.keys()))
 
     evolucion = []
     totales = {
@@ -1573,10 +1654,11 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
 
     for periodo in periodos:
         r = aux_por_periodo.get(periodo)
-        ing_op = ingresos_por_periodo.get(periodo, 0.0)
+        sc = sin_codigo_por_periodo.get(periodo, {})
+        ing_op = ingresos_por_periodo.get(periodo, 0.0)  # el "income" sin codigo ya esta fusionado arriba, ver comentario
         ing_no_op = float(r["ingresos_no_operacionales"] or 0) if r else 0.0
-        costos = float(r["costos_venta"] or 0) if r else 0.0
-        gastos_op = float(r["gastos_operacionales"] or 0) if r else 0.0
+        costos = (float(r["costos_venta"] or 0) if r else 0.0) + sc.get("costos_venta", 0.0)
+        gastos_op = (float(r["gastos_operacionales"] or 0) if r else 0.0) + sc.get("gastos_operacionales", 0.0)
         gastos_no_op = float(r["gastos_no_operacionales"] or 0) if r else 0.0
         dep_amort = float(r["dep_amort"] or 0) if r else 0.0
         impuestos_op = float(r["impuestos_operativos"] or 0) if r else 0.0
@@ -1673,6 +1755,26 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
                 for (anio, mes), val in ingresos_derivados_sin_ledger_real.items()
             },
             "total": sum(ingresos_derivados_sin_ledger_real.values()),
+        }
+
+    # Filas sinteticas para las cuentas sin codigo PUC, clasificadas por
+    # "type" (ver sin_codigo_detalle arriba) - mismo mecanismo que
+    # ALEGRA-VENTAS: el frontend usa "seccion" tal cual sin necesitar que
+    # "cuenta" matchee un patron PUC. Se marcan explicitamente en el nombre
+    # para que quede claro en "Vista detallada" que es clasificacion
+    # automatica, no verificada por el contador.
+    for nombre, det in sin_codigo_detalle.items():
+        if det["total"] == 0:
+            continue
+        clave = f"ALEGRA-SC-{nombre}"
+        cuentas_dict[clave] = {
+            "cuenta": clave,
+            "cuenta_padre": clave,
+            "nombre": f"{nombre} (sin código, clasificación automática)",
+            "seccion": SECCION_POR_BUCKET_SIN_CODIGO[det["bucket"]],
+            "naturaleza": "CREDITO_MENOS_DEBITO" if det["bucket"] == "ingresos_operacionales" else "DEBITO_MENOS_CREDITO",
+            "valores_mes": det["valores_mes"],
+            "total": det["total"],
         }
 
     composicion = list(cuentas_dict.values())
