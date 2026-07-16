@@ -20661,6 +20661,13 @@ def create_app():
                 codigo = "ver_siigo"
 
             # ------------------------------------------
+            # Balance de Prueba (Excel exportado desde la API de Siigo)
+            # Usado por Balance General / Indicadores Financieros.
+            # ------------------------------------------
+            elif "balance-excel" in path_norm or "balance-prueba" in path_norm:
+                codigo = "ver_reporte_balance_general"
+
+            # ------------------------------------------
             # Ruta de importación no mapeada
             # ------------------------------------------
             else:
