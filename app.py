@@ -2023,12 +2023,23 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
         f_actual = datetime(r['periodo_anio'], r['periodo_mes'], 1)
         mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
+        iva_v19 = float(r['v19'] or 0)
+        iva_v5 = float(r['v5'] or 0)
+        iva_c19 = float(r['c19'] or 0)
+        iva_c5 = float(r['c5'] or 0)
+
         series_mensuales.append({
             "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
-            "iva_v19": float(r['v19'] or 0),
-            "iva_v5": float(r['v5'] or 0),
-            "iva_c19": float(r['c19'] or 0),
-            "iva_c5": float(r['c5'] or 0),
+            "iva_v19": iva_v19,
+            "iva_v5": iva_v5,
+            "iva_c19": iva_c19,
+            "iva_c5": iva_c5,
+            "base_v19": iva_v19 / 0.19,
+            "base_v5": iva_v5 / 0.05,
+            "base_c19": iva_c19 / 0.19,
+            "base_c5": iva_c5 / 0.05,
+            "base_ventas": (iva_v19 / 0.19) + (iva_v5 / 0.05),
+            "base_compras": (iva_c19 / 0.19) + (iva_c5 / 0.05),
             "iva_ventas": float(r['v_total'] or 0),
             "iva_compras": float(r['c_total'] or 0),
             "reteiva_favor": float(r['rete'] or 0),
@@ -2212,6 +2223,12 @@ def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
             "iva_v5": v["t5"],
             "iva_c19": c19,
             "iva_c5": c5,
+            "base_v19": v["t19"] / 0.19,
+            "base_v5": v["t5"] / 0.05,
+            "base_c19": c19 / 0.19,
+            "base_c5": c5 / 0.05,
+            "base_ventas": (v["t19"] / 0.19) + (v["t5"] / 0.05),
+            "base_compras": (c19 / 0.19) + (c5 / 0.05),
             "iva_ventas": v_total,
             "iva_compras": c_total,
             "reteiva_favor": rete,
@@ -2232,9 +2249,13 @@ def _empaquetar_cruce_iva(series_mensuales):
             v_s = sum(x['iva_ventas'] for x in g)
             c_s = sum(x['iva_compras'] for x in g)
             r_s = sum(x['reteiva_favor'] for x in g)
+            bv_s = sum(x.get('base_ventas', 0) for x in g)
+            bc_s = sum(x.get('base_compras', 0) for x in g)
             agrupados.append({
                 "label": " + ".join([x['label'] for x in g]),
+                "base_ventas": bv_s,
                 "iva_ventas": v_s,
+                "base_compras": bc_s,
                 "iva_compras": c_s,
                 "reteiva_favor": r_s,
                 "saldo_iva": v_s - c_s - r_s,
@@ -2245,7 +2266,9 @@ def _empaquetar_cruce_iva(series_mensuales):
     return {
         "series": series_mensuales,
         "kpis": {
+            "base_ventas": sum(s.get('base_ventas', 0) for s in series_mensuales),
             "iva_ventas": sum(s['iva_ventas'] for s in series_mensuales),
+            "base_compras": sum(s.get('base_compras', 0) for s in series_mensuales),
             "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
             "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
             "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
