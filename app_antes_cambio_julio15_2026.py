@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone, timedelta
 from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_permiso_en_paquete
  
 from config import Config
-from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte
+from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete
 from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
 from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
@@ -76,7 +76,6 @@ from decimal import Decimal, InvalidOperation
 
 from balance import (
     regenerar_snapshot_saldos_corte,
-    regenerar_snapshot_saldos_corte_desde_balance_prueba,
     regenerar_snapshots_balance,
     construir_balance_general,
 )
@@ -18236,40 +18235,6 @@ def create_app():
             }), 500
 
 
-    # Genera el snapshot de AuxiliarSaldosCorte a partir del Balance de
-    # Prueba real ya descargado de Siigo y cargado en BalancePrueba (ver
-    # /siigo/balance/generar + /importar/balance-excel). Alternativa al
-    # rebuild_snapshot de arriba (que acumula auxiliar_contable) - no lo
-    # reemplaza, ambos caminos escriben en la misma tabla y
-    # construir_balance_general los consume igual sin importar el origen.
-    @app.route("/reportes/balance_general/rebuild_snapshot_desde_balance_prueba", methods=["POST"])
-    @jwt_required()
-    def rebuild_balance_snapshot_desde_balance_prueba():
-        idcliente = get_jwt().get("idcliente")
-        data = request.get_json(silent=True) or {}
-
-        try:
-            periodo_anio = int(data.get("periodo_anio"))
-            periodo_mes_inicio = int(data.get("periodo_mes_inicio"))
-            periodo_mes_fin = int(data.get("periodo_mes_fin"))
-        except (TypeError, ValueError):
-            return jsonify({"error": "Debes enviar periodo_anio, periodo_mes_inicio y periodo_mes_fin"}), 400
-
-        try:
-            result = regenerar_snapshot_saldos_corte_desde_balance_prueba(
-                idcliente, periodo_anio, periodo_mes_inicio, periodo_mes_fin
-            )
-            if not result.get("ok"):
-                return jsonify(result), 404
-            return jsonify(result), 200
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({
-                "error": "No fue posible regenerar el snapshot desde el Balance de Prueba",
-                "detalle": str(e)
-            }), 500
-
-
     @app.route("/reportes/balance_general_v1", methods=["GET"])
     @jwt_required()
     def get_balance_general_v1():
@@ -18604,21 +18569,8 @@ def create_app():
 
             # --------------------------------------------------
             # 1) Snapshot del balance al corte final del período
-            #
-            #    Si ya existe una foto cargada desde el Balance de Prueba
-            #    real de Siigo para este corte exacto (ver
-            #    /reportes/balance_general/rebuild_snapshot_desde_balance_prueba),
-            #    se respeta tal cual y NO se regenera desde
-            #    auxiliar_contable - de lo contrario se pisaría en cada
-            #    consulta con datos potencialmente incompletos.
             # --------------------------------------------------
-            snapshot_existente = AuxiliarSaldosCorte.query.filter_by(
-                idcliente=idcliente,
-                fecha_corte=fecha_hasta
-            ).first()
-
-            if not snapshot_existente or snapshot_existente.origen != "BALANCE_PRUEBA":
-                regenerar_snapshot_saldos_corte(idcliente, str(fecha_hasta))
+            regenerar_snapshot_saldos_corte(idcliente, str(fecha_hasta))
 
             # --------------------------------------------------
             # 2) Balance general al corte final

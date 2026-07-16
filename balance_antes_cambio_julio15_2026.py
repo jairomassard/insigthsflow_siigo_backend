@@ -3,7 +3,7 @@ from decimal import Decimal
 from collections import defaultdict
 from sqlalchemy import text
 
-from models import db, AuxiliarSaldosCorte, BalancePrueba
+from models import db, AuxiliarSaldosCorte
 
 
 # =========================================================
@@ -249,111 +249,6 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
         "idcliente": idcliente,
         "fecha_corte": fecha_corte,
         "registros_generados": len(inserts)
-    }
-
-
-def regenerar_snapshot_saldos_corte_desde_balance_prueba(
-    idcliente: int,
-    periodo_anio: int,
-    periodo_mes_inicio: int,
-    periodo_mes_fin: int
-):
-    """
-    Construye el snapshot de AuxiliarSaldosCorte a partir del Balance de
-    Prueba real descargado de Siigo (tabla BalancePrueba), en vez de
-    acumular auxiliar_contable. Reutiliza la misma clasificación contable
-    (clasificar_cuenta) que ya usa la ruta de auxiliar_contable, así que
-    construir_balance_general no necesita ningún cambio para consumir
-    este snapshot.
-
-    Siigo entrega saldo_final con una única convención "débito - crédito"
-    para TODAS las clases (confirmado 2026-07-15 contra los estados
-    financieros firmados de un cliente real: activo positivo, pasivo y
-    patrimonio negativos) — hay que invertir el signo para las clases
-    2/3/4 para que coincida con la convención interna de este módulo
-    (CREDITO_MENOS_DEBITO), la misma que ya usa el snapshot de auxiliar.
-
-    fecha_corte queda fijada al último día de periodo_mes_fin/periodo_anio
-    (la fecha "Saldo final" que reporta Siigo para ese rango).
-    """
-    fecha_corte = ultimo_dia_del_mes(f"{periodo_anio}-{periodo_mes_fin:02d}-01")
-
-    filas = BalancePrueba.query.filter_by(
-        idcliente=idcliente,
-        periodo_anio=periodo_anio,
-        periodo_mes_inicio=periodo_mes_inicio,
-        periodo_mes_fin=periodo_mes_fin,
-        es_transaccional=True
-    ).all()
-
-    if not filas:
-        return {
-            "ok": False,
-            "error": (
-                f"No hay Balance de Prueba cargado para {periodo_anio} "
-                f"({periodo_mes_inicio} → {periodo_mes_fin}). Genera y sube "
-                f"el archivo desde Siigo primero."
-            )
-        }
-
-    acumulado = {}
-    for fila in filas:
-        codigo = str(fila.codigo_cuenta or "").strip()
-        if not codigo:
-            continue
-
-        meta = clasificar_cuenta(codigo)
-        saldo_siigo = safe_float(fila.saldo_final)
-        saldo = -saldo_siigo if meta["naturaleza"] == "CREDITO_MENOS_DEBITO" else saldo_siigo
-
-        if codigo not in acumulado:
-            acumulado[codigo] = {
-                "cuenta_nombre": str(fila.nombre_cuenta or "").strip(),
-                "meta": meta,
-                "saldo": 0.0,
-            }
-        acumulado[codigo]["saldo"] += saldo
-
-    AuxiliarSaldosCorte.query.filter_by(
-        idcliente=idcliente,
-        fecha_corte=fecha_corte
-    ).delete()
-
-    inserts = []
-    for codigo, datos in acumulado.items():
-        if abs(datos["saldo"]) < 0.005:
-            continue
-
-        meta = datos["meta"]
-        inserts.append(
-            AuxiliarSaldosCorte(
-                idcliente=idcliente,
-                fecha_corte=fecha_corte,
-                cuenta_codigo=codigo,
-                cuenta_nombre=datos["cuenta_nombre"],
-                cuenta_padre=meta["cuenta_padre"],
-                clase=meta["clase"],
-                grupo=meta["grupo"],
-                seccion=meta["seccion"],
-                grupo_balance=meta["grupo_balance"],
-                naturaleza=meta["naturaleza"],
-                saldo=Decimal(str(redondear(datos["saldo"], 2))),
-                origen="BALANCE_PRUEBA"
-            )
-        )
-
-    db.session.bulk_save_objects(inserts)
-    db.session.commit()
-
-    return {
-        "ok": True,
-        "idcliente": idcliente,
-        "fecha_corte": fecha_corte,
-        "periodo_anio": periodo_anio,
-        "periodo_mes_inicio": periodo_mes_inicio,
-        "periodo_mes_fin": periodo_mes_fin,
-        "registros_generados": len(inserts),
-        "origen": "BALANCE_PRUEBA"
     }
 
 
