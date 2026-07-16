@@ -1146,7 +1146,7 @@ class IndicadoresFinancierosConfig(db.Model):
     # Solvencia / autonomía
     autonomia_min = db.Column(db.Numeric(18, 4))
     solvencia_min = db.Column(db.Numeric(18, 4))
-    cobertura_activo_pasivo_min = db.Column(db.Numeric(18, 4))
+    cobertura_activo_pasivo_min = db.Column(db.Numeric(18, 4))  # deprecado 2026-07-16: indicador duplicado con solvencia, ya no se evalua ni se muestra en UI, columna se deja por compatibilidad
 
     # Capital de trabajo
     capital_trabajo_min = db.Column(db.Numeric(18, 2))
@@ -1154,6 +1154,15 @@ class IndicadoresFinancierosConfig(db.Model):
     # Composición del balance
     porcentaje_pasivo_corto_max = db.Column(db.Numeric(18, 4))
     porcentaje_activo_no_corriente_max = db.Column(db.Numeric(18, 4))
+
+    # Rentabilidad sobre patrimonio/activos, liquidez estricta y ciclo de caja
+    # (agregados 2026-07-16)
+    roe_min = db.Column(db.Numeric(18, 4))
+    roa_min = db.Column(db.Numeric(18, 4))
+    prueba_acida_min = db.Column(db.Numeric(18, 4))
+    dso_dias_cobro_max = db.Column(db.Numeric(18, 2))
+    dpo_dias_pago_min = db.Column(db.Numeric(18, 2))
+    cobertura_intereses_min = db.Column(db.Numeric(18, 4))
 
     # Auditoría
     creado_por = db.Column(db.Integer)
@@ -1191,6 +1200,13 @@ class IndicadoresFinancierosConfig(db.Model):
             "porcentaje_pasivo_corto_max": float(self.porcentaje_pasivo_corto_max) if self.porcentaje_pasivo_corto_max is not None else None,
             "porcentaje_activo_no_corriente_max": float(self.porcentaje_activo_no_corriente_max) if self.porcentaje_activo_no_corriente_max is not None else None,
             "endeudamiento_largo_plazo_max": float(self.endeudamiento_largo_plazo_max) if self.endeudamiento_largo_plazo_max is not None else None,
+
+            "roe_min": float(self.roe_min) if self.roe_min is not None else None,
+            "roa_min": float(self.roa_min) if self.roa_min is not None else None,
+            "prueba_acida_min": float(self.prueba_acida_min) if self.prueba_acida_min is not None else None,
+            "dso_dias_cobro_max": float(self.dso_dias_cobro_max) if self.dso_dias_cobro_max is not None else None,
+            "dpo_dias_pago_min": float(self.dpo_dias_pago_min) if self.dpo_dias_pago_min is not None else None,
+            "cobertura_intereses_min": float(self.cobertura_intereses_min) if self.cobertura_intereses_min is not None else None,
 
             "creado_por": self.creado_por,
             "actualizado_por": self.actualizado_por,

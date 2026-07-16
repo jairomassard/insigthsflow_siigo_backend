@@ -1882,103 +1882,6 @@ def construir_pnl(idcliente, desde, hasta):
     return construir_pnl_auxiliares(idcliente, desde, hasta)
 
 
-# =========================================================
-# Helpers para indicadores financieros adicionales (ROE, ROA,
-# Prueba Acida, DSO, DPO, Cobertura de Intereses) - 2026-07-16.
-#
-# Cartera (CxC) y Cuentas por Pagar (CxP) se leen de las vistas
-# facturas_enriquecidas / compras_enriquecidas en vez de acumular el
-# balance (auxiliar_contable) - son la misma fuente ya usada y
-# validada para los KPIs de cartera del Resumen Ejecutivo, y ya
-# tienen rama Alegra via UNION ALL (a diferencia del balance general,
-# que para Alegra todavia depende del problema de saldo inicial sin
-# resolver - ver [[project-insightflow-alegra-balance-saldos-iniciales]]).
-# Esto hace que DSO/DPO sean confiables para Alegra incluso mientras
-# el balance general de Alegra siga con ese problema pendiente.
-# =========================================================
-
-def _cartera_total_actual(idcliente):
-    """Saldo total pendiente de recaudo a clientes, a la fecha actual.
-    Misma logica de cuentas_por_cobrar() (solo_saldo_pendiente)."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT COALESCE(SUM(saldo), 0) AS total
-        FROM facturas_enriquecidas
-        WHERE idcliente = :idc AND COALESCE(saldo, 0) > 0
-    """)
-    row = db.session.execute(sql, {"idc": idcliente}).first()
-    return float(row.total if row else 0) or 0.0
-
-
-def _cuentas_por_pagar_total_actual(idcliente):
-    """Saldo total pendiente de pago a proveedores, a la fecha actual.
-    Misma formula de total_saldo ya validada en /reportes/financiero/compras-gastos."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT COALESCE(SUM(
-            LEAST(
-                COALESCE(saldo, 0),
-                GREATEST(COALESCE(total_ajustado, total, 0) - COALESCE(retencion_total, 0), 0)
-            )
-        ), 0) AS total
-        FROM compras_enriquecidas
-        WHERE idcliente = :idc
-    """)
-    row = db.session.execute(sql, {"idc": idcliente}).first()
-    return float(row.total if row else 0) or 0.0
-
-
-def _compras_total_periodo(idcliente, desde, hasta):
-    """Total bruto de compras/gastos del periodo (para DPO)."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT COALESCE(SUM(COALESCE(total_ajustado, total, 0)), 0) AS total
-        FROM compras_enriquecidas
-        WHERE idcliente = :idc AND fecha BETWEEN :d AND :h
-    """)
-    row = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).first()
-    return float(row.total if row else 0) or 0.0
-
-
-def _gastos_financieros_periodo(idcliente, desde, hasta):
-    """Gastos financieros (PUC 53%%: intereses, comisiones, gastos
-    bancarios) del periodo - separado de 54%% (extraordinarios/diversos),
-    a diferencia de construir_pnl que los agrupa juntos en
-    gastos_no_operacionales. Excluye el cierre contable anual de Alegra
-    (comprobante_tipo 'CC-CA%%') igual que construir_pnl_alegra_facturas;
-    en Siigo esa convencion no existe, asi que el filtro no afecta nada."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT COALESCE(SUM(debito - credito), 0) AS total
-        FROM auxiliar_contable
-        WHERE idcliente = :idc
-        AND fecha_contable BETWEEN :d AND :h
-        AND cuenta_codigo LIKE '53%'
-        AND (comprobante_tipo IS NULL OR comprobante_tipo NOT LIKE 'CC-CA%')
-    """)
-    row = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).first()
-    return float(row.total if row else 0) or 0.0
-
-
-def _inventarios_actual(idcliente, fecha_corte):
-    """Saldo de inventarios (PUC grupo 14) en el snapshot de balance a la
-    fecha de corte - funciona igual sin importar si el snapshot vino de
-    auxiliar_contable o del Balance de Prueba (misma tabla/columnas)."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT COALESCE(SUM(saldo), 0) AS total
-        FROM auxiliar_saldos_corte
-        WHERE idcliente = :idc AND fecha_corte = :fc AND grupo = '14'
-    """)
-    row = db.session.execute(sql, {"idc": idcliente, "fc": fecha_corte}).first()
-    return float(row.total if row else 0) or 0.0
-
-
 def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
     """Version Siigo del Cruce de IVAs (logica original, extraida tal cual
     del endpoint /reportes/cruce_iva_v2 sin cambios de comportamiento)."""
@@ -4042,17 +3945,11 @@ INDICADORES_CONFIG_FIELDS = [
     "rentabilidad_min",
     "autonomia_min",
     "solvencia_min",
-    "cobertura_activo_pasivo_min",  # deprecado: ya no se evalua, se deja por compatibilidad con configs guardadas
+    "cobertura_activo_pasivo_min",
     "capital_trabajo_min",
     "porcentaje_pasivo_corto_max",
     "porcentaje_activo_no_corriente_max",
     "endeudamiento_largo_plazo_max",
-    "roe_min",
-    "roa_min",
-    "prueba_acida_min",
-    "dso_dias_cobro_max",
-    "dpo_dias_pago_min",
-    "cobertura_intereses_min",
 ]
 
 
@@ -4110,12 +4007,6 @@ def obtener_config_indicadores_financieros(idcliente):
             porcentaje_pasivo_corto_max,
             porcentaje_activo_no_corriente_max,
             endeudamiento_largo_plazo_max,
-            roe_min,
-            roa_min,
-            prueba_acida_min,
-            dso_dias_cobro_max,
-            dpo_dias_pago_min,
-            cobertura_intereses_min,
             creado_por,
             actualizado_por,
             created_at,
@@ -4170,12 +4061,6 @@ def guardar_config_indicadores_financieros(idcliente, payload, idusuario=None):
             porcentaje_pasivo_corto_max,
             porcentaje_activo_no_corriente_max,
             endeudamiento_largo_plazo_max,
-            roe_min,
-            roa_min,
-            prueba_acida_min,
-            dso_dias_cobro_max,
-            dpo_dias_pago_min,
-            cobertura_intereses_min,
             creado_por,
             actualizado_por,
             created_at,
@@ -4195,12 +4080,6 @@ def guardar_config_indicadores_financieros(idcliente, payload, idusuario=None):
             :porcentaje_pasivo_corto_max,
             :porcentaje_activo_no_corriente_max,
             :endeudamiento_largo_plazo_max,
-            :roe_min,
-            :roa_min,
-            :prueba_acida_min,
-            :dso_dias_cobro_max,
-            :dpo_dias_pago_min,
-            :cobertura_intereses_min,
             :creado_por,
             :actualizado_por,
             NOW(),
@@ -4220,12 +4099,6 @@ def guardar_config_indicadores_financieros(idcliente, payload, idusuario=None):
             porcentaje_pasivo_corto_max = EXCLUDED.porcentaje_pasivo_corto_max,
             porcentaje_activo_no_corriente_max = EXCLUDED.porcentaje_activo_no_corriente_max,
             endeudamiento_largo_plazo_max = EXCLUDED.endeudamiento_largo_plazo_max,
-            roe_min = EXCLUDED.roe_min,
-            roa_min = EXCLUDED.roa_min,
-            prueba_acida_min = EXCLUDED.prueba_acida_min,
-            dso_dias_cobro_max = EXCLUDED.dso_dias_cobro_max,
-            dpo_dias_pago_min = EXCLUDED.dpo_dias_pago_min,
-            cobertura_intereses_min = EXCLUDED.cobertura_intereses_min,
             actualizado_por = EXCLUDED.actualizado_por,
             updated_at = NOW()
     """)
@@ -4314,7 +4187,10 @@ def construir_interpretaciones_neutrales(indicadores):
     Modo sin parametrización:
     no se emite juicio financiero.
     """
-    texto = "Sin parámetros propios configurados."
+    texto = (
+        "Indicador calculado. Su lectura debe realizarse según la industria, "
+        "el modelo operativo y los criterios financieros definidos por la empresa."
+    )
 
     return {
         key: texto
@@ -4332,7 +4208,10 @@ def construir_interpretaciones_detalle_neutrales(indicadores):
         detalle[key] = {
             "estado": "sin_parametros",
             "severidad": "neutral",
-            "texto": "Sin parámetros propios configurados.",
+            "texto": (
+                "Sin parámetros empresariales configurados. "
+                "InsightFlow muestra este indicador de forma informativa, sin dictamen automático."
+            ),
             "valor": value,
             "minimo": None,
             "maximo": None,
@@ -4378,6 +4257,12 @@ def interpretar_indicadores_con_parametros(indicadores, config):
         maximo=None,
     )
 
+    detalle["cobertura_activo_pasivo"] = _evaluar_indicador(
+        indicadores.get("cobertura_activo_pasivo"),
+        minimo=config.get("cobertura_activo_pasivo_min"),
+        maximo=None,
+    )
+
     detalle["capital_trabajo"] = _evaluar_indicador(
         indicadores.get("capital_trabajo"),
         minimo=config.get("capital_trabajo_min"),
@@ -4402,44 +4287,6 @@ def interpretar_indicadores_con_parametros(indicadores, config):
         maximo=config.get("endeudamiento_largo_plazo_max"),
     )
 
-    detalle["roe"] = _evaluar_indicador(
-        indicadores.get("roe"),
-        minimo=config.get("roe_min"),
-        maximo=None,
-    )
-
-    detalle["roa"] = _evaluar_indicador(
-        indicadores.get("roa"),
-        minimo=config.get("roa_min"),
-        maximo=None,
-    )
-
-    detalle["prueba_acida"] = _evaluar_indicador(
-        indicadores.get("prueba_acida"),
-        minimo=config.get("prueba_acida_min"),
-        maximo=None,
-    )
-
-    # DSO: menos dias para cobrar es mejor -> umbral maximo.
-    detalle["dso_dias_cobro"] = _evaluar_indicador(
-        indicadores.get("dso_dias_cobro"),
-        minimo=None,
-        maximo=config.get("dso_dias_cobro_max"),
-    )
-
-    # DPO: tardar al menos X dias en pagar preserva caja -> umbral minimo.
-    detalle["dpo_dias_pago"] = _evaluar_indicador(
-        indicadores.get("dpo_dias_pago"),
-        minimo=config.get("dpo_dias_pago_min"),
-        maximo=None,
-    )
-
-    detalle["cobertura_intereses"] = _evaluar_indicador(
-        indicadores.get("cobertura_intereses"),
-        minimo=config.get("cobertura_intereses_min"),
-        maximo=None,
-    )
-
     # Para cifras base que no son indicadores de juicio, mantener lectura neutral.
     campos_neutrales = [
         "activo_total",
@@ -4453,10 +4300,6 @@ def interpretar_indicadores_con_parametros(indicadores, config):
         "activo_no_corriente",
         "pasivo_corto",
         "pasivo_largo",
-        "inventarios",
-        "cartera_total",
-        "cuentas_por_pagar_total",
-        "gastos_financieros",
     ]
 
     for key in campos_neutrales:
@@ -18829,20 +18672,6 @@ def create_app():
                 (pk.get("gastos_no_operacionales", 0) or 0)
             )
             utilidad_neta = float(pk.get("utilidad_neta", 0) or 0)
-            utilidad_operativa = float(pk.get("utilidad_operativa", 0) or 0)
-
-            # =========================
-            # Variables base adicionales: cartera, CxP, gastos financieros,
-            # inventarios (ver helpers arriba de create_app - funcionan
-            # igual para Siigo y Alegra).
-            # =========================
-            dias_periodo = (fecha_hasta - fecha_desde).days + 1
-
-            cartera_total = _cartera_total_actual(idcliente)
-            cuentas_por_pagar_total = _cuentas_por_pagar_total_actual(idcliente)
-            compras_periodo = _compras_total_periodo(idcliente, fecha_desde, fecha_hasta)
-            gastos_financieros = _gastos_financieros_periodo(idcliente, fecha_desde, fecha_hasta)
-            inventarios = _inventarios_actual(idcliente, fecha_hasta)
 
             # =========================
             # Indicadores
@@ -18854,26 +18683,8 @@ def create_app():
             autonomia = round(patrimonio / activo_total, 2) if activo_total else None
             porcentaje_pasivo_corto = round(pasivo_corto / pasivo_total, 2) if pasivo_total else None
             porcentaje_activo_no_corriente = round(activo_no_corriente / activo_total, 2) if activo_total else None
+            cobertura_activo_pasivo = round(activo_total / pasivo_total, 2) if pasivo_total else None
             endeudamiento_largo_plazo = round(pasivo_largo / patrimonio, 2) if patrimonio and patrimonio > 0 else None
-
-            # Rentabilidad sobre patrimonio/activos - complementan el margen
-            # neto (que mide sobre ventas, no sobre lo invertido).
-            roe = round(utilidad_neta / patrimonio, 2) if patrimonio else None
-            roa = round(utilidad_neta / activo_total, 2) if activo_total else None
-
-            # Liquidez estricta: excluye inventarios (no siempre convertibles
-            # a efectivo de inmediato).
-            prueba_acida = round((activo_corriente - inventarios) / pasivo_corto, 2) if pasivo_corto else None
-
-            # Dias promedio para cobrar a clientes / pagar a proveedores,
-            # usando cartera y CxP reales (no el balance) - ver docstring de
-            # los helpers arriba.
-            dso_dias_cobro = round((cartera_total / ingresos) * dias_periodo, 1) if ingresos else None
-            dpo_dias_pago = round((cuentas_por_pagar_total / compras_periodo) * dias_periodo, 1) if compras_periodo else None
-
-            # Cuantas veces la utilidad operativa cubre los gastos
-            # financieros (capacidad de servicio de la deuda).
-            cobertura_intereses = round(utilidad_operativa / gastos_financieros, 2) if gastos_financieros else None
 
             indicadores = {
                 # ratios
@@ -18885,17 +18696,8 @@ def create_app():
                 "autonomia": autonomia,
                 "porcentaje_pasivo_corto": porcentaje_pasivo_corto,
                 "porcentaje_activo_no_corriente": porcentaje_activo_no_corriente,
+                "cobertura_activo_pasivo": cobertura_activo_pasivo,
                 "endeudamiento_largo_plazo": endeudamiento_largo_plazo,
-
-                # rentabilidad sobre patrimonio/activos
-                "roe": roe,
-                "roa": roa,
-
-                # liquidez estricta y ciclo de caja
-                "prueba_acida": prueba_acida,
-                "dso_dias_cobro": dso_dias_cobro,
-                "dpo_dias_pago": dpo_dias_pago,
-                "cobertura_intereses": cobertura_intereses,
 
                 # cifras base
                 "activo_total": round(activo_total, 2),
@@ -18911,10 +18713,6 @@ def create_app():
                 "activo_no_corriente": round(activo_no_corriente, 2),
                 "pasivo_corto": round(pasivo_corto, 2),
                 "pasivo_largo": round(pasivo_largo, 2),
-                "inventarios": round(inventarios, 2),
-                "cartera_total": round(cartera_total, 2),
-                "cuentas_por_pagar_total": round(cuentas_por_pagar_total, 2),
-                "gastos_financieros": round(gastos_financieros, 2),
             }
 
             # =========================
@@ -18929,13 +18727,8 @@ def create_app():
                 "autonomia": "Patrimonio / Activo total. Mide qué proporción de la empresa está financiada con recursos propios.",
                 "porcentaje_pasivo_corto": "Pasivo corriente / Pasivo total. Mide la concentración de obligaciones en el corto plazo.",
                 "porcentaje_activo_no_corriente": "Activo no corriente / Activo total. Mide la proporción de activos menos líquidos o de permanencia.",
+                "cobertura_activo_pasivo": "Activo total / Pasivo total. Mide la relación global entre activos y pasivos.",
                 "endeudamiento_largo_plazo": "Pasivo no corriente / Patrimonio. Mide la relación entre deuda de largo plazo y capital propio.",
-                "roe": "Utilidad neta / Patrimonio. Mide el rendimiento obtenido sobre el capital propio invertido por los socios.",
-                "roa": "Utilidad neta / Activo total. Mide qué tan eficientemente los activos de la empresa generan utilidad.",
-                "prueba_acida": "(Activo corriente - Inventarios) / Pasivo corriente. Liquidez estricta, sin depender de vender inventario.",
-                "dso_dias_cobro": "(Cartera pendiente / Ingresos del período) × días del período. Días promedio que tarda la empresa en recaudar su cartera.",
-                "dpo_dias_pago": "(Cuentas por pagar / Compras del período) × días del período. Días promedio que la empresa tarda en pagar a sus proveedores.",
-                "cobertura_intereses": "Utilidad operativa / Gastos financieros. Mide cuántas veces la utilidad operativa cubre el costo de la deuda.",
                 "activo_total": "Total de recursos controlados por la empresa al corte final.",
                 "pasivo_total": "Total de obligaciones con terceros al corte final.",
                 "patrimonio": "Recursos propios o acumulados de la empresa al corte final.",
@@ -18947,10 +18740,6 @@ def create_app():
                 "activo_no_corriente": "Activos de permanencia o recuperación a largo plazo.",
                 "pasivo_corto": "Obligaciones exigibles en el corto plazo.",
                 "pasivo_largo": "Obligaciones exigibles a largo plazo.",
-                "inventarios": "Saldo de inventarios de mercancías al corte final.",
-                "cartera_total": "Saldo total pendiente de recaudo a clientes, a la fecha actual.",
-                "cuentas_por_pagar_total": "Saldo total pendiente de pago a proveedores, a la fecha actual.",
-                "gastos_financieros": "Intereses, comisiones y gastos bancarios del período seleccionado.",
             }
 
             # =========================
@@ -19040,26 +18829,6 @@ def create_app():
                     "clase": "Utilidad neta",
                     "valor": round(utilidad_neta, 2),
                     "interpretacion": "Resultado neto del período analizado."
-                },
-                {
-                    "clase": "Inventarios",
-                    "valor": round(inventarios, 2),
-                    "interpretacion": "Saldo de inventarios de mercancías al corte final."
-                },
-                {
-                    "clase": "Cartera (CxC)",
-                    "valor": round(cartera_total, 2),
-                    "interpretacion": "Saldo total pendiente de recaudo a clientes, a la fecha actual."
-                },
-                {
-                    "clase": "Cuentas por pagar (CxP)",
-                    "valor": round(cuentas_por_pagar_total, 2),
-                    "interpretacion": "Saldo total pendiente de pago a proveedores, a la fecha actual."
-                },
-                {
-                    "clase": "Gastos financieros",
-                    "valor": round(gastos_financieros, 2),
-                    "interpretacion": "Intereses, comisiones y gastos bancarios del período seleccionado."
                 },
             ]
 
