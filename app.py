@@ -2638,7 +2638,49 @@ def construir_cruce_dian(idcliente, desde, hasta):
             "iva_siigo": iva_siigo,
             "total_siigo": _total_bruto_compra(match.id) if match else None,
             "estado": estado_match,
+            "match_debil": False,
+            "siigo_folio_real": None,
         })
+
+    # Segundo intento (2026-07-17): cruce debil por NIT + fecha exacta
+    # cuando el numero de factura no calzo. Caso real que motivo esto:
+    # UNISON STUDIOS MEDIA (NIT 901689106) factura FE-137 del 2026-01-05
+    # quedaba "Falta en Siigo" porque quien la registro en Siigo tipeo
+    # "FC-137" en factura_proveedor (texto libre, a diferencia de
+    # ventas/notas donde el numero lo genera Siigo solo). Solo se acepta
+    # el cruce si (NIT, fecha) es unico en AMBOS lados entre lo que quedo
+    # sin cruzar - si hay mas de un candidato de cualquier lado, se deja
+    # como "falta_en_siigo" en vez de arriesgar un cruce incorrecto entre
+    # dos facturas distintas del mismo proveedor el mismo dia.
+    no_cruzados_siigo = [c for c in compras_siigo if c.idcompra not in usados_compras]
+    siigo_por_nit_fecha = {}
+    for c in no_cruzados_siigo:
+        clave = (str(c.proveedor_identificacion or "").strip(), c.fecha.isoformat() if c.fecha else None)
+        siigo_por_nit_fecha.setdefault(clave, []).append(c)
+
+    dian_por_nit_fecha = {}
+    for d_detalle in detalle_compras:
+        if d_detalle["estado"] != "falta_en_siigo":
+            continue
+        clave = (str(d_detalle["tercero_nit"] or "").strip(), d_detalle["fecha"])
+        dian_por_nit_fecha.setdefault(clave, []).append(d_detalle)
+
+    for clave, dian_candidatos in dian_por_nit_fecha.items():
+        siigo_candidatos = siigo_por_nit_fecha.get(clave, [])
+        if len(dian_candidatos) != 1 or len(siigo_candidatos) != 1:
+            continue
+        d_detalle = dian_candidatos[0]
+        match = siigo_candidatos[0]
+        iva_siigo = float(ivas_compra_por_id.get(match.id, 0))
+        d_detalle.update({
+            "siigo_id": match.idcompra,
+            "siigo_folio_real": match.factura_proveedor,
+            "iva_siigo": iva_siigo,
+            "total_siigo": _total_bruto_compra(match.id),
+            "estado": _clasificar_match(True, d_detalle["iva_dian"], iva_siigo),
+            "match_debil": True,
+        })
+        usados_compras.add(match.idcompra)
 
     extra_compras = [
         {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
