@@ -2346,6 +2346,16 @@ def _folio_nota_credito_dian(folio_raw):
     return digitos[0], digitos[1:]
 
 
+def _limpiar_nombre_pg_array(raw):
+    """siigo_customers.name viene como texto de array de Postgres, ej.
+    '{"DERCO COLOMBIA SAS"}' o '{"Juan Andrés","Silva Borrero"}' (nombre y
+    apellido separados) - extrae las partes entre comillas y las une."""
+    if not raw:
+        return None
+    partes = re.findall(r'"([^"]*)"', str(raw))
+    return " ".join(p for p in partes if p).strip() or None
+
+
 def _clasificar_match(encontrado, dian_monto, siigo_monto, tolerancia=2.0):
     if not encontrado:
         return "falta_en_siigo"
@@ -2400,6 +2410,14 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     resultado = {}
 
+    # siigo_facturas.cliente_nombre y siigo_notas_credito.cliente_nombre
+    # llegan vacios del sync (confirmado con datos reales) - el nombre real
+    # solo esta en siigo_customers, indexado por customer_id.
+    nombres_customer_por_id = {
+        str(c.id): _limpiar_nombre_pg_array(c.name)
+        for c in SiigoCustomer.query.filter_by(idcliente=idcliente).all()
+    }
+
     # ---------- Facturas de venta ----------
     facturas_dian = por_tipo_grupo.get(("Factura electrónica", "Emitido"), [])
     facturas_siigo = SiigoFactura.query.filter(
@@ -2447,7 +2465,9 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     extra_ventas = [
         {"siigo_id": f.idfactura, "fecha": f.fecha.isoformat() if f.fecha else None,
-         "tercero_nit": f.customer_identificacion, "iva_siigo": float(f.impuestos_total or 0),
+         "tercero_nit": f.customer_identificacion,
+         "tercero_nombre": nombres_customer_por_id.get(str(f.customer_id)),
+         "iva_siigo": float(f.impuestos_total or 0),
          "total_siigo": float(f.subtotal or 0) + float(f.impuestos_total or 0)}
         for f in facturas_siigo if f.idfactura not in usados_ventas
     ]
@@ -2505,9 +2525,15 @@ def construir_cruce_dian(idcliente, desde, hasta):
             "estado": estado_match,
         })
 
+    def _nit_nota(n):
+        meta = n.metadata_json or {}
+        return (meta.get("customer") or {}).get("identification") if isinstance(meta, dict) else None
+
     extra_notas = [
         {"siigo_id": n.nota_id, "fecha": n.fecha.isoformat() if n.fecha else None,
-         "tercero_nit": None, "iva_siigo": _iva_nota(n), "total_siigo": float(n.total or 0)}
+         "tercero_nit": _nit_nota(n),
+         "tercero_nombre": nombres_customer_por_id.get(str(n.customer_id)),
+         "iva_siigo": _iva_nota(n), "total_siigo": float(n.total or 0)}
         for n in notas_siigo if n.nota_id not in usados_notas
     ]
 
@@ -2616,7 +2642,8 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     extra_compras = [
         {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
-         "tercero_nit": c.proveedor_identificacion, "iva_siigo": float(ivas_compra_por_id.get(c.id, 0)),
+         "tercero_nit": c.proveedor_identificacion, "tercero_nombre": c.proveedor_nombre,
+         "iva_siigo": float(ivas_compra_por_id.get(c.id, 0)),
          "total_siigo": _total_bruto_compra(c.id)}
         for c in compras_siigo if c.idcompra not in usados_compras
     ]
@@ -2657,7 +2684,8 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     extra_ds = [
         {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
-         "tercero_nit": c.proveedor_identificacion, "total_siigo": float(c.total or 0)}
+         "tercero_nit": c.proveedor_identificacion, "tercero_nombre": c.proveedor_nombre,
+         "total_siigo": float(c.total or 0)}
         for c in ds_siigo if c.idcompra not in usados_ds
     ]
 
