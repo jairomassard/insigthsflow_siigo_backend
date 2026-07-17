@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone, timedelta
 from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_permiso_en_paquete
  
 from config import Config
-from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte
+from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte, DianDocumento
 from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
 from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
@@ -2285,6 +2285,393 @@ def construir_cruce_iva(idcliente, desde, hasta, inc_19, inc_5):
     if _proveedor_datos_cliente(idcliente) == "alegra":
         return construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5)
     return construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5)
+
+
+# ============================================================
+# Cruce DIAN vs Siigo (documento por documento)
+# ============================================================
+#
+# Llaves de cruce validadas con datos reales de Binaria Media
+# (idcliente=13, archivo TokenDIAN_Ene1_Julio15_2026.xlsx, 2026-07-17):
+#
+#   Facturas de venta:   Siigo idfactura "FV-{sucursal}-{consecutivo}"
+#                         <-> DIAN Folio (numerico), tipo="Factura
+#                         electronica", grupo="Emitido". Comparar por
+#                         impuestos_total (Siigo) vs IVA (DIAN)
+#                         - 287/287 exacto en la validacion.
+#   Notas credito:        Siigo nota_id "NC-{sucursal}-{consecutivo}"
+#                         <-> DIAN Folio viene como texto "NC{sucursal}
+#                         {consecutivo}" pegado, sin prefijo separado.
+#                         Comparar por suma de IVA de items (metadata_json)
+#                         vs IVA (DIAN) - 27/27 exacto.
+#   Facturas de compra:  Siigo factura_proveedor "{Prefijo}-{Folio}"
+#                         (mismo texto que Prefijo+"-"+Folio de la DIAN)
+#                         + NIT proveedor = NIT Emisor, grupo="Recibido".
+#                         Comparar por suma de impuestos de items vs IVA
+#                         (DIAN) - 565/690 exacto en validacion (el resto,
+#                         igual que los "no encontrados", son candidatos
+#                         reales a revisar, no ruido del metodo).
+#   Documento soporte:    Siigo idcompra "DS-{sucursal}-{consecutivo}"
+#                         (OJO: no factura_proveedor, que aqui es texto
+#                         libre) <-> DIAN Folio (numerico), tipo=
+#                         "Documento soporte con no obligados",
+#                         grupo="Emitido". Comparar por total - 246/266
+#                         (92.5%) en validacion.
+#
+# Nota importante: el campo `total` de siigo_facturas/siigo_compras viene
+# NETO de retenciones (ReteIVA/ReteFuente/ReteICA que el auxiliar de Siigo
+# resta del "total a cobrar/pagar"), mientras que el Total de la DIAN es
+# BRUTO (subtotal+IVA, sin restar retenciones). Por eso el cruce compara
+# por IVA en vez de por total en la mayoria de los casos - comparar por
+# total genera falsos "no coincide" sistematicos.
+
+def _consecutivo_de_id_siigo(identificador):
+    """'FV-2-2219' -> ('2', '2219'); 'NC-2-148' -> ('2','148');
+    'DS-1-1935' -> ('1','1935'). None si no calza el patron."""
+    if not identificador:
+        return None, None
+    partes = str(identificador).strip().split("-")
+    if len(partes) < 3:
+        return None, None
+    return partes[-2], partes[-1]
+
+
+def _folio_nota_credito_dian(folio_raw):
+    """La DIAN reporta el folio de notas credito de venta como texto
+    'NC2148' (prefijo vacio, todo pegado): letras + 1 digito de sucursal +
+    consecutivo. Devuelve (sucursal, consecutivo)."""
+    digitos = re.sub(r"^[A-Za-z]+", "", str(folio_raw or "").strip())
+    if len(digitos) < 2:
+        return None, None
+    return digitos[0], digitos[1:]
+
+
+def _clasificar_match(encontrado, dian_monto, siigo_monto, tolerancia=2.0):
+    if not encontrado:
+        return "falta_en_siigo"
+    if abs((dian_monto or 0) - (siigo_monto or 0)) <= tolerancia:
+        return "coincide"
+    return "monto_distinto"
+
+
+def construir_cruce_dian(idcliente, desde, hasta):
+    """Cruce documento-por-documento entre lo reportado por la DIAN
+    (dian_documentos, cargado desde el export de facturacion electronica)
+    y lo que ya esta sincronizado de Siigo (facturas, notas credito,
+    compras). Solo Siigo por ahora (ver limitaciones de Alegra en el
+    diseno: NIT no vive en la cabecera y el CUFE esta sin parsear en
+    stamp/JSONB)."""
+
+    proveedor = _proveedor_datos_cliente(idcliente)
+    if proveedor != "siigo":
+        return {
+            "proveedor_datos": proveedor,
+            "implementado": False,
+            "mensaje": (
+                "El cruce documento-por-documento contra la DIAN todavia "
+                "solo esta construido para clientes Siigo. Para Alegra "
+                "falta resolver el NIT a nivel de cabecera y extraer el "
+                "CUFE del campo stamp (ver docstring de "
+                "construir_cruce_iva_alegra)."
+            ),
+        }
+
+    docs_dian = DianDocumento.query.filter(
+        DianDocumento.idcliente == idcliente,
+        DianDocumento.fecha_emision.between(desde, hasta),
+    ).all()
+
+    por_tipo_grupo = {}
+    for d in docs_dian:
+        por_tipo_grupo.setdefault((d.tipo_documento, d.grupo), []).append(d)
+
+    resultado = {}
+
+    # ---------- Facturas de venta ----------
+    facturas_dian = por_tipo_grupo.get(("Factura electrónica", "Emitido"), [])
+    facturas_siigo = SiigoFactura.query.filter(
+        SiigoFactura.idcliente == idcliente,
+        SiigoFactura.fecha.between(desde, hasta),
+    ).all()
+    facturas_siigo_por_consec = {}
+    for f in facturas_siigo:
+        _, consec = _consecutivo_de_id_siigo(f.idfactura)
+        if consec:
+            facturas_siigo_por_consec.setdefault(consec, []).append(f)
+
+    detalle_ventas = []
+    usados_ventas = set()
+    for d in facturas_dian:
+        candidatos = facturas_siigo_por_consec.get(str(d.folio or "").strip(), [])
+        match = None
+        for c in candidatos:
+            if abs(float(c.impuestos_total or 0) - float(d.iva or 0)) <= 2.0:
+                match = c
+                break
+        if not match and candidatos:
+            match = candidatos[0]
+        estado_match = _clasificar_match(
+            bool(match), float(d.iva or 0), float(match.impuestos_total or 0) if match else None
+        )
+        if match:
+            usados_ventas.add(match.idfactura)
+        # total_siigo = subtotal + impuestos_total (bruto), NO el campo
+        # `total` de siigo_facturas: ese viene neto de retenciones
+        # (ReteIVA/ReteFuente/ReteICA) mientras que el Total de la DIAN es
+        # bruto - comparar contra `total` genera falsos "monto distinto".
+        total_siigo_venta = (
+            float(match.subtotal or 0) + float(match.impuestos_total or 0) if match else None
+        )
+        detalle_ventas.append({
+            "cufe": d.cufe, "folio": d.folio, "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_receptor, "tercero_nombre": d.nombre_receptor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match.idfactura if match else None,
+            "iva_siigo": float(match.impuestos_total or 0) if match else None,
+            "total_siigo": total_siigo_venta,
+            "estado": estado_match,
+        })
+
+    extra_ventas = [
+        {"siigo_id": f.idfactura, "fecha": f.fecha.isoformat() if f.fecha else None,
+         "tercero_nit": f.customer_identificacion, "iva_siigo": float(f.impuestos_total or 0),
+         "total_siigo": float(f.subtotal or 0) + float(f.impuestos_total or 0)}
+        for f in facturas_siigo if f.idfactura not in usados_ventas
+    ]
+
+    resultado["ventas"] = _resumen_cruce(detalle_ventas, extra_ventas)
+
+    # ---------- Notas crédito de venta ----------
+    notas_dian = por_tipo_grupo.get(("Nota de crédito electrónica", "Emitido"), [])
+    notas_siigo = SiigoNotaCredito.query.filter(
+        SiigoNotaCredito.idcliente == idcliente,
+        SiigoNotaCredito.fecha.between(desde, hasta),
+    ).all()
+
+    def _iva_nota(n):
+        meta = n.metadata_json or {}
+        items = meta.get("items", []) if isinstance(meta, dict) else []
+        return sum(
+            float(t.get("value") or 0)
+            for it in items for t in (it.get("taxes") or []) if t.get("type") == "IVA"
+        )
+
+    notas_siigo_por_consec = {}
+    for n in notas_siigo:
+        _, consec = _consecutivo_de_id_siigo(n.nota_id)
+        if consec:
+            notas_siigo_por_consec.setdefault(consec, []).append(n)
+
+    detalle_notas = []
+    usados_notas = set()
+    for d in notas_dian:
+        _, consec = _folio_nota_credito_dian(d.folio)
+        candidatos = notas_siigo_por_consec.get(consec, []) if consec else []
+        match = candidatos[0] if candidatos else None
+        iva_siigo = _iva_nota(match) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.iva or 0), iva_siigo)
+        if match:
+            usados_notas.add(match.nota_id)
+        detalle_notas.append({
+            "cufe": d.cufe, "folio": d.folio, "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_receptor, "tercero_nombre": d.nombre_receptor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match.nota_id if match else None,
+            "iva_siigo": iva_siigo,
+            # `total` de siigo_notas_credito SI viene bruto en la mayoria
+            # de casos (validado: NC-2-148 total=2.201.500 = 1.850.000 +
+            # 351.500 de IVA), pero OJO (2026-07-17, sin resolver): en
+            # NC-2-147 (Inchcape, nota grande) el IVA coincide exacto
+            # ($81.495.212,49 en ambos lados) pero el total_dian
+            # ($510.417.383,49) y total_siigo ($476.892.826,61) difieren en
+            # ~$33.5M - el estado "coincide" se decide solo por IVA, no por
+            # total, asi que puede verse "Coincide" con la columna Total
+            # distinta. Pendiente investigar si esa nota tiene retenciones
+            # netas al igual que compras/facturas.
+            "total_siigo": float(match.total or 0) if match else None,
+            "estado": estado_match,
+        })
+
+    extra_notas = [
+        {"siigo_id": n.nota_id, "fecha": n.fecha.isoformat() if n.fecha else None,
+         "tercero_nit": None, "iva_siigo": _iva_nota(n), "total_siigo": float(n.total or 0)}
+        for n in notas_siigo if n.nota_id not in usados_notas
+    ]
+
+    resultado["notas_credito"] = _resumen_cruce(detalle_notas, extra_notas)
+
+    # ---------- Facturas de compra ----------
+    # "Application response" es solo el acuse de recibo (no un documento
+    # financiero). "Nota de crédito electrónica" recibida se excluye de
+    # este bucket a proposito: no hay todavia una entidad de "nota credito
+    # de compra" en Siigo/InsightFlow contra la cual cruzarla, y dejarla
+    # adentro solo generaba "falta_en_siigo" falsos (confirmado con datos
+    # reales de Binaria: prefijos NCRE/NC/DPER/NC04/blanco, sin match
+    # posible con siigo_compras.factura_proveedor).
+    compras_dian = [
+        d for (tipo, grupo), docs in por_tipo_grupo.items()
+        if grupo == "Recibido" and tipo not in ("Application response", "Nota de crédito electrónica")
+        for d in docs
+    ]
+    compras_siigo_todas = SiigoCompra.query.filter(
+        SiigoCompra.idcliente == idcliente,
+        SiigoCompra.fecha.between(desde, hasta),
+    ).all()
+    # Documento soporte (idcompra "DS-...") se cruza aparte mas abajo -
+    # excluirlo aqui evita que aparezca duplicado como "extra_en_siigo"
+    # en compras (la DIAN lo agrupa como "Emitido", no "Recibido", asi
+    # que nunca hace match en este bloque y siempre parece "extra").
+    compras_siigo = [c for c in compras_siigo_todas if not str(c.idcompra or "").upper().startswith("DS-")]
+
+    # LIMITACION CONOCIDA (2026-07-17, pendiente para retomar): sumar
+    # SiigoCompraItem.impuestos por compra NO es un IVA confiable en todos
+    # los casos. Validado con datos reales (compra FC-1-2508, Astro's
+    # Catering AS-345): en el item "SNACK BOX PM" la tarifa de IVA (Impto.
+    # Cargo) era 0% pero Retefuente era 3.5%, y el campo `impuestos` trajo
+    # el valor de la RETENCION ($100.765 = 3.5% de $2.879.000), no IVA. En
+    # cambio en los items "MENAJE"/"MESERO" del mismo documento, con IVA
+    # real al 19%, `impuestos` si coincidio con el IVA. O sea: el campo
+    # trae "lo que no sea cero" por item, mezclando IVA y Retefuente segun
+    # el caso - no distingue tipo de impuesto (a diferencia de
+    # SiigoFacturaItem, que si separa iva_valor de las retenciones). Esto
+    # hace que el bucket "monto_distinto" en Facturas de Compra no sea
+    # 100% confiable para proveedores con tarifas mixtas (catering/eventos
+    # tipicamente). Pendiente evaluar si el sync de Siigo puede capturar
+    # el desglose real de impuestos por item de compra (la API de Siigo
+    # probablemente lo trae, similar a como ya se hace para facturas de
+    # venta) antes de confiar en este numero para decisiones.
+    #
+    # Caso aparte SIN resolver, no relacionado con lo anterior: la compra
+    # FC-1-2508 (Astro's Catering, factura_proveedor "AS-345") tiene total
+    # real $4.436.461 en Siigo (confirmado con el PDF de Siigo), pero la
+    # DIAN reporta para el folio "AS-345" solo $209.000 de IVA (~$1.3M de
+    # factura). La diferencia de magnitud es demasiado grande para ser el
+    # problema del campo `impuestos` de arriba. Hipotesis sin confirmar:
+    # Astro's Catering reutilizo/cruzo numeracion entre AS-341/AS-342/
+    # AS-345 (facturas consecutivas de fechas muy cercanas). Requiere
+    # verificar con el proveedor o la factura fisica, no se puede resolver
+    # solo con los datos que ya tenemos.
+    ivas_compra_por_id = dict(
+        db.session.query(SiigoCompraItem.compra_id, func.coalesce(func.sum(SiigoCompraItem.impuestos), 0))
+        .join(SiigoCompra, SiigoCompra.id == SiigoCompraItem.compra_id)
+        .filter(SiigoCompra.idcliente == idcliente, SiigoCompra.fecha.between(desde, hasta))
+        .group_by(SiigoCompraItem.compra_id)
+        .all()
+    )
+    # "Total bruto" aproximado = subtotal de items + la misma suma de
+    # `impuestos` de arriba (con la misma limitacion documentada: mezcla
+    # IVA/Retefuente segun el item). Es lo mejor que se puede reconstruir
+    # sin el desglose de impuesto por tipo a nivel de item de compra.
+    subtotales_compra_por_id = dict(
+        db.session.query(
+            SiigoCompraItem.compra_id,
+            func.coalesce(func.sum(SiigoCompraItem.precio * SiigoCompraItem.cantidad), 0),
+        )
+        .join(SiigoCompra, SiigoCompra.id == SiigoCompraItem.compra_id)
+        .filter(SiigoCompra.idcliente == idcliente, SiigoCompra.fecha.between(desde, hasta))
+        .group_by(SiigoCompraItem.compra_id)
+        .all()
+    )
+
+    def _total_bruto_compra(compra_id):
+        return float(subtotales_compra_por_id.get(compra_id, 0)) + float(ivas_compra_por_id.get(compra_id, 0))
+
+    compras_siigo_por_key = {}
+    for c in compras_siigo:
+        key = (str(c.proveedor_identificacion or "").strip(), (c.factura_proveedor or "").strip().upper())
+        compras_siigo_por_key[key] = c
+
+    detalle_compras = []
+    usados_compras = set()
+    for d in compras_dian:
+        key = (str(d.nit_emisor or "").strip(), f"{d.prefijo or ''}-{d.folio or ''}".strip().upper())
+        match = compras_siigo_por_key.get(key)
+        iva_siigo = float(ivas_compra_por_id.get(match.id, 0)) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.iva or 0), iva_siigo)
+        if match:
+            usados_compras.add(match.idcompra)
+        detalle_compras.append({
+            "cufe": d.cufe, "folio": f"{d.prefijo or ''}-{d.folio or ''}",
+            "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_emisor, "tercero_nombre": d.nombre_emisor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match.idcompra if match else None,
+            "iva_siigo": iva_siigo,
+            "total_siigo": _total_bruto_compra(match.id) if match else None,
+            "estado": estado_match,
+        })
+
+    extra_compras = [
+        {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
+         "tercero_nit": c.proveedor_identificacion, "iva_siigo": float(ivas_compra_por_id.get(c.id, 0)),
+         "total_siigo": _total_bruto_compra(c.id)}
+        for c in compras_siigo if c.idcompra not in usados_compras
+    ]
+
+    resultado["compras"] = _resumen_cruce(detalle_compras, extra_compras)
+
+    # ---------- Documento soporte ----------
+    ds_dian = por_tipo_grupo.get(("Documento soporte con no obligados", "Emitido"), [])
+    ds_siigo = [c for c in compras_siigo_todas if str(c.idcompra or "").upper().startswith("DS-")]
+    ds_siigo_por_consec = {}
+    for c in ds_siigo:
+        _, consec = _consecutivo_de_id_siigo(c.idcompra)
+        if consec:
+            ds_siigo_por_consec.setdefault(consec, []).append(c)
+
+    detalle_ds = []
+    usados_ds = set()
+    for d in ds_dian:
+        candidatos = ds_siigo_por_consec.get(str(d.folio or "").strip(), [])
+        match = candidatos[0] if candidatos else None
+        # OJO: a diferencia de facturas/compras normales, en documento
+        # soporte el campo `total` de Siigo ya viene comparable al Total
+        # bruto de la DIAN (validado con datos reales: sumar
+        # retencion_total aqui empeora el match de 246/266 a 47/266).
+        total_siigo = float(match.total or 0) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.total or 0), total_siigo)
+        if match:
+            usados_ds.add(match.idcompra)
+        detalle_ds.append({
+            "cufe": d.cufe, "folio": d.folio, "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_receptor, "tercero_nombre": d.nombre_receptor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match.idcompra if match else None,
+            "iva_siigo": None,
+            "total_siigo": total_siigo,
+            "estado": estado_match,
+        })
+
+    extra_ds = [
+        {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
+         "tercero_nit": c.proveedor_identificacion, "total_siigo": float(c.total or 0)}
+        for c in ds_siigo if c.idcompra not in usados_ds
+    ]
+
+    resultado["documento_soporte"] = _resumen_cruce(detalle_ds, extra_ds)
+
+    resultado["proveedor_datos"] = proveedor
+    resultado["implementado"] = True
+    return resultado
+
+
+def _resumen_cruce(detalle, extra_en_siigo):
+    coincide = [d for d in detalle if d["estado"] == "coincide"]
+    monto_distinto = [d for d in detalle if d["estado"] == "monto_distinto"]
+    falta_en_siigo = [d for d in detalle if d["estado"] == "falta_en_siigo"]
+    return {
+        "resumen": {
+            "total_dian": len(detalle),
+            "coincide": len(coincide),
+            "monto_distinto": len(monto_distinto),
+            "falta_en_siigo": len(falta_en_siigo),
+            "extra_en_siigo": len(extra_en_siigo),
+        },
+        "coincide": coincide,
+        "monto_distinto": monto_distinto,
+        "falta_en_siigo": falta_en_siigo,
+        "extra_en_siigo": extra_en_siigo,
+    }
 
 
 def construir_retenciones_siigo(idcliente, desde, hasta):
@@ -18044,6 +18431,117 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
 
+    # Carga del reporte de documentos electrónicos de la DIAN (Rp_Doc /
+    # Emitidos / Entregado - todas comparten el mismo shape de columnas:
+    # Tipo de documento, CUFE/CUDE, Folio, Prefijo, Fecha Emisión, NIT/Nombre
+    # Emisor y Receptor, IVA, Rete IVA, Total, Estado, Grupo). Un mismo
+    # archivo puede traer varias hojas con ese shape (confirmado con archivo
+    # real 2026-07 de Binaria Media: Rp_Doc/Entregado/Emitidos en un mismo
+    # libro) - se procesan todas las que calcen, se ignoran las que no (ej.
+    # hoja "RT IVA" que es un auxiliar contable de Siigo, no un export DIAN).
+    # CUFE/CUDE es una llave natural real (a diferencia de auxiliar_contable),
+    # así que se hace upsert por (idcliente, cufe) en vez de borrar por rango
+    # de fechas.
+    COLUMNAS_DIAN_REQUERIDAS = {"Tipo de documento", "CUFE/CUDE", "Grupo"}
+
+    @app.route("/reportes/cargar_dian_documentos", methods=["POST"])
+    @jwt_required()
+    def cargar_dian_documentos():
+        import pandas as pd
+        idcliente = get_jwt().get("idcliente")
+        file = request.files.get("archivo")
+        if not file:
+            return jsonify({"error": "No hay archivo"}), 400
+
+        try:
+            from models import DianDocumento
+            hojas = pd.read_excel(file, sheet_name=None, header=0, engine="calamine")
+
+            def clean_num(val):
+                if val is None or str(val).strip().lower() in ("nan", ""):
+                    return 0.0
+                try:
+                    return float(str(val).replace(",", "").replace(" ", "").replace("$", ""))
+                except ValueError:
+                    return 0.0
+
+            def clean_str(val):
+                """Celdas vacías llegan de pandas como NaN (float), que es
+                'truthy' en Python - 'str(val) or ""' NO las detecta y deja
+                el texto literal "nan" en el dato. Hay que chequear
+                explícitamente."""
+                if val is None:
+                    return None
+                s = str(val).strip()
+                if s == "" or s.lower() == "nan":
+                    return None
+                return s
+
+            mapeados_por_cufe = {}
+            hojas_procesadas = []
+            for nombre_hoja, df in hojas.items():
+                df.columns = [str(c).strip() for c in df.columns]
+                if not COLUMNAS_DIAN_REQUERIDAS.issubset(set(df.columns)):
+                    continue
+                hojas_procesadas.append(nombre_hoja)
+
+                for _, row in df.iterrows():
+                    tipo_doc = row.get("Tipo de documento")
+                    cufe = row.get("CUFE/CUDE")
+                    if not tipo_doc or not cufe or str(cufe).strip().lower() == "nan":
+                        continue
+
+                    fecha_raw = row.get("Fecha Emisión")
+                    fecha_emision = None
+                    if fecha_raw and str(fecha_raw).strip().lower() != "nan":
+                        fecha_emision = pd.to_datetime(fecha_raw, dayfirst=True).date()
+
+                    mapeados_por_cufe[str(cufe).strip()] = {
+                        "idcliente": idcliente,
+                        "cufe": str(cufe).strip(),
+                        "tipo_documento": str(tipo_doc).strip(),
+                        "folio": clean_str(row.get("Folio")),
+                        "prefijo": clean_str(row.get("Prefijo")),
+                        "fecha_emision": fecha_emision,
+                        "nit_emisor": clean_str(row.get("NIT Emisor")),
+                        "nombre_emisor": clean_str(row.get("Nombre Emisor")),
+                        "nit_receptor": clean_str(row.get("NIT Receptor")),
+                        "nombre_receptor": clean_str(row.get("Nombre Receptor")),
+                        "iva": clean_num(row.get("IVA")),
+                        "rete_iva": clean_num(row.get("Rete IVA")),
+                        "total": clean_num(row.get("Total")),
+                        "estado": clean_str(row.get("Estado")),
+                        "grupo": clean_str(row.get("Grupo")),
+                        "archivo_origen": file.filename,
+                    }
+
+            if not hojas_procesadas:
+                return jsonify({
+                    "error": "El archivo no tiene ninguna hoja con el formato del export de documentos de la DIAN.",
+                    "hojas_encontradas": list(hojas.keys()),
+                }), 400
+
+            lista_mapeada = list(mapeados_por_cufe.values())
+            if lista_mapeada:
+                cufes = [m["cufe"] for m in lista_mapeada]
+                DianDocumento.query.filter(
+                    DianDocumento.idcliente == idcliente,
+                    DianDocumento.cufe.in_(cufes),
+                ).delete(synchronize_session=False)
+                db.session.bulk_insert_mappings(DianDocumento, lista_mapeada)
+                db.session.commit()
+
+            return jsonify({
+                "detalles": {
+                    "hojas_procesadas": hojas_procesadas,
+                    "registros_procesados": len(lista_mapeada),
+                }
+            }), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": str(e)}), 500
+
+
     # Carga del "Libro Diario" exportado desde Alegra (mismo destino que el
     # auxiliar de Siigo - auxiliar_contable - pero shape de columnas distinto:
     # confirmado con archivo real 2026-07-10 (IMPORTADORA NGC S.A.S.) que
@@ -18220,7 +18718,17 @@ def create_app():
 
 
 
-    #ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES 
+    @app.route("/reportes/cruce_dian", methods=["GET"])
+    @jwt_required()
+    def get_cruce_dian():
+        idcliente = get_jwt().get("idcliente")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        return jsonify(construir_cruce_dian(idcliente, desde, hasta)), 200
+
+
+
+    #ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES
     # ENDPOINT PARA EL CALCULO DE REPORTE DE RETENCIONES
     @app.route("/reportes/retenciones_v1", methods=["GET"])
     @jwt_required()
@@ -21139,6 +21647,14 @@ def create_app():
                 or "cruceiva" in path_norm
             ):
                 codigo = "ver_reporte_cruceivas"
+
+            # ------------------------------------------
+            # Cruce DIAN vs Siigo (documento por documento) -
+            # cubre tanto la carga del archivo (cargar_dian_documentos)
+            # como el reporte de cruce (cruce_dian).
+            # ------------------------------------------
+            elif "cruce-dian" in path_norm or "cargar-dian" in path_norm or "dian-documentos" in path_norm:
+                codigo = "ver_reporte_cruce_dian"
 
             # ------------------------------------------
             # Retenciones

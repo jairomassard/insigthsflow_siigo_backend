@@ -617,6 +617,60 @@ class SiigoCompraItem(db.Model):
 
 
 
+class DianDocumento(db.Model):
+    """Documentos electrónicos reportados por la DIAN (factura, nota crédito,
+    documento soporte, etc.), cargados desde el Excel de facturación
+    electrónica que exporta el portal de la DIAN. Se usan para el cruce
+    documento-por-documento contra lo que ya está sincronizado de Siigo/Alegra
+    (ver construir_cruce_dian en app.py)."""
+    __tablename__ = "dian_documentos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+
+    cufe = db.Column(db.String(200), nullable=False)
+    tipo_documento = db.Column(db.String(100))
+    folio = db.Column(db.String(50))
+    prefijo = db.Column(db.String(20))
+    fecha_emision = db.Column(db.Date)
+    fecha_recepcion = db.Column(db.DateTime)
+    nit_emisor = db.Column(db.String(50))
+    nombre_emisor = db.Column(db.String(200))
+    nit_receptor = db.Column(db.String(50))
+    nombre_receptor = db.Column(db.String(200))
+    iva = db.Column(db.Numeric(18, 2), server_default="0")
+    rete_iva = db.Column(db.Numeric(18, 2), server_default="0")
+    total = db.Column(db.Numeric(18, 2), server_default="0")
+    estado = db.Column(db.String(100))
+    grupo = db.Column(db.String(20))  # 'Emitido' | 'Recibido'
+    archivo_origen = db.Column(db.String(255))
+    fecha_carga = db.Column(db.DateTime, server_default=func.now())
+
+    __table_args__ = (
+        db.UniqueConstraint("idcliente", "cufe"),
+    )
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "idcliente": self.idcliente,
+            "cufe": self.cufe,
+            "tipo_documento": self.tipo_documento,
+            "folio": self.folio,
+            "prefijo": self.prefijo,
+            "fecha_emision": self.fecha_emision.isoformat() if self.fecha_emision else None,
+            "nit_emisor": self.nit_emisor,
+            "nombre_emisor": self.nombre_emisor,
+            "nit_receptor": self.nit_receptor,
+            "nombre_receptor": self.nombre_receptor,
+            "iva": float(self.iva or 0),
+            "rete_iva": float(self.rete_iva or 0),
+            "total": float(self.total or 0),
+            "estado": self.estado,
+            "grupo": self.grupo,
+        }
+
+
 class SiigoProveedor(db.Model):
     __tablename__ = "siigo_proveedores"
 
