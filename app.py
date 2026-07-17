@@ -2376,6 +2376,19 @@ def construir_cruce_dian(idcliente, desde, hasta):
             ),
         }
 
+    # Cobertura real de datos DIAN cargados (independiente del rango de
+    # fecha que se este consultando) - puramente informativo para el
+    # frontend: le avisa al usuario hasta que fecha esta cargado el
+    # export de la DIAN, para que entienda por que documentos de Siigo
+    # posteriores a esa fecha aparecen como "Extra en Siigo" (no es que
+    # falten en la DIAN, es que todavia no se ha subido ese periodo). A
+    # proposito NO se usa para filtrar/ocultar esos resultados - el
+    # usuario prefirio verlos igual, como recordatorio de que el reporte
+    # DIAN necesita actualizarse.
+    cobertura_dian_hasta = db.session.query(func.max(DianDocumento.fecha_emision)).filter(
+        DianDocumento.idcliente == idcliente
+    ).scalar()
+
     docs_dian = DianDocumento.query.filter(
         DianDocumento.idcliente == idcliente,
         DianDocumento.fecha_emision.between(desde, hasta),
@@ -2652,6 +2665,7 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     resultado["proveedor_datos"] = proveedor
     resultado["implementado"] = True
+    resultado["cobertura_dian_hasta"] = cobertura_dian_hasta.isoformat() if cobertura_dian_hasta else None
     return resultado
 
 
