@@ -2701,16 +2701,31 @@ def construir_cruce_dian(idcliente, desde, hasta):
         if consec:
             ds_siigo_por_consec.setdefault(consec, []).append(c)
 
+    # El campo `total` de siigo_compras para documento soporte viene NETO
+    # de Retefuente (total = Bruto - Retefuente), pero el ReteICA queda
+    # aparte en `retencion_total` sin restar - ninguna combinacion de esos
+    # dos campos reconstruye el Bruto. Lo que si lo reconstruye exacto es
+    # el `precio` del item: validado con datos reales (DS-1-1793/1794/
+    # 1795) que item.precio == Total Bruto de la DIAN al peso, en los 3
+    # casos, incluso cuando hay Retefuente Y ReteICA aplicados a la vez.
+    subtotales_ds_por_id = dict(
+        db.session.query(SiigoCompraItem.compra_id, func.coalesce(func.sum(SiigoCompraItem.precio), 0))
+        .join(SiigoCompra, SiigoCompra.id == SiigoCompraItem.compra_id)
+        .filter(SiigoCompra.idcliente == idcliente, SiigoCompra.idcompra.in_([c.idcompra for c in ds_siigo]))
+        .group_by(SiigoCompraItem.compra_id)
+        .all()
+    )
+
+    def _total_bruto_ds(compra):
+        bruto_items = subtotales_ds_por_id.get(compra.id)
+        return float(bruto_items) if bruto_items else float(compra.total or 0)
+
     detalle_ds = []
     usados_ds = set()
     for d in ds_dian:
         candidatos = ds_siigo_por_consec.get(str(d.folio or "").strip(), [])
         match = candidatos[0] if candidatos else None
-        # OJO: a diferencia de facturas/compras normales, en documento
-        # soporte el campo `total` de Siigo ya viene comparable al Total
-        # bruto de la DIAN (validado con datos reales: sumar
-        # retencion_total aqui empeora el match de 246/266 a 47/266).
-        total_siigo = float(match.total or 0) if match else None
+        total_siigo = _total_bruto_ds(match) if match else None
         estado_match = _clasificar_match(bool(match), float(d.total or 0), total_siigo)
         if match:
             usados_ds.add(match.idcompra)
@@ -2727,7 +2742,7 @@ def construir_cruce_dian(idcliente, desde, hasta):
     extra_ds = [
         {"siigo_id": c.idcompra, "fecha": c.fecha.isoformat() if c.fecha else None,
          "tercero_nit": c.proveedor_identificacion, "tercero_nombre": c.proveedor_nombre,
-         "total_siigo": float(c.total or 0)}
+         "total_siigo": _total_bruto_ds(c)}
         for c in ds_siigo if c.idcompra not in usados_ds
     ]
 
