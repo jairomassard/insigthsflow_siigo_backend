@@ -226,17 +226,20 @@ HEADER_MAP = {
     ],
 }
 
+
+# Solo lo que de verdad no puede faltar en NINGUN paquete de nomina (Siigo
+# tiene varios formatos distintos segun el paquete contratado por cada
+# cliente, y no todos desglosan las mismas deducciones/auxilios - ver
+# HEADER_MAP arriba). El resto (no_contrato, aux_transporte,
+# auxilio_extralegal, fondo_salud, fondo_pension, fondo_solidaridad) se trata
+# como opcional en /importar/nomina-excel, igual que ya se hacia con
+# prima/intereses_cesantias/retefuente/prestamos - default 0 (o vacio para
+# no_contrato) si el archivo no trae esa columna.
 REQUIRED_DB_FIELDS = [
     "nombre",
     "identificacion",
-    "no_contrato",
     "sueldo",
-    "aux_transporte",
-    "auxilio_extralegal",
     "total_ingresos",
-    "fondo_salud",
-    "fondo_pension",
-    "fondo_solidaridad",
     "total_deducciones",
     "neto_pagar",
 ]
@@ -16959,16 +16962,16 @@ def create_app():
                         periodo=periodo,
                         nombre=str(row.get(columnas_resueltas["nombre"], "") or "").strip(),
                         identificacion=str(row.get(columnas_resueltas["identificacion"], "") or "").strip(),
-                        no_contrato=str(row.get(columnas_resueltas["no_contrato"], "") or "").strip(),
+                        no_contrato=str(row.get(columnas_resueltas["no_contrato"], "") or "").strip() if "no_contrato" in columnas_resueltas else "",
                         sueldo=normalizar_numero(row.get(columnas_resueltas["sueldo"])),
-                        aux_transporte=normalizar_numero(row.get(columnas_resueltas["aux_transporte"])),
-                        auxilio_extralegal=normalizar_numero(row.get(columnas_resueltas["auxilio_extralegal"])),
+                        aux_transporte=normalizar_numero(row.get(columnas_resueltas["aux_transporte"])) if "aux_transporte" in columnas_resueltas else Decimal("0"),
+                        auxilio_extralegal=normalizar_numero(row.get(columnas_resueltas["auxilio_extralegal"])) if "auxilio_extralegal" in columnas_resueltas else Decimal("0"),
                         prima=normalizar_numero(row.get(columnas_resueltas["prima"])) if "prima" in columnas_resueltas else Decimal("0"),
                         intereses_cesantias=normalizar_numero(row.get(columnas_resueltas["intereses_cesantias"])) if "intereses_cesantias" in columnas_resueltas else Decimal("0"),
                         total_ingresos=normalizar_numero(row.get(columnas_resueltas["total_ingresos"])),
-                        fondo_salud=normalizar_numero(row.get(columnas_resueltas["fondo_salud"])),
-                        fondo_pension=normalizar_numero(row.get(columnas_resueltas["fondo_pension"])),
-                        fondo_solidaridad=normalizar_numero(row.get(columnas_resueltas["fondo_solidaridad"])),
+                        fondo_salud=normalizar_numero(row.get(columnas_resueltas["fondo_salud"])) if "fondo_salud" in columnas_resueltas else Decimal("0"),
+                        fondo_pension=normalizar_numero(row.get(columnas_resueltas["fondo_pension"])) if "fondo_pension" in columnas_resueltas else Decimal("0"),
+                        fondo_solidaridad=normalizar_numero(row.get(columnas_resueltas["fondo_solidaridad"])) if "fondo_solidaridad" in columnas_resueltas else Decimal("0"),
                         retefuente=normalizar_numero(row.get(columnas_resueltas["retefuente"])) if "retefuente" in columnas_resueltas else Decimal("0"),
                         prestamos=normalizar_numero(row.get(columnas_resueltas["prestamos"])) if "prestamos" in columnas_resueltas else Decimal("0"),
                         total_deducciones=normalizar_numero(row.get(columnas_resueltas["total_deducciones"])),
@@ -17075,9 +17078,27 @@ def create_app():
         except Exception as e:
             return jsonify({"error": f"No se pudo leer el Excel: {str(e)}"}), 400
 
+        # Mismo mapeo por sinónimos que usa el cargue real (/importar/nomina-excel)
+        # - se muestra ANTES de subir para que el usuario sepa si el archivo va a
+        # funcionar, sin tener que intentar el cargue real primero.
+        columnas_resueltas = resolver_columnas(headers)
+        faltantes = [campo for campo in REQUIRED_DB_FIELDS if campo not in columnas_resueltas]
+        opcionales_detectados = [
+            campo for campo in columnas_resueltas if campo not in REQUIRED_DB_FIELDS
+        ]
+        opcionales_no_detectados = [
+            campo for campo in HEADER_MAP if campo not in REQUIRED_DB_FIELDS and campo not in columnas_resueltas
+        ]
+
         return jsonify({
             "mensaje": f"Archivo leído correctamente. {len(preview)} filas en preview.",
-            "preview": preview
+            "preview": preview,
+            "columnas_detectadas": headers,
+            "columnas_mapeadas": columnas_resueltas,
+            "campos_obligatorios_faltantes": faltantes,
+            "campos_opcionales_detectados": opcionales_detectados,
+            "campos_opcionales_no_detectados": opcionales_no_detectados,
+            "listo_para_cargar": len(faltantes) == 0,
         })
 
 
