@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 from collections import defaultdict
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 from models import db, AuxiliarSaldosCorte, BalancePrueba
 
@@ -176,11 +176,86 @@ def clasificar_cuenta(cuenta_codigo: str):
 def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
     fecha_corte = ultimo_dia_del_mes(fecha_corte)
 
-    sql = text("""
-        SELECT
-            cuenta_codigo,
-            MAX(cuenta_nombre) AS cuenta_nombre,
-            SUM(
+    # Clientes Alegra migrados a mitad de año fiscal no tienen en
+    # auxiliar_contable ningún concepto de saldo acumulado de años
+    # anteriores (el Libro Diario cargado normalmente solo cubre el año en
+    # curso) - confirmado con datos reales de Maslux LED e Importadora NGC
+    # (2026-07-15/18) que sin esto CxC/CxP/patrimonio/retenciones muestran
+    # solo el MOVIMIENTO del año cargado, no el saldo real. Si existe un
+    # saldo inicial cargado (ver models_alegra.AlegraSaldoInicial,
+    # /alegra/cargar_saldos_iniciales) con fecha <= fecha_corte, se usa como
+    # piso y se le suma encima solo el movimiento posterior a esa fecha -
+    # para Siigo (o Alegra sin saldo inicial cargado) esta tabla
+    # simplemente está vacía y el comportamiento es idéntico al de siempre.
+    from models_alegra import AlegraSaldoInicial
+    fecha_corte_inicial = db.session.query(
+        func.max(AlegraSaldoInicial.fecha_corte_inicial)
+    ).filter(
+        AlegraSaldoInicial.idcliente == idcliente,
+        AlegraSaldoInicial.fecha_corte_inicial <= fecha_corte,
+    ).scalar()
+
+    if fecha_corte_inicial:
+        sql = text("""
+            WITH base AS (
+                SELECT cuenta_codigo, cuenta_nombre, saldo
+                FROM alegra_saldos_iniciales
+                WHERE idcliente = :idc AND fecha_corte_inicial = :fci
+            ),
+            movimiento AS (
+                SELECT
+                    cuenta_codigo,
+                    MAX(cuenta_nombre) AS cuenta_nombre,
+                    SUM(
+                        CASE
+                            WHEN LEFT(cuenta_codigo, 1) IN ('1', '5', '6', '7')
+                                THEN (debito - credito)
+                            WHEN LEFT(cuenta_codigo, 1) IN ('2', '3', '4')
+                                THEN (credito - debito)
+                            ELSE 0
+                        END
+                    ) AS delta
+                FROM auxiliar_contable
+                WHERE idcliente = :idc
+                  AND fecha_contable > :fci
+                  AND fecha_contable <= :fc
+                  AND LEFT(cuenta_codigo, 1) IN ('1', '2', '3', '4', '5', '6', '7')
+                GROUP BY cuenta_codigo
+            )
+            SELECT
+                COALESCE(b.cuenta_codigo, m.cuenta_codigo) AS cuenta_codigo,
+                COALESCE(m.cuenta_nombre, b.cuenta_nombre) AS cuenta_nombre,
+                COALESCE(b.saldo, 0) + COALESCE(m.delta, 0) AS saldo
+            FROM base b
+            FULL OUTER JOIN movimiento m ON m.cuenta_codigo = b.cuenta_codigo
+            WHERE COALESCE(b.saldo, 0) + COALESCE(m.delta, 0) <> 0
+            ORDER BY 1
+        """)
+        rows = db.session.execute(sql, {
+            "idc": idcliente,
+            "fci": fecha_corte_inicial,
+            "fc": fecha_corte,
+        }).mappings().all()
+    else:
+        sql = text("""
+            SELECT
+                cuenta_codigo,
+                MAX(cuenta_nombre) AS cuenta_nombre,
+                SUM(
+                    CASE
+                        WHEN LEFT(cuenta_codigo, 1) IN ('1', '5', '6', '7')
+                            THEN (debito - credito)
+                        WHEN LEFT(cuenta_codigo, 1) IN ('2', '3', '4')
+                            THEN (credito - debito)
+                        ELSE 0
+                    END
+                ) AS saldo
+            FROM auxiliar_contable
+            WHERE idcliente = :idc
+              AND fecha_contable <= :fc
+              AND LEFT(cuenta_codigo, 1) IN ('1', '2', '3', '4', '5', '6', '7')
+            GROUP BY cuenta_codigo
+            HAVING SUM(
                 CASE
                     WHEN LEFT(cuenta_codigo, 1) IN ('1', '5', '6', '7')
                         THEN (debito - credito)
@@ -188,28 +263,14 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
                         THEN (credito - debito)
                     ELSE 0
                 END
-            ) AS saldo
-        FROM auxiliar_contable
-        WHERE idcliente = :idc
-          AND fecha_contable <= :fc
-          AND LEFT(cuenta_codigo, 1) IN ('1', '2', '3', '4', '5', '6', '7')
-        GROUP BY cuenta_codigo
-        HAVING SUM(
-            CASE
-                WHEN LEFT(cuenta_codigo, 1) IN ('1', '5', '6', '7')
-                    THEN (debito - credito)
-                WHEN LEFT(cuenta_codigo, 1) IN ('2', '3', '4')
-                    THEN (credito - debito)
-                ELSE 0
-            END
-        ) <> 0
-        ORDER BY cuenta_codigo
-    """)
+            ) <> 0
+            ORDER BY cuenta_codigo
+        """)
 
-    rows = db.session.execute(sql, {
-        "idc": idcliente,
-        "fc": fecha_corte
-    }).mappings().all()
+        rows = db.session.execute(sql, {
+            "idc": idcliente,
+            "fc": fecha_corte
+        }).mappings().all()
 
     AuxiliarSaldosCorte.query.filter_by(
         idcliente=idcliente,

@@ -279,6 +279,47 @@ class AlegraSaldoCuenta(db.Model):
         }
 
 
+class AlegraSaldoInicial(db.Model):
+    """Saldo de apertura por cuenta, cargado desde el 'Estado de situación
+    financiera' nativo de Alegra al corte anterior al primer mes con Libro
+    Diario cargado (ej. 31-dic del año anterior). Necesario porque
+    regenerar_snapshot_saldos_corte (balance.py) acumula auxiliar_contable
+    desde cero sin ningun concepto de apertura - confirmado con datos reales
+    de Maslux LED e Importadora NGC (2026-07-15/18) que esto rompe CxC/CxP/
+    patrimonio/retenciones por igual (no solo cuentas puntuales) para
+    cualquier cliente Alegra migrado a mitad de año fiscal. Ver
+    Docs_integracion/alegra_crear_tabla_saldos_iniciales.sql."""
+    __tablename__ = "alegra_saldos_iniciales"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+    fecha_corte_inicial = db.Column(db.Date, nullable=False)
+
+    cuenta_codigo = db.Column(db.String(30), nullable=False)
+    cuenta_nombre = db.Column(db.String(255))
+    saldo = db.Column(db.Numeric(18, 2), nullable=False)
+
+    archivo_origen = db.Column(db.String(255))
+    fecha_carga = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "idcliente", "fecha_corte_inicial", "cuenta_codigo",
+            name="uq_alegra_saldo_inicial_corte_cuenta",
+        ),
+    )
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "idcliente": self.idcliente,
+            "fecha_corte_inicial": self.fecha_corte_inicial.isoformat() if self.fecha_corte_inicial else None,
+            "cuenta_codigo": self.cuenta_codigo,
+            "cuenta_nombre": self.cuenta_nombre,
+            "saldo": float(self.saldo or 0),
+        }
+
+
 # ---------------------------------------------------------------------------
 # 4.3 Bloque operativo
 # ---------------------------------------------------------------------------
@@ -425,6 +466,7 @@ class AlegraNotaCredito(db.Model):
     total_applied = db.Column(db.Numeric(18, 2))
     cliente_id = db.Column(db.String(50))
     estado = db.Column(db.String(30))
+    stamp = db.Column(JSONB)          # CUFE / estado DIAN, mismo shape que alegra_facturas.stamp - null si no es electronica
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     facturas_afectadas = db.relationship(

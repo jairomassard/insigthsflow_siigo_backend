@@ -100,6 +100,7 @@ def sync_notas_credito_desde_alegra(idcliente: int) -> str:
         nota.total_applied = cn.get("totalApplied")
         nota.cliente_id = str(cliente.get("id")) if cliente.get("id") is not None else None
         nota.estado = cn.get("status")
+        nota.stamp = cn.get("stamp")
 
         AlegraNotaCreditoFactura.query.filter_by(nota_credito_id=nota.id).delete()
         for factura_ref in cn.get("invoices") or []:

@@ -2367,22 +2367,20 @@ def _clasificar_match(encontrado, dian_monto, siigo_monto, tolerancia=2.0):
 def construir_cruce_dian(idcliente, desde, hasta):
     """Cruce documento-por-documento entre lo reportado por la DIAN
     (dian_documentos, cargado desde el export de facturacion electronica)
-    y lo que ya esta sincronizado de Siigo (facturas, notas credito,
-    compras). Solo Siigo por ahora (ver limitaciones de Alegra en el
-    diseno: NIT no vive en la cabecera y el CUFE esta sin parsear en
-    stamp/JSONB)."""
+    y lo que ya esta sincronizado de Siigo o Alegra (facturas, notas
+    credito, compras) - ver construir_cruce_dian_alegra para la version
+    Alegra."""
 
     proveedor = _proveedor_datos_cliente(idcliente)
+    if proveedor == "alegra":
+        return construir_cruce_dian_alegra(idcliente, desde, hasta)
     if proveedor != "siigo":
         return {
             "proveedor_datos": proveedor,
             "implementado": False,
             "mensaje": (
                 "El cruce documento-por-documento contra la DIAN todavia "
-                "solo esta construido para clientes Siigo. Para Alegra "
-                "falta resolver el NIT a nivel de cabecera y extraer el "
-                "CUFE del campo stamp (ver docstring de "
-                "construir_cruce_iva_alegra)."
+                "no esta construido para este sistema contable."
             ),
         }
 
@@ -2749,6 +2747,221 @@ def construir_cruce_dian(idcliente, desde, hasta):
     resultado["documento_soporte"] = _resumen_cruce(detalle_ds, extra_ds)
 
     resultado["proveedor_datos"] = proveedor
+    resultado["implementado"] = True
+    resultado["cobertura_dian_hasta"] = cobertura_dian_hasta.isoformat() if cobertura_dian_hasta else None
+    return resultado
+
+
+def construir_cruce_dian_alegra(idcliente, desde, hasta):
+    """Version Alegra del Cruce DIAN. Validado con datos reales de Maslux LED
+    (idcliente=16, export DIAN mayo-junio 2026) 2026-07-18.
+
+    A diferencia de Siigo, ventas y notas credito se cruzan por CUFE REAL
+    (alegra_facturas.stamp/alegra_notas_credito.stamp, ambos ->>'cufe') en
+    vez de parsear el folio - llave mas confiable, y sin necesidad de
+    reconstruir consecutivo/sucursal. Confirmado con dato real que el CUFE de
+    alegra_facturas.stamp coincide exacto contra la columna CUFE/CUDE de la
+    DIAN para el mismo documento. Notas credito necesitaban esta misma
+    columna agregada (ver Docs_integracion/alegra_agregar_stamp_notas_credito.sql
+    y alegra_backfill_stamp_notas_credito.py) - antes de esta sesion
+    alegra_notas_credito no la capturaba aunque el JSON crudo de
+    /credit-notes SI la trae (mismo shape que /invoices).
+
+    Compras se cruza por (NIT proveedor, factura_proveedor) igual que Siigo,
+    pero SIN guion entre prefijo y folio: Alegra concatena
+    numberTemplate.fullNumber directo (confirmado con datos reales de
+    Maslux: 'FEBQ5113424' = prefijo 'FEBQ' + folio '5113424' de la DIAN,
+    sin separador - a diferencia de Siigo, que arma la llave con guion).
+    IVA descontable por compra se reconstruye de alegra_compra_items.tax
+    (mismo patron ya usado en construir_cruce_iva_alegra), no del campo
+    `total` cacheado.
+
+    No hay bucket de "Documento soporte": los clientes Alegra probados no
+    tienen ese tipo de documento en su export DIAN (todas las compras entran
+    como Factura electronica). "Application response" (acuse DIAN sin valor
+    contable) y notas credito RECIBIDAS de proveedor (sin entidad propia
+    todavia en este sistema) se excluyen del bucket de compras, mismo
+    criterio ya aplicado en la version Siigo."""
+    from sqlalchemy import text
+
+    cobertura_dian_hasta = db.session.query(func.max(DianDocumento.fecha_emision)).filter(
+        DianDocumento.idcliente == idcliente
+    ).scalar()
+
+    docs_dian = DianDocumento.query.filter(
+        DianDocumento.idcliente == idcliente,
+        DianDocumento.fecha_emision.between(desde, hasta),
+    ).all()
+
+    por_tipo_grupo = {}
+    for d in docs_dian:
+        por_tipo_grupo.setdefault((d.tipo_documento, d.grupo), []).append(d)
+
+    resultado = {}
+
+    # ---------- Facturas de venta (match por CUFE) ----------
+    facturas_dian = por_tipo_grupo.get(("Factura electrónica", "Emitido"), [])
+
+    sql_facturas = text("""
+        SELECT f.id, f.alegra_id, f.fecha, f.subtotal, f.impuestos_total,
+               f.stamp->>'cufe' AS cufe, f.tercero_nombre,
+               t.identificacion AS tercero_nit
+        FROM alegra_facturas f
+        LEFT JOIN alegra_terceros t
+            ON t.idcliente = f.idcliente AND t.alegra_id = f.tercero_id
+        WHERE f.idcliente = :idc AND f.fecha BETWEEN :d AND :h
+    """)
+    facturas_alegra = db.session.execute(
+        sql_facturas, {"idc": idcliente, "d": desde, "h": hasta}
+    ).mappings().all()
+    facturas_por_cufe = {f["cufe"]: f for f in facturas_alegra if f["cufe"]}
+
+    detalle_ventas = []
+    usados_ventas = set()
+    for d in facturas_dian:
+        match = facturas_por_cufe.get(d.cufe)
+        iva_match = float(match["impuestos_total"] or 0) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.iva or 0), iva_match)
+        if match:
+            usados_ventas.add(match["id"])
+        detalle_ventas.append({
+            "cufe": d.cufe, "folio": f"{d.prefijo or ''}{d.folio or ''}",
+            "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_receptor, "tercero_nombre": d.nombre_receptor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match["alegra_id"] if match else None,
+            "iva_siigo": iva_match,
+            "total_siigo": (float(match["subtotal"] or 0) + float(match["impuestos_total"] or 0)) if match else None,
+            "estado": estado_match,
+            "match_debil": False,
+            "siigo_folio_real": None,
+        })
+
+    extra_ventas = [
+        {"siigo_id": f["alegra_id"], "fecha": f["fecha"].isoformat() if f["fecha"] else None,
+         "tercero_nit": f["tercero_nit"], "tercero_nombre": f["tercero_nombre"],
+         "iva_siigo": float(f["impuestos_total"] or 0),
+         "total_siigo": float(f["subtotal"] or 0) + float(f["impuestos_total"] or 0)}
+        for f in facturas_alegra if f["id"] not in usados_ventas
+    ]
+
+    resultado["ventas"] = _resumen_cruce(detalle_ventas, extra_ventas)
+
+    # ---------- Notas crédito de venta (match por CUFE) ----------
+    notas_dian = por_tipo_grupo.get(("Nota de crédito electrónica", "Emitido"), [])
+
+    sql_notas = text("""
+        SELECT n.id, n.alegra_id, n.fecha, n.subtotal, n.impuestos_total, n.total,
+               n.stamp->>'cufe' AS cufe,
+               t.nombre AS tercero_nombre, t.identificacion AS tercero_nit
+        FROM alegra_notas_credito n
+        LEFT JOIN alegra_terceros t
+            ON t.idcliente = n.idcliente AND t.alegra_id = n.cliente_id
+        WHERE n.idcliente = :idc AND n.fecha BETWEEN :d AND :h
+    """)
+    notas_alegra = db.session.execute(
+        sql_notas, {"idc": idcliente, "d": desde, "h": hasta}
+    ).mappings().all()
+    notas_por_cufe = {n["cufe"]: n for n in notas_alegra if n["cufe"]}
+
+    detalle_notas = []
+    usados_notas = set()
+    for d in notas_dian:
+        match = notas_por_cufe.get(d.cufe)
+        iva_match = float(match["impuestos_total"] or 0) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.iva or 0), iva_match)
+        if match:
+            usados_notas.add(match["id"])
+        detalle_notas.append({
+            "cufe": d.cufe, "folio": d.folio, "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_receptor, "tercero_nombre": d.nombre_receptor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match["alegra_id"] if match else None,
+            "iva_siigo": iva_match,
+            "total_siigo": float(match["total"] or 0) if match else None,
+            "estado": estado_match,
+        })
+
+    extra_notas = [
+        {"siigo_id": n["alegra_id"], "fecha": n["fecha"].isoformat() if n["fecha"] else None,
+         "tercero_nit": n["tercero_nit"], "tercero_nombre": n["tercero_nombre"],
+         "iva_siigo": float(n["impuestos_total"] or 0), "total_siigo": float(n["total"] or 0)}
+        for n in notas_alegra if n["id"] not in usados_notas
+    ]
+
+    resultado["notas_credito"] = _resumen_cruce(detalle_notas, extra_notas)
+
+    # ---------- Facturas de compra (match por NIT + factura_proveedor, sin guion) ----------
+    compras_dian = [
+        d for (tipo, grupo), docs in por_tipo_grupo.items()
+        if grupo == "Recibido" and tipo not in ("Application response", "Nota de crédito electrónica")
+        for d in docs
+    ]
+
+    sql_compras = text("""
+        SELECT c.id, c.alegra_id, c.fecha, c.factura_proveedor, c.total,
+               c.proveedor_nombre, t.identificacion AS proveedor_nit
+        FROM alegra_compras c
+        LEFT JOIN alegra_terceros t
+            ON t.idcliente = c.idcliente AND t.alegra_id = c.proveedor_id
+        WHERE c.idcliente = :idc AND c.fecha BETWEEN :d AND :h
+    """)
+    compras_alegra = db.session.execute(
+        sql_compras, {"idc": idcliente, "d": desde, "h": hasta}
+    ).mappings().all()
+
+    sql_iva_compras = text("""
+        SELECT c.id AS compra_id, COALESCE(SUM((t->>'amount')::numeric), 0) AS iva
+        FROM alegra_compra_items i
+        JOIN alegra_compras c ON c.id = i.compra_id
+        CROSS JOIN LATERAL jsonb_array_elements(i.tax) AS t
+        WHERE c.idcliente = :idc AND c.fecha BETWEEN :d AND :h
+          AND jsonb_typeof(i.tax) = 'array' AND t->>'type' = 'IVA'
+        GROUP BY c.id
+    """)
+    iva_por_compra = {
+        r["compra_id"]: float(r["iva"] or 0)
+        for r in db.session.execute(sql_iva_compras, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    }
+
+    compras_por_key = {}
+    for c in compras_alegra:
+        key = (str(c["proveedor_nit"] or "").strip(), str(c["factura_proveedor"] or "").strip().upper())
+        compras_por_key[key] = c
+
+    detalle_compras = []
+    usados_compras = set()
+    for d in compras_dian:
+        key = (str(d.nit_emisor or "").strip(), f"{d.prefijo or ''}{d.folio or ''}".strip().upper())
+        match = compras_por_key.get(key)
+        iva_match = iva_por_compra.get(match["id"], 0.0) if match else None
+        estado_match = _clasificar_match(bool(match), float(d.iva or 0), iva_match)
+        if match:
+            usados_compras.add(match["id"])
+        detalle_compras.append({
+            "cufe": d.cufe, "folio": f"{d.prefijo or ''}{d.folio or ''}",
+            "fecha": d.fecha_emision.isoformat() if d.fecha_emision else None,
+            "tercero_nit": d.nit_emisor, "tercero_nombre": d.nombre_emisor,
+            "iva_dian": float(d.iva or 0), "total_dian": float(d.total or 0),
+            "siigo_id": match["alegra_id"] if match else None,
+            "iva_siigo": iva_match,
+            "total_siigo": float(match["total"] or 0) if match else None,
+            "estado": estado_match,
+            "match_debil": False,
+            "siigo_folio_real": None,
+        })
+
+    extra_compras = [
+        {"siigo_id": c["alegra_id"], "fecha": c["fecha"].isoformat() if c["fecha"] else None,
+         "tercero_nit": c["proveedor_nit"], "tercero_nombre": c["proveedor_nombre"],
+         "iva_siigo": iva_por_compra.get(c["id"], 0.0),
+         "total_siigo": float(c["total"] or 0)}
+        for c in compras_alegra if c["id"] not in usados_compras
+    ]
+
+    resultado["compras"] = _resumen_cruce(detalle_compras, extra_compras)
+
+    resultado["proveedor_datos"] = "alegra"
     resultado["implementado"] = True
     resultado["cobertura_dian_hasta"] = cobertura_dian_hasta.isoformat() if cobertura_dian_hasta else None
     return resultado
@@ -18801,6 +19014,109 @@ def create_app():
             db.session.rollback()
             return jsonify({"error": str(e)}), 500
 
+
+    # Carga del "Estado de situación financiera" nativo de Alegra como saldo
+    # de apertura (ver models_alegra.AlegraSaldoInicial y balance.py). El
+    # export trae varias filas de título/metadata antes del encabezado real
+    # (confirmado con archivos reales de Maslux LED 2026-07-18: 7 filas antes
+    # de "Código"/"Cuenta contable") y es un reporte COMPARATIVO (dos años en
+    # el mismo archivo, ej. columnas "31 Dic, 2025" y "31 Dic, 2024") - por
+    # eso el frontend manda `fecha_corte_inicial` explícito y el backend
+    # busca la columna cuyo encabezado contenga ese año, en vez de asumir
+    # que la primera columna de valores es la que se quiere. Filas sin
+    # "Código" (subtotales de grupo tipo "Activos corrientes", "Total
+    # activos") se ignoran - mismo criterio ya usado en el resto del
+    # proyecto para estos exports nativos.
+    @app.route("/alegra/cargar_saldos_iniciales", methods=["POST"])
+    @jwt_required()
+    def cargar_saldos_iniciales_alegra():
+        import pandas as pd
+
+        idcliente = get_jwt().get("idcliente")
+        file = request.files.get("archivo")
+        fecha_corte_raw = request.form.get("fecha_corte_inicial")
+        if not file:
+            return jsonify({"error": "No hay archivo"}), 400
+        if not fecha_corte_raw:
+            return jsonify({"error": "Falta fecha_corte_inicial (la fecha 'al' del export, ej. 2024-12-31)"}), 400
+
+        try:
+            fecha_corte_inicial = pd.to_datetime(fecha_corte_raw).date()
+        except Exception:
+            return jsonify({"error": "fecha_corte_inicial inválida, usa formato AAAA-MM-DD"}), 400
+
+        try:
+            from models_alegra import AlegraSaldoInicial
+
+            crudo = pd.read_excel(file, header=None, engine="calamine")
+            fila_header = None
+            for i in range(min(15, len(crudo))):
+                valores = [str(v).strip() for v in crudo.iloc[i].tolist()]
+                if "Código" in valores and "Cuenta contable" in valores:
+                    fila_header = i
+                    break
+            if fila_header is None:
+                return jsonify({
+                    "error": "No se encontró el encabezado esperado (Código / Cuenta contable) - "
+                             "¿es un export de 'Estado de situación financiera' de Alegra?"
+                }), 400
+
+            file.stream.seek(0)
+            df = pd.read_excel(file, header=fila_header, engine="calamine")
+            df.columns = [str(c).strip() for c in df.columns]
+
+            anio_corte = str(fecha_corte_inicial.year)
+            columna_saldo = next(
+                (c for c in df.columns if anio_corte in c and "%" not in c and not c.lower().startswith("var")),
+                None,
+            )
+            if not columna_saldo:
+                return jsonify({
+                    "error": f"No se encontró una columna de saldo para el año {anio_corte} en el archivo.",
+                    "columnas_encontradas": list(df.columns),
+                }), 400
+
+            def clean_codigo(val):
+                if val is None or pd.isna(val):
+                    return None
+                s = str(val).strip()
+                return (s[:-2] if s.endswith(".0") else s) or None
+
+            def clean_num(val):
+                if val is None or pd.isna(val):
+                    return 0.0
+                return float(val)
+
+            lista_mapeada = []
+            for _, row in df.iterrows():
+                codigo = clean_codigo(row.get("Código"))
+                if not codigo:
+                    continue
+                lista_mapeada.append({
+                    "idcliente": idcliente,
+                    "fecha_corte_inicial": fecha_corte_inicial,
+                    "cuenta_codigo": codigo,
+                    "cuenta_nombre": str(row.get("Cuenta contable") or "").strip(),
+                    "saldo": clean_num(row.get(columna_saldo)),
+                    "archivo_origen": file.filename,
+                })
+
+            AlegraSaldoInicial.query.filter_by(
+                idcliente=idcliente, fecha_corte_inicial=fecha_corte_inicial
+            ).delete()
+            if lista_mapeada:
+                db.session.bulk_insert_mappings(AlegraSaldoInicial, lista_mapeada)
+            db.session.commit()
+
+            return jsonify({
+                "ok": True,
+                "fecha_corte_inicial": fecha_corte_inicial.isoformat(),
+                "columna_usada": columna_saldo,
+                "cuentas_cargadas": len(lista_mapeada),
+            }), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": str(e)}), 500
 
 
     @app.route("/reportes/cruce_iva_v2", methods=["GET"])
