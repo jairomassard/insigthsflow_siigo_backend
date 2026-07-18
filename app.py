@@ -2396,9 +2396,11 @@ def construir_cruce_dian(idcliente, desde, hasta):
     # proposito NO se usa para filtrar/ocultar esos resultados - el
     # usuario prefirio verlos igual, como recordatorio de que el reporte
     # DIAN necesita actualizarse.
-    cobertura_dian_hasta = db.session.query(func.max(DianDocumento.fecha_emision)).filter(
+    cobertura_dian_desde, cobertura_dian_hasta = db.session.query(
+        func.min(DianDocumento.fecha_emision), func.max(DianDocumento.fecha_emision)
+    ).filter(
         DianDocumento.idcliente == idcliente
-    ).scalar()
+    ).first()
 
     docs_dian = DianDocumento.query.filter(
         DianDocumento.idcliente == idcliente,
@@ -2751,6 +2753,7 @@ def construir_cruce_dian(idcliente, desde, hasta):
 
     resultado["proveedor_datos"] = proveedor
     resultado["implementado"] = True
+    resultado["cobertura_dian_desde"] = cobertura_dian_desde.isoformat() if cobertura_dian_desde else None
     resultado["cobertura_dian_hasta"] = cobertura_dian_hasta.isoformat() if cobertura_dian_hasta else None
     return resultado
 
@@ -2787,9 +2790,11 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
     criterio ya aplicado en la version Siigo."""
     from sqlalchemy import text
 
-    cobertura_dian_hasta = db.session.query(func.max(DianDocumento.fecha_emision)).filter(
+    cobertura_dian_desde, cobertura_dian_hasta = db.session.query(
+        func.min(DianDocumento.fecha_emision), func.max(DianDocumento.fecha_emision)
+    ).filter(
         DianDocumento.idcliente == idcliente
-    ).scalar()
+    ).first()
 
     docs_dian = DianDocumento.query.filter(
         DianDocumento.idcliente == idcliente,
@@ -2966,6 +2971,7 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
 
     resultado["proveedor_datos"] = "alegra"
     resultado["implementado"] = True
+    resultado["cobertura_dian_desde"] = cobertura_dian_desde.isoformat() if cobertura_dian_desde else None
     resultado["cobertura_dian_hasta"] = cobertura_dian_hasta.isoformat() if cobertura_dian_hasta else None
     return resultado
 
