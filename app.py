@@ -13,7 +13,7 @@ from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_per
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte, DianDocumento
-from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog
+from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog, AlegraSyncConfig
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
 from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
 from flask_cors import CORS
@@ -7452,6 +7452,123 @@ def create_app():
 
         return jsonify({"message": "Credenciales de Alegra guardadas correctamente."}), 200
 
+    # Programacion automatica (espejo de /config/sync y /config/siigo-sync-status,
+    # pero contra AlegraSyncConfig). No hay campo "fecha inicial de datos" aqui a
+    # diferencia de Siigo - sync_completo_desde_alegra no tiene ese parametro,
+    # el sync de Alegra siempre trae todo el historico la primera vez y despues
+    # es incremental por su cuenta (ver alegra_sync_all.py). El disparo real
+    # ocurre desde cron_sync.py (servicio Cron dedicado en Railway, corre cada
+    # hora), no hay nada dentro de este proceso web que dispare esto solo.
+    @app.route("/config/alegra-sync", methods=["GET"])
+    @jwt_required()
+    def get_alegra_sync_config():
+        idcliente, error = _resolver_idcliente_alegra(get_jwt())
+        if error:
+            return error
+
+        config = AlegraSyncConfig.query.filter_by(idcliente=idcliente).first()
+
+        if not config:
+            return jsonify({
+                "idcliente": idcliente,
+                "hora_ejecucion": None,
+                "frecuencia_dias": 1,
+                "activo": False,
+                "ultimo_ejecutado": None,
+                "ultimo_auto_ejecutado": None,
+                "resultado_ultima_sync": None,
+                "detalle_ultima_sync": None,
+                "created_at": None,
+            }), 200
+
+        return jsonify(config.as_dict()), 200
+
+    @app.route("/config/alegra-sync", methods=["POST"])
+    @jwt_required()
+    def save_alegra_sync_config():
+        idcliente, error = _resolver_idcliente_alegra(get_jwt())
+        if error:
+            return error
+
+        data = request.get_json() or {}
+
+        hora_ejecucion = _parse_time_hh_mm(data.get("hora_ejecucion") or "05:00")
+        frecuencia_dias_raw = data.get("frecuencia_dias", 1)
+        activo_raw = data.get("activo", True)
+
+        try:
+            frecuencia_dias = int(frecuencia_dias_raw or 1)
+            if frecuencia_dias < 1:
+                frecuencia_dias = 1
+        except Exception:
+            frecuencia_dias = 1
+
+        config = AlegraSyncConfig.query.filter_by(idcliente=idcliente).first()
+
+        if not config:
+            config = AlegraSyncConfig(
+                idcliente=idcliente,
+                hora_ejecucion=hora_ejecucion,
+                frecuencia_dias=frecuencia_dias,
+                activo=bool(activo_raw),
+            )
+        else:
+            config.hora_ejecucion = hora_ejecucion
+            config.frecuencia_dias = frecuencia_dias
+            config.activo = bool(activo_raw)
+
+        db.session.add(config)
+        db.session.commit()
+
+        return jsonify({
+            "mensaje": "Configuración guardada",
+            "config": config.as_dict(),
+        }), 200
+
+    @app.route("/config/alegra-sync-status", methods=["GET"])
+    @jwt_required()
+    def get_alegra_sync_status():
+        idcliente, error = _resolver_idcliente_alegra(get_jwt())
+        if error:
+            return error
+
+        cliente = db.session.get(Cliente, idcliente)
+        tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
+
+        config = AlegraSyncConfig.query.filter_by(idcliente=idcliente).first()
+
+        if not config:
+            return jsonify({
+                "ultimo_ejec": None,
+                "ultimo_auto_ejec": None,
+                "resultado": None,
+                "detalle": "",
+                "hora_ejecucion": None,
+                "frecuencia_dias": 1,
+                "activo": False,
+                "timezone": tz_str,
+            }), 200
+
+        ultimo_ejec = (
+            utc_to_local(config.ultimo_ejecutado, tz_str).isoformat()
+            if config.ultimo_ejecutado else None
+        )
+        ultimo_auto_ejec = (
+            utc_to_local(config.ultimo_auto_ejecutado, tz_str).isoformat()
+            if config.ultimo_auto_ejecutado else None
+        )
+
+        return jsonify({
+            "ultimo_ejec": ultimo_ejec,
+            "ultimo_auto_ejec": ultimo_auto_ejec,
+            "resultado": config.resultado_ultima_sync,
+            "detalle": config.detalle_ultima_sync or "",
+            "hora_ejecucion": config.hora_ejecucion.strftime("%H:%M") if config.hora_ejecucion else None,
+            "frecuencia_dias": config.frecuencia_dias,
+            "activo": config.activo,
+            "timezone": tz_str,
+        }), 200
+
     @app.route("/alegra/test_auth", methods=["POST"])
     @jwt_required()
     def alegra_test_auth():
@@ -7482,7 +7599,7 @@ def create_app():
         except Exception:
             return datetime.utcnow()
 
-    def _correr_alegra_sync_en_segundo_plano(idcliente, log_id):
+    def _correr_alegra_sync_en_segundo_plano(idcliente, log_id, es_cron=False):
         # Corre en un thread aparte, fuera del ciclo de vida de la peticion
         # HTTP original - evita que un proxy/gateway corte la conexion antes
         # de que termine (confirmado 2026-07-10: paso exactamente eso con un
@@ -7513,6 +7630,21 @@ def create_app():
                 logrec.ejecutado_en = _hora_local_cliente(idcliente)
                 db.session.commit()
 
+            # Refleja el resultado REAL (no solo "se encolo") en la tarjeta de
+            # Programacion Automatica - a diferencia de Siigo (sync sincrono,
+            # se actualiza dentro del propio endpoint), aqui el sync corre en
+            # este hilo de fondo, asi que este es el unico lugar donde ya se
+            # conoce el resultado final.
+            config = AlegraSyncConfig.query.filter_by(idcliente=idcliente).first()
+            if config:
+                ahora = datetime.utcnow()
+                config.ultimo_ejecutado = ahora
+                if es_cron:
+                    config.ultimo_auto_ejecutado = ahora
+                config.resultado_ultima_sync = resumen["resultado"]
+                config.detalle_ultima_sync = resumen["detalle"][:2000]
+                db.session.commit()
+
     @app.route("/alegra/sync-all", methods=["POST"])
     @jwt_required()
     def alegra_sync_all_route():
@@ -7532,6 +7664,11 @@ def create_app():
                 "log_id": en_curso.id,
             }), 409
 
+        data = request.get_json(silent=True) or {}
+        origen = data.get("origen", "manual")
+        if origen not in ("manual", "cron"):
+            origen = "manual"
+
         ahora_local = _hora_local_cliente(idcliente)
 
         logrec = AlegraSyncLog(
@@ -7540,7 +7677,7 @@ def create_app():
             ejecutado_en=None,
             resultado="EN_EJECUCION",
             detalle="Sincronización en curso...",
-            origen="manual",
+            origen=origen,
             total_pasos=0,
             pasos_ok=0,
             pasos_error=0,
@@ -7550,7 +7687,7 @@ def create_app():
 
         hilo = threading.Thread(
             target=_correr_alegra_sync_en_segundo_plano,
-            args=(idcliente, logrec.id),
+            args=(idcliente, logrec.id, origen == "cron"),
             daemon=True,
         )
         hilo.start()

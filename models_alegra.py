@@ -65,6 +65,12 @@ class AlegraSyncConfig(db.Model):
     frecuencia_dias = db.Column(db.Integer, default=1)
     activo = db.Column(db.Boolean, default=True)
     ultimo_ejecutado = db.Column(db.DateTime(timezone=True))
+    # Distingue "ultima vez que corrio, manual o cron" (ultimo_ejecutado) de
+    # "ultima vez que corrio EL CRON especificamente" (este campo) - necesario
+    # para que cron_sync.py sepa si ya cumplio su ejecucion automatica de hoy
+    # sin que un clic manual del usuario la tape. Mismo patron que
+    # SiigoSyncConfig.ultimo_auto_ejecutado.
+    ultimo_auto_ejecutado = db.Column(db.DateTime(timezone=True))
     resultado_ultima_sync = db.Column(db.Text)
     detalle_ultima_sync = db.Column(db.Text)
     sync_fecha_desde = db.Column(db.Date, nullable=True)
@@ -78,6 +84,7 @@ class AlegraSyncConfig(db.Model):
             "frecuencia_dias": self.frecuencia_dias,
             "activo": self.activo,
             "ultimo_ejecutado": self.ultimo_ejecutado.isoformat() if self.ultimo_ejecutado else None,
+            "ultimo_auto_ejecutado": self.ultimo_auto_ejecutado.isoformat() if self.ultimo_auto_ejecutado else None,
             "resultado_ultima_sync": self.resultado_ultima_sync,
             "detalle_ultima_sync": self.detalle_ultima_sync,
             "sync_fecha_desde": self.sync_fecha_desde.isoformat() if self.sync_fecha_desde else None,
