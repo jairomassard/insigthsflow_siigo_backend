@@ -2810,6 +2810,12 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
     # ---------- Facturas de venta (match por CUFE) ----------
     facturas_dian = por_tipo_grupo.get(("Factura electrónica", "Emitido"), [])
 
+    # estado NOT IN ('void','draft'): mismo criterio ya aplicado en
+    # facturas_enriquecidas/ventas_movimientos_enriquecidos (ver
+    # Docs_integracion/alegra_excluir_facturas_void_draft.sql) - sin este
+    # filtro, una factura anulada o en borrador (sin CUFE real, nunca
+    # reportada a la DIAN) aparecia igual en "Extra en Alegra", como si
+    # fuera un documento real no reportado.
     sql_facturas = text("""
         SELECT f.id, f.alegra_id, f.fecha, f.subtotal, f.impuestos_total,
                f.stamp->>'cufe' AS cufe, f.tercero_nombre,
@@ -2818,6 +2824,7 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
         LEFT JOIN alegra_terceros t
             ON t.idcliente = f.idcliente AND t.alegra_id = f.tercero_id
         WHERE f.idcliente = :idc AND f.fecha BETWEEN :d AND :h
+          AND f.estado NOT IN ('void', 'draft')
     """)
     facturas_alegra = db.session.execute(
         sql_facturas, {"idc": idcliente, "d": desde, "h": hasta}
@@ -2866,6 +2873,7 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
         LEFT JOIN alegra_terceros t
             ON t.idcliente = n.idcliente AND t.alegra_id = n.cliente_id
         WHERE n.idcliente = :idc AND n.fecha BETWEEN :d AND :h
+          AND COALESCE(n.estado, 'open') <> 'void'
     """)
     notas_alegra = db.session.execute(
         sql_notas, {"idc": idcliente, "d": desde, "h": hasta}
@@ -2913,6 +2921,7 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
         LEFT JOIN alegra_terceros t
             ON t.idcliente = c.idcliente AND t.alegra_id = c.proveedor_id
         WHERE c.idcliente = :idc AND c.fecha BETWEEN :d AND :h
+          AND c.estado <> 'void'
     """)
     compras_alegra = db.session.execute(
         sql_compras, {"idc": idcliente, "d": desde, "h": hasta}
@@ -2924,6 +2933,7 @@ def construir_cruce_dian_alegra(idcliente, desde, hasta):
         JOIN alegra_compras c ON c.id = i.compra_id
         CROSS JOIN LATERAL jsonb_array_elements(i.tax) AS t
         WHERE c.idcliente = :idc AND c.fecha BETWEEN :d AND :h
+          AND c.estado <> 'void'
           AND jsonb_typeof(i.tax) = 'array' AND t->>'type' = 'IVA'
         GROUP BY c.id
     """)
