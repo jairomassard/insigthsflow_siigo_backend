@@ -4677,6 +4677,19 @@ def _cliente_as_dict_con_paquete(cliente):
     return data
 
 
+# Permisos que un paquete incluye contractualmente, pero que NO se
+# auto-otorgan al crear o cambiar de paquete a un cliente Alegra - quedan
+# disponibles para que el admin del cliente los habilite el mismo desde
+# Perfiles si de verdad los necesita, en vez de aparecer prendidos por
+# defecto. Motivo: Nomina para Alegra se sube manualmente por Excel (no hay
+# sync automatico como en Siigo), asi que no tiene sentido mostrarlo activo
+# desde el dia 1 sin que el cliente lo haya pedido. No afecta el techo de
+# permisos contratados (obtener_codigos_permitidos_cliente en
+# licenciamiento.py) - el admin SI puede prenderlo despues manualmente,
+# esto solo evita el auto-otorgamiento inicial/al resincronizar paquete.
+PERMISOS_OPCIONALES_ALEGRA = {"ver_reporte_nomina"}
+
+
 def _obtener_codigos_paquete(idpaquete):
     """
     Obtiene los códigos de permisos activos configurados para un paquete.
@@ -4727,6 +4740,12 @@ def _sincronizar_permisos_paquete_cliente(idcliente, paquete):
     from sqlalchemy import func
 
     codigos_permitidos = _obtener_codigos_paquete(paquete.idpaquete)
+
+    fuente = FuenteDatosCliente.query.filter_by(idcliente=idcliente).first()
+    if fuente and fuente.proveedor == "alegra":
+        codigos_permitidos = [
+            c for c in codigos_permitidos if c not in PERMISOS_OPCIONALES_ALEGRA
+        ]
 
     if not codigos_permitidos:
         return {
@@ -6668,7 +6687,19 @@ def create_app():
             # =====================================================
             # 4. Obtener códigos permitidos por paquetes contratados
             # =====================================================
+            # proveedor_datos se calcula aqui (adelantado del paso 9) porque
+            # ya viene en el payload del request desde el inicio - se
+            # necesita antes de crear los permisos, no despues.
+            proveedor_datos = str(data.get("proveedor_datos") or "siigo").strip().lower()
+            if proveedor_datos not in ("siigo", "alegra"):
+                proveedor_datos = "siigo"
+
             codigos_permitidos = obtener_codigos_permitidos_cliente(cliente.idcliente)
+
+            if proveedor_datos == "alegra":
+                codigos_permitidos = {
+                    c for c in codigos_permitidos if c not in PERMISOS_OPCIONALES_ALEGRA
+                }
 
             if not codigos_permitidos:
                 db.session.rollback()
@@ -6785,11 +6816,9 @@ def create_app():
             #    logica de reportes) le corresponde a este cliente. Un
             #    cliente tiene un unico proveedor (unique=True en idcliente
             #    de fuente_datos_cliente) - no se soporta doble fuente.
+            #    (proveedor_datos ya se calculo en el paso 4, antes de crear
+            #    los permisos)
             # =====================================================
-            proveedor_datos = str(data.get("proveedor_datos") or "siigo").strip().lower()
-            if proveedor_datos not in ("siigo", "alegra"):
-                proveedor_datos = "siigo"
-
             db.session.add(FuenteDatosCliente(
                 idcliente=cliente.idcliente,
                 proveedor=proveedor_datos,
