@@ -10072,6 +10072,26 @@ def create_app():
             # - incluye_impuesto = false => subtotal
             campo_valor = "total" if incluye_impuesto else "subtotal"
 
+            # "Pagado" para Alegra: confirmado con datos reales 2026-07-21
+            # (Maslux, factura CENCOSUD alegra_id=271) que "total - saldo"
+            # cuenta como "pagado" cualquier reduccion de saldo, incluida la
+            # que viene de una nota credito aplicada (af.total_paid=0, la
+            # nota credito cubrio $180.650.712 y el saldo bajo a 0 - pero
+            # "total - saldo" reportaba los $180.729.988 completos como
+            # pagados). af.total_paid (columna pagos_total en la vista) SI
+            # es el pago real, sin mezclar notas credito. Para Siigo, el
+            # propio campo `pagos_total` que entrega la API (suma de
+            # `payments[].value`) YA viene mezclado con aplicaciones de nota
+            # credito en el origen (confirmado con Binaria) - no hay todavia
+            # una forma confiable de separarlos, asi que el lado Siigo se
+            # deja con la formula de siempre hasta investigarlo aparte.
+            proveedor_datos_cliente = _proveedor_datos_cliente(idcliente)
+
+            if proveedor_datos_cliente == "alegra":
+                formula_pagado_b = "GREATEST(pagos_total_b, 0)"
+            else:
+                formula_pagado_b = "GREATEST(total_b - saldo_b, 0)"
+
             cte_common = f"""
                 WITH comp AS (
                     SELECT
@@ -10096,7 +10116,8 @@ def create_app():
                         COALESCE(m.impuestos_total, 0) AS impuestos_b,
                         COALESCE(m.total, 0) AS total_b,
                         COALESCE(m.{campo_valor}, 0) AS valor_siigo_b,
-                        COALESCE(m.saldo, 0) AS saldo_b
+                        COALESCE(m.saldo, 0) AS saldo_b,
+                        COALESCE(m.pagos_total, 0) AS pagos_total_b
 
                     FROM ventas_movimientos_enriquecidos m
                     WHERE {where_mov}
@@ -10118,7 +10139,7 @@ def create_app():
                         END AS saldo_b,
 
                         CASE
-                            WHEN tipo_movimiento = 'FACTURA' THEN GREATEST(total_b - saldo_b, 0)
+                            WHEN tipo_movimiento = 'FACTURA' THEN {formula_pagado_b}
                             ELSE 0
                         END AS pagado_b,
 
