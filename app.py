@@ -14250,12 +14250,18 @@ def create_app():
             condiciones.append("c.fecha <= :hasta")
             params["hasta"] = hasta
 
-        # --- Filtro por estado real de siigo_compras ---
+        # --- Filtro por estado, decidido por saldo (no por el texto crudo de
+        # `estado`): confirmado con datos reales 2026-07-21 que Siigo usa
+        # literalmente 'pagado'/'pendiente' pero Alegra usa 'closed'/'open' -
+        # con el filtro viejo (comparar contra el texto), CUALQUIER filtro de
+        # estado para un cliente Alegra devolvía cero filas. Mismo criterio ya
+        # aplicado en /reportes/facturas_proveedor.
         if estado:
             estado_norm = estado.strip().lower()
-            if estado_norm in ["pagado", "pendiente"]:
-                condiciones.append("LOWER(c.estado) = :estado")
-                params["estado"] = estado_norm
+            if estado_norm == "pagado":
+                condiciones.append("COALESCE(c.saldo, 0) <= 0")
+            elif estado_norm == "pendiente":
+                condiciones.append("COALESCE(c.saldo, 0) > 0")
 
         # --- Filtro por centro de costo ---
         if centro_costos:
@@ -14373,16 +14379,19 @@ def create_app():
                     END
                 ) AS documentos_con_ajuste,
 
-                -- Saldo limitado al total ajustado para evitar pendientes inflados
+                -- Saldo limitado al total ajustado para evitar pendientes
+                -- inflados. Antes esto solo sumaba cuando el texto crudo de
+                -- `estado` decia literalmente 'pendiente' - para Alegra
+                -- ('closed'/'open') esa condicion nunca se cumplia, asi que
+                -- total_saldo salia siempre en 0 y todo proveedor Alegra
+                -- aparecia 100% pagado sin importar el saldo real (bug real
+                -- encontrado 2026-07-21). LEAST(saldo, total) ya es correcto
+                -- por si solo, sin necesitar el filtro de estado.
                 SUM(
-                    CASE
-                        WHEN LOWER(COALESCE(c.estado, '')) = 'pendiente'
-                        THEN LEAST(
-                            COALESCE(c.saldo, 0),
-                            COALESCE(c.total_ajustado, c.total, 0)
-                        )
-                        ELSE 0
-                    END
+                    LEAST(
+                        COALESCE(c.saldo, 0),
+                        COALESCE(c.total_ajustado, c.total, 0)
+                    )
                 ) AS total_saldo,
 
                 MAX(c.fecha) AS ultima_fecha
