@@ -3597,6 +3597,22 @@ def _resolver_meta_eficiencia(config):
     return _round2(config.get("meta_eficiencia_operativa", 20.0))
 
 
+def _fecha_corte_inicial_alegra(idcliente, hasta):
+    # Mismo mecanismo que regenerar_snapshot_saldos_corte() en balance.py:
+    # clientes Alegra migrados a mitad de año no tienen en auxiliar_contable
+    # ningún saldo acumulado de años anteriores. Si hay un saldo inicial
+    # cargado (AlegraSaldoInicial) con fecha <= hasta, se usa como piso.
+    # Para Siigo (o Alegra sin saldo inicial) esta tabla esta vacia y el
+    # resultado es None, preservando el comportamiento de siempre.
+    from models_alegra import AlegraSaldoInicial
+    return db.session.query(
+        func.max(AlegraSaldoInicial.fecha_corte_inicial)
+    ).filter(
+        AlegraSaldoInicial.idcliente == idcliente,
+        AlegraSaldoInicial.fecha_corte_inicial <= hasta,
+    ).scalar()
+
+
 def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
     if not config:
         return {
@@ -3656,13 +3672,39 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
 
         where_cuentas = " OR ".join(condiciones)
 
-        sql = text(f"""
-            SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-              AND fecha_contable <= :hasta
-              AND ({where_cuentas})
-        """)
+        fecha_corte_inicial = _fecha_corte_inicial_alegra(idcliente, hasta)
+
+        if fecha_corte_inicial:
+            params["fci"] = fecha_corte_inicial
+            sql = text(f"""
+                WITH base AS (
+                    SELECT COALESCE(SUM(saldo), 0) AS saldo_inicial
+                    FROM alegra_saldos_iniciales
+                    WHERE idcliente = :idc
+                      AND fecha_corte_inicial = :fci
+                      AND ({where_cuentas})
+                ),
+                movimiento AS (
+                    SELECT COALESCE(SUM(debito - credito), 0) AS delta
+                    FROM auxiliar_contable
+                    WHERE idcliente = :idc
+                      AND fecha_contable > :fci
+                      AND fecha_contable <= :hasta
+                      AND ({where_cuentas})
+                )
+                SELECT
+                    (SELECT saldo_inicial FROM base) + (SELECT delta FROM movimiento)
+                    AS caja_actual
+            """)
+        else:
+            sql = text(f"""
+                SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
+                FROM auxiliar_contable
+                WHERE idcliente = :idc
+                  AND fecha_contable <= :hasta
+                  AND ({where_cuentas})
+            """)
+
         row = db.session.execute(sql, params).mappings().first()
         valor = _safe_float(row["caja_actual"] if row else 0)
 
@@ -3688,14 +3730,42 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                 params[key] = f"{codigo}%"
             filtro_exclusion = " AND " + " AND ".join(condiciones)
 
-        sql = text(f"""
-            SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
-            FROM auxiliar_contable
-            WHERE idcliente = :idc
-              AND fecha_contable <= :hasta
-              AND cuenta_codigo LIKE '11%'
-              {filtro_exclusion}
-        """)
+        fecha_corte_inicial = _fecha_corte_inicial_alegra(idcliente, hasta)
+
+        if fecha_corte_inicial:
+            params["fci"] = fecha_corte_inicial
+            sql = text(f"""
+                WITH base AS (
+                    SELECT COALESCE(SUM(saldo), 0) AS saldo_inicial
+                    FROM alegra_saldos_iniciales
+                    WHERE idcliente = :idc
+                      AND fecha_corte_inicial = :fci
+                      AND cuenta_codigo LIKE '11%'
+                      {filtro_exclusion}
+                ),
+                movimiento AS (
+                    SELECT COALESCE(SUM(debito - credito), 0) AS delta
+                    FROM auxiliar_contable
+                    WHERE idcliente = :idc
+                      AND fecha_contable > :fci
+                      AND fecha_contable <= :hasta
+                      AND cuenta_codigo LIKE '11%'
+                      {filtro_exclusion}
+                )
+                SELECT
+                    (SELECT saldo_inicial FROM base) + (SELECT delta FROM movimiento)
+                    AS caja_actual
+            """)
+        else:
+            sql = text(f"""
+                SELECT COALESCE(SUM(debito - credito), 0) AS caja_actual
+                FROM auxiliar_contable
+                WHERE idcliente = :idc
+                  AND fecha_contable <= :hasta
+                  AND cuenta_codigo LIKE '11%'
+                  {filtro_exclusion}
+            """)
+
         row = db.session.execute(sql, params).mappings().first()
         valor = _safe_float(row["caja_actual"] if row else 0)
 
@@ -3770,11 +3840,14 @@ def _calcular_cash_runway_parametrizado(idcliente, fecha_hasta, config, caja_inf
     if modo_runway == "egresos_promedio":
         desde_ref = _first_day_of_month(_shift_months(fecha_hasta, -(meses_promedio - 1)))
 
+        # compras_enriquecidas (no siigo_compras): une Siigo + Alegra - antes
+        # esto quedaba en 0 para cualquier cliente Alegra, sin importar la
+        # parametrizacion, porque siigo_compras solo tiene datos Siigo.
         sql = text("""
             SELECT
                 TO_CHAR(DATE_TRUNC('month', fecha), 'YYYY-MM') AS mes,
-                COALESCE(SUM(total), 0) AS egresos_mes
-            FROM siigo_compras
+                COALESCE(SUM(COALESCE(total_ajustado, total, 0)), 0) AS egresos_mes
+            FROM compras_enriquecidas
             WHERE idcliente = :idc
               AND fecha >= :desde
               AND fecha <= :hasta
