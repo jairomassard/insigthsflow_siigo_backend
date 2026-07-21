@@ -15663,8 +15663,16 @@ def create_app():
                 c.saldo,
                 c.cost_center,
                 c.centro_costo_nombre,
+                -- Se decide por saldo, no por el texto crudo de `estado`:
+                -- confirmado con datos reales (2026-07-21) que Siigo usa
+                -- literalmente 'pagado' pero Alegra usa 'closed'/'open' -
+                -- comparar contra 'pagado' dejaba TODA compra Alegra
+                -- marcada "No Pagada" sin importar el saldo real. saldo<=0
+                -- es la señal financiera confiable en ambos proveedores
+                -- (también corrige un puñado de casos Siigo donde el saldo
+                -- ya estaba en 0 pero el texto de estado no decía 'pagado').
                 CASE
-                    WHEN LOWER(COALESCE(c.estado, '')) = 'pagado' THEN 'Pagada'
+                    WHEN COALESCE(c.saldo, 0) <= 0 THEN 'Pagada'
                     ELSE 'No Pagada'
                 END AS estado
             FROM compras_enriquecidas c
