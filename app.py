@@ -14394,7 +14394,7 @@ def create_app():
                     )
                 ) AS total_saldo,
 
-                MAX(c.fecha) AS ultima_fecha
+                TO_CHAR(MAX(c.fecha)::date, 'YYYY-MM-DD') AS ultima_fecha
 
             FROM compras_enriquecidas c
             WHERE {where_sql}
@@ -14420,8 +14420,14 @@ def create_app():
                     c.factura_proveedor,
                     c.proveedor_identificacion,
                     c.proveedor_nombre,
-                    c.fecha,
-                    c.vencimiento,
+
+                    -- Se castea a texto ISO explicito: sin esto, Flask serializa
+                    -- un date/datetime crudo como RFC 822 ("Tue, 24 Mar 2026..."),
+                    -- que el frontend ya no puede parsear tras dejar de usar
+                    -- new Date() (ver nota en formatFecha() del frontend). Mismo
+                    -- patron ya usado en detalle_proveedor() de compras-gastos.
+                    TO_CHAR(c.fecha::date, 'YYYY-MM-DD') AS fecha,
+                    TO_CHAR(c.vencimiento::date, 'YYYY-MM-DD') AS vencimiento,
 
                     -- Total neto ajustado para compatibilidad con el frontend actual
                     COALESCE(c.total_ajustado, c.total, 0) AS total,
@@ -15680,9 +15686,15 @@ def create_app():
                 -- es la señal financiera confiable en ambos proveedores
                 -- (también corrige un puñado de casos Siigo donde el saldo
                 -- ya estaba en 0 pero el texto de estado no decía 'pagado').
+                -- Se agrega 'Parcial' para quedar coherente con las otras 2
+                -- páginas de compras (Egresos por Compras/Gastos y Compras a
+                -- Proveedores), que ya distinguen pago parcial de "nada
+                -- pagado" - esta página se había quedado con solo 2 estados.
                 CASE
+                    WHEN COALESCE(c.total, 0) <= 0 THEN 'Pagada'
                     WHEN COALESCE(c.saldo, 0) <= 0 THEN 'Pagada'
-                    ELSE 'No Pagada'
+                    WHEN COALESCE(c.saldo, 0) >= COALESCE(c.total, 0) THEN 'No Pagada'
+                    ELSE 'Parcial'
                 END AS estado
             FROM compras_enriquecidas c
             WHERE {where_sql}
