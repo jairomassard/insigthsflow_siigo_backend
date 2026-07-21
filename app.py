@@ -3618,29 +3618,35 @@ def _anchor_balance_prueba_siigo(idcliente, hasta):
     # datos reales 2026-07-21 que Binaria (cliente Siigo, "Caja disponible"
     # ya activo en producción) tenía el mismo problema que Alegra - su
     # auxiliar_contable arranca en 2024-01-03 sin ningún saldo acumulado de
-    # antes, mientras que su Balance de Prueba sí trae saldo_inicial real
-    # ($22.990.563,19 en cuentas clase 11) para el periodo más antiguo
-    # cargado (2024, enero-diciembre). Se toma el periodo transaccional más
-    # antiguo en archivo como piso, y solo se suma el movimiento de
-    # auxiliar_contable desde el primer día de ese periodo en adelante. Para
-    # clientes sin Balance de Prueba cargado, no hay filas y el resultado es
-    # None (comportamiento de siempre).
-    fila = db.session.query(
+    # antes, mientras que su Balance de Prueba sí trae saldo_inicial real.
+    #
+    # IMPORTANTE: se usa el periodo MAS RECIENTE cargado (no el más antiguo)
+    # cuyo inicio sea <= hasta - mismo criterio que ya usa
+    # _fecha_corte_inicial_alegra() (func.max(...) <= hasta). Confirmado con
+    # datos reales que esto SI importa: para Binaria, anclar en el periodo
+    # 2024 (saldo_inicial $22.990.563,19) + movimiento de auxiliar_contable
+    # desde 2024 da $492.989.280, pero anclar en el periodo 2026 más reciente
+    # (saldo_inicial $2.110.550,17, que ya es el saldo_final 2024 = saldo
+    # inicial 2025 reconciliado por Siigo) da $485.571.156 - una diferencia
+    # real de $7,4M que viene de que auxiliar_contable 2024-2025 no reproduce
+    # exacto el balance ya reconciliado en el Balance de Prueba de Siigo. El
+    # periodo mas reciente es la fuente mas confiable porque acorta la
+    # ventana de movimiento que depende de que auxiliar_contable este
+    # completo, en vez de arrastrar 2+ años de posible desfase.
+    filas = db.session.query(
         BalancePrueba.periodo_anio,
         BalancePrueba.periodo_mes_inicio,
+        BalancePrueba.periodo_mes_fin,
     ).filter(
         BalancePrueba.idcliente == idcliente,
         BalancePrueba.es_transaccional == True,
-    ).order_by(
-        BalancePrueba.periodo_anio.asc(),
-        BalancePrueba.periodo_mes_inicio.asc(),
-    ).first()
+    ).distinct().order_by(
+        BalancePrueba.periodo_anio.desc(),
+        BalancePrueba.periodo_mes_fin.desc(),
+    ).all()
 
-    if not fila:
+    if not filas:
         return None
-
-    anio, mes_inicio = fila
-    fecha_anchor = date(anio, mes_inicio, 1)
 
     # _calcular_caja_disponible_parametrizada() recibe `hasta` a veces como
     # string "YYYY-MM-DD" (llamada real desde /dashboard/resumen-ejecutivo)
@@ -3653,10 +3659,12 @@ def _anchor_balance_prueba_siigo(idcliente, hasta):
     else:
         hasta_date = datetime.strptime(str(hasta)[:10], "%Y-%m-%d").date()
 
-    if fecha_anchor > hasta_date:
-        return None
+    for anio, mes_inicio, _mes_fin in filas:
+        fecha_anchor = date(anio, mes_inicio, 1)
+        if fecha_anchor <= hasta_date:
+            return anio, mes_inicio, fecha_anchor
 
-    return anio, mes_inicio, fecha_anchor
+    return None
 
 
 def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
