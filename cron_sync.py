@@ -5,6 +5,7 @@ from app import app, db
 from models import Cliente, SiigoSyncConfig
 from models_alegra import AlegraSyncConfig, AlegraSyncLog
 from alegra.alegra_sync_all import sync_completo_desde_alegra_con_log
+from app import liberar_syncs_alegra_colgados
 
 
 # === CONFIGURACIÓN DEL CRON ===
@@ -206,6 +207,14 @@ def ejecutar_sync_pendientes_alegra():
         print("\n" + "=" * 70)
         print("🕓 INICIO DE VERIFICACIÓN AUTOMÁTICA DE SINCRONIZACIONES (ALEGRA)")
         print("=" * 70)
+
+        # Autorepara candados viejos (EN_EJECUCION colgado de una corrida
+        # que murio a mitad de camino) antes de decidir a quien sincronizar -
+        # sin esto, un cliente afectado quedaria bloqueado para siempre,
+        # tanto aqui como para un clic manual de "Sincronizar todo ahora".
+        liberados = liberar_syncs_alegra_colgados()
+        if liberados:
+            print(f"🔓 {liberados} sincronización(es) colgada(s) liberada(s) (llevaban más de 60 min en EN_EJECUCION).\n")
 
         now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
         configs = AlegraSyncConfig.query.filter_by(activo=True).all()

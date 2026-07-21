@@ -5287,6 +5287,47 @@ def neutralizar_resumen_balance_si_aplica(resumen_balance, parametros_configurad
 
 
 
+def liberar_syncs_alegra_colgados(idcliente=None, max_minutos=60):
+    """Libera (marca como ERROR) cualquier AlegraSyncLog que quedo pegado en
+    EN_EJECUCION mas alla de max_minutos.
+
+    Motivo: si el proceso que disparo el sync muere a mitad de camino (el
+    servidor se reinicia/redeploya mientras corre, una excepcion no
+    controlada que ni siquiera el try/except del hilo alcanza a capturar),
+    el registro nunca se actualiza y queda en EN_EJECUCION para siempre -
+    y el chequeo de "no permitir dos sincronizaciones en paralelo" bloquea
+    ese cliente indefinidamente, tanto para el cron como para un clic
+    manual de "Sincronizar todo ahora". Se llama al inicio de
+    /alegra/sync-all (antes de chequear si hay una en curso) y al inicio
+    de cada corrida de cron_sync.py, para que cualquiera de los dos
+    caminos autorepare un candado viejo antes de decidir si puede o no
+    sincronizar.
+    """
+    limite = datetime.utcnow() - timedelta(minutes=max_minutos)
+    query = AlegraSyncLog.query.filter(
+        AlegraSyncLog.resultado == "EN_EJECUCION",
+        AlegraSyncLog.fecha_programada < limite,
+    )
+    if idcliente:
+        query = query.filter(AlegraSyncLog.idcliente == idcliente)
+
+    colgados = query.all()
+    for log in colgados:
+        log.resultado = "ERROR"
+        log.detalle = (
+            f"Marcado como fallido automáticamente: quedó en EN_EJECUCION por más de "
+            f"{max_minutos} minutos sin actualizarse - probablemente el proceso que lo "
+            f"disparó se interrumpió a mitad de camino (reinicio/redeploy del servidor "
+            f"u otra excepción no controlada)."
+        )
+        log.ejecutado_en = datetime.utcnow()
+
+    if colgados:
+        db.session.commit()
+
+    return len(colgados)
+
+
 #---------------------------------------------------------------------------------------------------------
 # ENDPOINTS DEL SISTEMA
 #---------------------------------------------------------------------------------------------------------
@@ -7653,6 +7694,10 @@ def create_app():
         idcliente, error = _resolver_idcliente_alegra(get_jwt())
         if error:
             return error
+
+        # Autorepara candados viejos antes de decidir si hay una sync en
+        # curso de verdad (ver docstring de liberar_syncs_alegra_colgados).
+        liberar_syncs_alegra_colgados(idcliente=idcliente)
 
         # No permitir dos sincronizaciones en paralelo para el mismo cliente.
         en_curso = AlegraSyncLog.query.filter_by(
