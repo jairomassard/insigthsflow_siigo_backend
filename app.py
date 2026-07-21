@@ -3613,6 +3613,52 @@ def _fecha_corte_inicial_alegra(idcliente, hasta):
     ).scalar()
 
 
+def _anchor_balance_prueba_siigo(idcliente, hasta):
+    # Equivalente Siigo de _fecha_corte_inicial_alegra(): confirmado con
+    # datos reales 2026-07-21 que Binaria (cliente Siigo, "Caja disponible"
+    # ya activo en producción) tenía el mismo problema que Alegra - su
+    # auxiliar_contable arranca en 2024-01-03 sin ningún saldo acumulado de
+    # antes, mientras que su Balance de Prueba sí trae saldo_inicial real
+    # ($22.990.563,19 en cuentas clase 11) para el periodo más antiguo
+    # cargado (2024, enero-diciembre). Se toma el periodo transaccional más
+    # antiguo en archivo como piso, y solo se suma el movimiento de
+    # auxiliar_contable desde el primer día de ese periodo en adelante. Para
+    # clientes sin Balance de Prueba cargado, no hay filas y el resultado es
+    # None (comportamiento de siempre).
+    fila = db.session.query(
+        BalancePrueba.periodo_anio,
+        BalancePrueba.periodo_mes_inicio,
+    ).filter(
+        BalancePrueba.idcliente == idcliente,
+        BalancePrueba.es_transaccional == True,
+    ).order_by(
+        BalancePrueba.periodo_anio.asc(),
+        BalancePrueba.periodo_mes_inicio.asc(),
+    ).first()
+
+    if not fila:
+        return None
+
+    anio, mes_inicio = fila
+    fecha_anchor = date(anio, mes_inicio, 1)
+
+    # _calcular_caja_disponible_parametrizada() recibe `hasta` a veces como
+    # string "YYYY-MM-DD" (llamada real desde /dashboard/resumen-ejecutivo)
+    # y a veces como date/datetime (pruebas/otros llamadores) - se normaliza
+    # para poder comparar contra fecha_anchor sin TypeError.
+    if isinstance(hasta, datetime):
+        hasta_date = hasta.date()
+    elif isinstance(hasta, date):
+        hasta_date = hasta
+    else:
+        hasta_date = datetime.strptime(str(hasta)[:10], "%Y-%m-%d").date()
+
+    if fecha_anchor > hasta_date:
+        return None
+
+    return anio, mes_inicio, fecha_anchor
+
+
 def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
     if not config:
         return {
@@ -3663,16 +3709,20 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
             }
 
         condiciones = []
+        condiciones_bp = []
         params = {"idc": idcliente, "hasta": hasta}
 
         for idx, codigo in enumerate(codigos):
             key = f"c{idx}"
             condiciones.append(f"cuenta_codigo LIKE :{key}")
+            condiciones_bp.append(f"codigo_cuenta LIKE :{key}")
             params[key] = f"{codigo}%"
 
         where_cuentas = " OR ".join(condiciones)
+        where_cuentas_bp = " OR ".join(condiciones_bp)
 
         fecha_corte_inicial = _fecha_corte_inicial_alegra(idcliente, hasta)
+        anchor_bp = None if fecha_corte_inicial else _anchor_balance_prueba_siigo(idcliente, hasta)
 
         if fecha_corte_inicial:
             params["fci"] = fecha_corte_inicial
@@ -3689,6 +3739,33 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     FROM auxiliar_contable
                     WHERE idcliente = :idc
                       AND fecha_contable > :fci
+                      AND fecha_contable <= :hasta
+                      AND ({where_cuentas})
+                )
+                SELECT
+                    (SELECT saldo_inicial FROM base) + (SELECT delta FROM movimiento)
+                    AS caja_actual
+            """)
+        elif anchor_bp:
+            anio_bp, mes_inicio_bp, fecha_anchor_bp = anchor_bp
+            params["anio_bp"] = anio_bp
+            params["mes_inicio_bp"] = mes_inicio_bp
+            params["fecha_anchor_bp"] = fecha_anchor_bp
+            sql = text(f"""
+                WITH base AS (
+                    SELECT COALESCE(SUM(saldo_inicial), 0) AS saldo_inicial
+                    FROM balance_prueba
+                    WHERE idcliente = :idc
+                      AND periodo_anio = :anio_bp
+                      AND periodo_mes_inicio = :mes_inicio_bp
+                      AND es_transaccional = true
+                      AND ({where_cuentas_bp})
+                ),
+                movimiento AS (
+                    SELECT COALESCE(SUM(debito - credito), 0) AS delta
+                    FROM auxiliar_contable
+                    WHERE idcliente = :idc
+                      AND fecha_contable >= :fecha_anchor_bp
                       AND fecha_contable <= :hasta
                       AND ({where_cuentas})
                 )
@@ -3722,15 +3799,20 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
         params = {"idc": idcliente, "hasta": hasta}
 
         filtro_exclusion = ""
+        filtro_exclusion_bp = ""
         if codigos:
             condiciones = []
+            condiciones_bp = []
             for idx, codigo in enumerate(codigos):
                 key = f"e{idx}"
                 condiciones.append(f"cuenta_codigo NOT LIKE :{key}")
+                condiciones_bp.append(f"codigo_cuenta NOT LIKE :{key}")
                 params[key] = f"{codigo}%"
             filtro_exclusion = " AND " + " AND ".join(condiciones)
+            filtro_exclusion_bp = " AND " + " AND ".join(condiciones_bp)
 
         fecha_corte_inicial = _fecha_corte_inicial_alegra(idcliente, hasta)
+        anchor_bp = None if fecha_corte_inicial else _anchor_balance_prueba_siigo(idcliente, hasta)
 
         if fecha_corte_inicial:
             params["fci"] = fecha_corte_inicial
@@ -3748,6 +3830,35 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     FROM auxiliar_contable
                     WHERE idcliente = :idc
                       AND fecha_contable > :fci
+                      AND fecha_contable <= :hasta
+                      AND cuenta_codigo LIKE '11%'
+                      {filtro_exclusion}
+                )
+                SELECT
+                    (SELECT saldo_inicial FROM base) + (SELECT delta FROM movimiento)
+                    AS caja_actual
+            """)
+        elif anchor_bp:
+            anio_bp, mes_inicio_bp, fecha_anchor_bp = anchor_bp
+            params["anio_bp"] = anio_bp
+            params["mes_inicio_bp"] = mes_inicio_bp
+            params["fecha_anchor_bp"] = fecha_anchor_bp
+            sql = text(f"""
+                WITH base AS (
+                    SELECT COALESCE(SUM(saldo_inicial), 0) AS saldo_inicial
+                    FROM balance_prueba
+                    WHERE idcliente = :idc
+                      AND periodo_anio = :anio_bp
+                      AND periodo_mes_inicio = :mes_inicio_bp
+                      AND es_transaccional = true
+                      AND codigo_cuenta LIKE '11%'
+                      {filtro_exclusion_bp}
+                ),
+                movimiento AS (
+                    SELECT COALESCE(SUM(debito - credito), 0) AS delta
+                    FROM auxiliar_contable
+                    WHERE idcliente = :idc
+                      AND fecha_contable >= :fecha_anchor_bp
                       AND fecha_contable <= :hasta
                       AND cuenta_codigo LIKE '11%'
                       {filtro_exclusion}
