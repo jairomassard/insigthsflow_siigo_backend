@@ -14906,6 +14906,7 @@ def create_app():
         hasta = request.args.get("hasta")
         centro_costos = request.args.get("centro_costos")
         tipo_documento = request.args.get("tipo_documento", "todos")
+        estado = request.args.get("estado")
 
         if not proveedor:
             return jsonify({"error": "Proveedor requerido"}), 400
@@ -14937,6 +14938,16 @@ def create_app():
         # por Siigo en el saldo de Documento Soporte desde el día en que se crea el
         # documento (no es un pago real). Ver nota completa en query_kpis.
         total_expr = "GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)"
+
+        # Mismo criterio de estado usado en detalle_facturas_mes(): este modal
+        # (el de "Top 15 Proveedores") no tenia filtro de estado - se agrega
+        # para dar coherencia con el modal de detalle por mes.
+        if estado == "pagado":
+            condiciones.append(f"({total_expr} = 0 OR COALESCE(c.saldo,0) = 0)")
+        elif estado == "pendiente":
+            condiciones.append(f"{total_expr} > 0 AND COALESCE(c.saldo,0) >= {total_expr}")
+        elif estado == "parcial":
+            condiciones.append(f"COALESCE(c.saldo,0) > 0 AND COALESCE(c.saldo,0) < {total_expr}")
 
         where_sql = " AND ".join(condiciones)
 
