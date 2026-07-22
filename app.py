@@ -10848,9 +10848,7 @@ def create_app():
         if not idcliente:
             return jsonify({"error": "No autorizado"}), 403
 
-        estado = request.args.get("estado")  # "Pagado" o "Pendiente"
-        if not estado:
-            return jsonify({"rows": []})
+        estado = request.args.get("estado")  # "Pagado" o "Pendiente" (opcional)
 
         # ---- Filtros compartidos (igual que en facturas_enriquecidas) ----
         desde       = request.args.get("desde")
@@ -10920,7 +10918,12 @@ def create_app():
         # Para el modal:
         #  - "Pagado"   => facturas donde pagado > 0
         #  - "Pendiente" => facturas donde pendiente > 0
-        if estado.lower() == "pagado":
+        #  - sin estado => todas las facturas del periodo (el modal filtra en
+        #    el cliente para poder alternar Pagado/Pendiente/Todas sin volver
+        #    a consultar el backend)
+        if not estado:
+            filtro_estado = "1=1"
+        elif estado.lower() == "pagado":
             filtro_estado = "pagado > 0"
         else:
             filtro_estado = "pendiente > 0"
