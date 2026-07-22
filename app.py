@@ -15793,6 +15793,29 @@ def create_app():
             condiciones.append("m.cost_center = :centro_costos")
             params["centro_costos"] = centro_costos
 
+        # Filtro de estado de pago (pagada/pendiente/parcial) para el modal de
+        # "Movimientos de ingresos" del Consolidado Ingresos vs Egresos - antes
+        # este endpoint no soportaba filtrar por estado, a diferencia del modal
+        # de compras/gastos que ya distingue pagado/pendiente/parcial. Mismo
+        # criterio de tolerancia usado en otras consultas de ventas de este
+        # archivo (saldo/total comparados directamente, sin ajuste de retención
+        # porque ese ajuste solo aplica al lado de compras - ver nota en
+        # detalle_facturas_mes). Las notas crédito no tienen estado de pago
+        # propio y quedan fuera de cualquier filtro distinto de "todas".
+        estado_pago_filtro = (request.args.get("estado") or "").strip().lower()
+        estado_pago_expr = """
+            CASE
+                WHEN m.tipo_movimiento != 'FACTURA' THEN 'no_aplica'
+                WHEN COALESCE(m.total, 0) <= 0 THEN 'pagada'
+                WHEN COALESCE(m.saldo, 0) <= 0 THEN 'pagada'
+                WHEN COALESCE(m.saldo, 0) >= COALESCE(m.total, 0) THEN 'pendiente'
+                ELSE 'parcial'
+            END
+        """
+        if estado_pago_filtro in ("pagada", "pendiente", "parcial"):
+            condiciones.append(f"({estado_pago_expr}) = :estado_pago_filtro")
+            params["estado_pago_filtro"] = estado_pago_filtro
+
         where_sql = " AND ".join(condiciones)
 
         sql = text(f"""
@@ -15829,7 +15852,9 @@ def create_app():
                     WHEN m.tipo_movimiento = 'FACTURA'
                     THEN GREATEST(COALESCE(m.saldo, 0), 0)
                     ELSE 0
-                END AS valor_pendiente
+                END AS valor_pendiente,
+
+                ({estado_pago_expr}) AS estado_pago_calc
 
             FROM ventas_movimientos_enriquecidos m
             WHERE {where_sql}
