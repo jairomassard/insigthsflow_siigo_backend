@@ -10916,17 +10916,22 @@ def create_app():
         #  - Pendiente = SUM(saldo)
         #
         # Para el modal:
-        #  - "Pagado"   => facturas donde pagado > 0
-        #  - "Pendiente" => facturas donde pendiente > 0
+        #  - "Pagado"   => facturas donde pagado > tolerancia
+        #  - "Pendiente" => facturas donde pendiente > tolerancia
         #  - sin estado => todas las facturas del periodo (el modal filtra en
         #    el cliente para poder alternar Pagado/Pendiente/Todas sin volver
         #    a consultar el backend)
+        #
+        # Tolerancia de $1 COP: un saldo de centavos por redondeo de
+        # impuestos/retenciones no debe contar como "pendiente" real (mismo
+        # criterio que estado_pago_real más arriba en este archivo).
+        TOLERANCIA_SALDO_COP = 1
         if not estado:
             filtro_estado = "1=1"
         elif estado.lower() == "pagado":
-            filtro_estado = "pagado > 0"
+            filtro_estado = f"pagado > {TOLERANCIA_SALDO_COP}"
         else:
-            filtro_estado = "pendiente > 0"
+            filtro_estado = f"pendiente > {TOLERANCIA_SALDO_COP}"
 
         sql = text(cte + f"""
             SELECT
