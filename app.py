@@ -8691,6 +8691,7 @@ def create_app():
                 "created_at": f.created_at.isoformat() if f.created_at else None,
                 "customer_id": f.customer_id,
                 "customer_identificacion": f.customer_identificacion,
+                "retenciones": f.retenciones,
             }
 
         def item_to_dict(it):
