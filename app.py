@@ -13753,6 +13753,7 @@ def create_app():
 
         tried = []
         raw_detail = None
+        fuente_siigo = None
 
         try:
             if uuid:
@@ -13761,6 +13762,7 @@ def create_app():
                 r = requests.get(url, headers=headers, timeout=60)
                 if r.status_code == 200:
                     raw_detail = r.json()
+                    fuente_siigo = "support-documents"
             elif compra_id:
                 url = f"{base_url}/v1/support-documents?document={compra_id}"
                 tried.append(url)
@@ -13769,8 +13771,39 @@ def create_app():
                     results = r.json().get("results")
                     if results:
                         raw_detail = results[0]
+                        fuente_siigo = "support-documents"
         except Exception as e:
             return jsonify({"error": str(e), "tried": tried}), 502
+
+        # FALLBACK (2026-07-23): "Facturas de Compra" (idcompra tipo "FC-...",
+        # a diferencia de Documento Soporte "DS-...") NO viven en
+        # /v1/support-documents, viven en /v1/purchases - que no tiene
+        # busqueda por nombre/id, solo listado paginado (igual que hace
+        # sync_compras_desde_siigo). Si lo de arriba no encontro nada y nos
+        # dieron ?idcompra=, paginamos /v1/purchases buscando el "name" que
+        # coincida, con un tope de paginas para no colgar la respuesta.
+        if raw_detail is None and compra_id and not str(compra_id).upper().startswith("DS-"):
+            try:
+                page = 1
+                max_paginas = 60  # ~60*100=6000 compras, cubre el volumen actual de Binaria
+                while page <= max_paginas and raw_detail is None:
+                    url = f"{base_url}/v1/purchases?page_size=100&page={page}"
+                    if page == 1:
+                        tried.append(url + " (paginado hasta encontrar match o agotar paginas)")
+                    r = requests.get(url, headers=headers, timeout=60)
+                    if r.status_code != 200:
+                        break
+                    resultados = r.json().get("results", [])
+                    if not resultados:
+                        break
+                    for pur in resultados:
+                        if str(pur.get("name") or "") == str(compra_id):
+                            raw_detail = pur
+                            fuente_siigo = f"purchases (pagina {page})"
+                            break
+                    page += 1
+            except Exception as e:
+                return jsonify({"error": str(e), "tried": tried}), 502
 
         # buscar en la base de datos local
         compra_db = SiigoCompra.query.filter_by(idcliente=idcliente, idcompra=compra_id).first()
@@ -13813,6 +13846,7 @@ def create_app():
             "query_params": {"uuid": uuid, "idcompra": compra_id, "idcliente": idcliente},
             "siigo_tried_urls": tried,
             "siigo_raw_detail": raw_detail,
+            "siigo_fuente": fuente_siigo,
             "db_compra": compra_to_dict(compra_db),
             "db_items": [item_to_dict(x) for x in items_db]
         })
