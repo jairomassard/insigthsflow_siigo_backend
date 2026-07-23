@@ -10686,7 +10686,30 @@ def create_app():
                             WHEN m.tipo_movimiento = 'FACTURA'
                             THEN GREATEST(COALESCE(m.saldo, 0), 0)
                             ELSE 0
-                        END AS pendiente
+                        END AS pendiente,
+
+                        -- Retenciones que ya estan restadas dentro de `total` (Siigo) o que
+                        -- reducen `pagado`/`saldo` (Alegra) - no incluye autorretencion, que
+                        -- nunca reduce lo que el cliente paga. Se calcula con un CASE-guard
+                        -- para no reventar si `retenciones` no es un array real (mismo tipo
+                        -- de error visto en el backfill de Alegra: "cannot get array length
+                        -- of a scalar").
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA' THEN COALESCE((
+                                SELECT SUM((elem->>'value')::numeric)
+                                FROM jsonb_array_elements(
+                                    CASE WHEN jsonb_typeof(m.retenciones) = 'array' THEN m.retenciones ELSE '[]'::jsonb END
+                                ) elem
+                                WHERE (elem->>'type') IS NOT NULL
+                                  AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
+                            ), 0)
+                            ELSE 0
+                        END AS retenciones_total,
+
+                        CASE
+                            WHEN m.tipo_movimiento = 'FACTURA' THEN m.retenciones
+                            ELSE NULL
+                        END AS retenciones
 
                     FROM ventas_movimientos_enriquecidos m
                     WHERE {where_clause}
