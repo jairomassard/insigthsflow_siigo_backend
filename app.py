@@ -16007,7 +16007,28 @@ def create_app():
                     ELSE 0
                 END AS valor_pendiente,
 
-                ({estado_pago_expr}) AS estado_pago_calc
+                ({estado_pago_expr}) AS estado_pago_calc,
+
+                -- Retenciones que ya estan restadas dentro de `total` (Siigo) o que
+                -- reducen `pagado`/`saldo` (Alegra) - no incluye autorretencion. Mismo
+                -- CASE-guard que en /reportes/ventas_movimientos_detalle para no
+                -- reventar si `retenciones` no es un array real.
+                CASE
+                    WHEN m.tipo_movimiento = 'FACTURA' THEN COALESCE((
+                        SELECT SUM((elem->>'value')::numeric)
+                        FROM jsonb_array_elements(
+                            CASE WHEN jsonb_typeof(m.retenciones) = 'array' THEN m.retenciones ELSE '[]'::jsonb END
+                        ) elem
+                        WHERE (elem->>'type') IS NOT NULL
+                          AND LOWER(elem->>'type') NOT LIKE '%autorretencion%'
+                    ), 0)
+                    ELSE 0
+                END AS retenciones_total,
+
+                CASE
+                    WHEN m.tipo_movimiento = 'FACTURA' THEN m.retenciones
+                    ELSE NULL
+                END AS retenciones
 
             FROM ventas_movimientos_enriquecidos m
             WHERE {where_sql}
