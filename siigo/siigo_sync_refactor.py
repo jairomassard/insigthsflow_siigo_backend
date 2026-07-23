@@ -457,6 +457,62 @@ def _convertir_items_y_pagos_a_cop(items_detalle: List[Dict[str, Any]], payments
                 p["value"] = float(_d(p.get("value"), DZERO) * tasa_cambio)
 
 
+def retenciones_item_level(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Retefuente (y cualquier otra retención) que Siigo mete dentro de
+    items[].taxes[], mezclada con el IVA - NO en el arreglo `retentions`
+    de nivel factura. Confirmado con dato real 2026-07-23 (FV-2-2238,
+    DERCO Colombia): el arreglo `retentions` solo trae ReteICA/ReteIVA/
+    Autorretencion; Retefuente vive exclusivamente en items[].taxes[]
+    junto al IVA (type='Retefuente'), y por eso `f.retenciones` nunca lo
+    capturaba - quedaba fuera del KPI "Retenciones" y (antes de este fix)
+    también se restaba de menos en total_utilizable, aunque ya estaba
+    correctamente neteado dentro de `total`.
+    Se agrupa por `type` porque en teoria podria haber mas de una
+    retencion a nivel de item (ej. si distintas lineas tienen tarifas
+    de Retefuente distintas).
+
+    A nivel de modulo (no closure) a proposito: la reutiliza el backfill
+    (`siigo_backfill_retenciones_historicas.py`) para recalcular
+    `retenciones` de facturas ya sincronizadas sin duplicar la logica.
+    """
+    agregados: Dict[str, Dict[str, Any]] = {}
+
+    for it in items:
+        taxes = it.get("taxes") or []
+
+        if not isinstance(taxes, list):
+            continue
+
+        for tx in taxes:
+            if not isinstance(tx, dict):
+                continue
+
+            ttype = _str(tx.get("type")).upper()
+            tname = _str(tx.get("name")).upper()
+
+            if "IVA" in ttype or "IVA" in tname:
+                continue
+
+            if "RETE" not in ttype and "RETE" not in tname:
+                continue
+
+            clave = _str(tx.get("type")) or _str(tx.get("name")) or "Retencion"
+            entrada = agregados.setdefault(
+                clave, {"percentage": tx.get("percentage"), "value": DZERO}
+            )
+            entrada["value"] += _d(tx.get("value"), DZERO)
+
+    return [
+        {
+            "type": tipo,
+            "percentage": float(datos["percentage"]) if datos["percentage"] is not None else None,
+            "value": float(datos["value"]),
+        }
+        for tipo, datos in agregados.items()
+        if datos["value"] != DZERO
+    ]
+
+
 # -----------------------------
 # Sync principal
 # -----------------------------
@@ -948,6 +1004,12 @@ def sync_facturas_desde_siigo(
                     "percentage": float(_d(r.get("percentage"), DZERO)),
                     "value": float(_to_cop(_d(r.get("value"), DZERO))),
                 })
+
+        # Retefuente (y similares) que Siigo mete en items[].taxes[] en vez
+        # de en el arreglo `retentions` de la factura - ver nota en
+        # retenciones_item_level(). items_detalle ya esta convertido a COP
+        # in-place por _convertir_items_y_pagos_a_cop, igual que sum_iva_from_items.
+        retenciones_clean.extend(retenciones_item_level(items_detalle))
 
         f.retenciones = retenciones_clean or None
 

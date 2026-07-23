@@ -13,7 +13,7 @@ from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_per
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte, DianDocumento
-from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog, AlegraSyncConfig
+from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog, AlegraSyncConfig, AlegraFactura
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
 from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
 from flask_cors import CORS
@@ -7862,6 +7862,108 @@ def create_app():
         except AlegraError as e:
             return jsonify({"ok": False, "error": f"No fue posible autenticar contra Alegra: {e}"}), 401
 
+    @app.route("/alegra/debug-invoice", methods=["GET"])
+    @jwt_required()
+    def alegra_debug_invoice():
+        """
+        Diagnostico puntual: trae el detalle CRUDO de una factura directo de
+        la API de Alegra y lo compara con lo que tenemos guardado, analogo a
+        /siigo/debug-invoice. Se agrego 2026-07-23 para validar si el `total`
+        de una factura Alegra viene neto de retenciones (como Siigo) o bruto,
+        antes de decidir si el fix de total_utilizable aplica tambien a Alegra.
+
+        Uso:
+          /alegra/debug-invoice?alegra_id=<id numerico de Alegra>
+          /alegra/debug-invoice  (sin parametros - autoselecciona la factura
+            mas reciente de este cliente con `retenciones` no vacio; si no
+            hay ninguna, lo dice explicitamente en vez de fallar)
+        Requiere JWT; usa el idcliente del token (o ?idcliente= en superadmin).
+        """
+        claims = get_jwt()
+        idcliente, error = _resolver_idcliente_alegra(claims)
+        if error:
+            return error
+
+        alegra_id = request.args.get("alegra_id", type=str)
+
+        cred = AlegraCredencial.query.filter_by(idcliente=idcliente).first()
+        if not cred:
+            return jsonify({"error": "Credenciales de Alegra no configuradas para este cliente"}), 400
+
+        token = dec(cred.token)
+        if not token:
+            return jsonify({"error": "No se pudo desencriptar el token guardado."}), 500
+
+        factura_db = None
+        autoseleccionada = False
+
+        if alegra_id:
+            factura_db = AlegraFactura.query.filter_by(idcliente=idcliente, alegra_id=alegra_id).first()
+        else:
+            factura_db = (
+                AlegraFactura.query
+                .filter(
+                    AlegraFactura.idcliente == idcliente,
+                    AlegraFactura.retenciones.isnot(None),
+                    db.func.jsonb_array_length(AlegraFactura.retenciones) > 0,
+                )
+                .order_by(AlegraFactura.fecha.desc())
+                .first()
+            )
+            if factura_db:
+                alegra_id = factura_db.alegra_id
+                autoseleccionada = True
+
+        if not alegra_id:
+            return jsonify({
+                "error": (
+                    "No se encontro ninguna factura Alegra de este cliente con "
+                    "'retenciones' no vacio en nuestra base - o no hay ninguna con "
+                    "retencion real, o el sync no la esta capturando. Prueba pasando "
+                    "?alegra_id=<id> de una factura que sepas que tuvo ReteFuente/"
+                    "ReteIVA/ReteICA aplicada."
+                )
+            }), 404
+
+        try:
+            raw_detail = alegra_api_get(ALEGRA_BASE_URL_DEFAULT, cred.email, token, f"invoices/{alegra_id}")
+        except AlegraError as e:
+            return jsonify({"error": f"Error consultando Alegra: {e}"}), 502
+
+        def _dec(v):
+            from decimal import Decimal
+            if isinstance(v, Decimal):
+                return float(v)
+            if isinstance(v, (datetime,)):
+                return v.isoformat()
+            return v
+
+        def factura_to_dict(f):
+            if not f:
+                return None
+            return {
+                "id": f.id,
+                "idcliente": f.idcliente,
+                "alegra_id": f.alegra_id,
+                "fecha": f.fecha.isoformat() if f.fecha else None,
+                "tercero_nombre": f.tercero_nombre,
+                "estado": f.estado,
+                "moneda": f.moneda,
+                "subtotal": _dec(f.subtotal),
+                "impuestos_total": _dec(f.impuestos_total),
+                "total": _dec(f.total),
+                "balance": _dec(f.balance),
+                "total_paid": _dec(f.total_paid),
+                "retenciones": f.retenciones,
+            }
+
+        return jsonify({
+            "query_params": {"alegra_id": alegra_id, "idcliente": idcliente},
+            "autoseleccionada": autoseleccionada,
+            "alegra_raw_detail": raw_detail,
+            "db_factura": factura_to_dict(factura_db),
+        }), 200
+
     def _hora_local_cliente(idcliente):
         cliente = db.session.get(Cliente, idcliente)
         tz_str = cliente.timezone if cliente and cliente.timezone else "America/Bogota"
@@ -10131,6 +10233,25 @@ def create_app():
             else:
                 formula_pagado_b = "GREATEST(total_b - saldo_b, 0)"
 
+            # "Total utilizable" para Siigo: `total_b` (el "Total a Pagar" que
+            # entrega la API de Siigo) YA viene neto de Retefuente/ReteIVA/
+            # ReteICA - confirmado con dato real 2026-07-23 (factura FV-2-2238,
+            # DERCO Colombia: Bruto 1.612.500 + IVA 306.375 - Retefuente 64.500
+            # - ReteIVA 45.956,25 - ReteICA 15.576,75 = Total a Pagar 1.792.842,
+            # exactamente lo que guarda `total`). Restar `retenciones_sin_auto`
+            # (que agrupa exactamente esas mismas 3 retenciones) volvia a
+            # descontarlas una segunda vez. La autorretencion si se resta aparte:
+            # no reduce lo que el cliente paga, es el vendedor autorretiniendose
+            # a si mismo de la plata que SI recibio completa.
+            # Para Alegra se deja la formula de siempre (resta retenciones_sin_auto
+            # + autorretencion) mientras se valida con una factura Alegra real si
+            # su `total` viene neto de retenciones como Siigo o bruto (pendiente
+            # de validar, 2026-07-23 - ver /alegra/debug-invoice).
+            if proveedor_datos_cliente == "alegra":
+                formula_total_utilizable_b = "(total_b - (autorretencion + retenciones_sin_auto))"
+            else:
+                formula_total_utilizable_b = "(total_b - autorretencion)"
+
             cte_common = f"""
                 WITH comp AS (
                     SELECT
@@ -10194,7 +10315,7 @@ def create_app():
             # ============================================================
             # KPIs principales
             # ============================================================
-            sql_kpis = text(cte_common + """
+            sql_kpis = text(cte_common + f"""
                 SELECT
                     -- Valor principal de ventas netas según modo Siigo
                     COALESCE(SUM(valor_siigo_b), 0) AS subtotal,
@@ -10292,7 +10413,7 @@ def create_app():
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
 
                     COALESCE(
-                        SUM(total_b - (autorretencion + retenciones_sin_auto)),
+                        SUM{formula_total_utilizable_b},
                         0
                     ) AS total_utilizable,
 
@@ -10309,7 +10430,7 @@ def create_app():
             # ============================================================
             # Series mensuales
             # ============================================================
-            sql_series = text(cte_common + """
+            sql_series = text(cte_common + f"""
                 SELECT
                     mes::text AS periodo,
                     TO_CHAR(mes, 'Mon YYYY') AS label,
@@ -10363,7 +10484,7 @@ def create_app():
                     COALESCE(SUM(retenciones_sin_auto), 0) AS retenciones,
 
                     COALESCE(
-                        SUM(total_b - (autorretencion + retenciones_sin_auto)),
+                        SUM{formula_total_utilizable_b},
                         0
                     ) AS total_utilizable,
 

@@ -50,6 +50,54 @@ def _parse_fecha(s):
         return None
 
 
+def normalizar_retenciones_alegra(retentions_raw):
+    """Alegra devuelve las retenciones de una factura de venta con el shape
+    {id, name, percentage, amount, referenceKey, base} - CONFIRMADO con dato
+    real 2026-07-23 (factura MLX684 / alegra_id=696, Maslux): ReteIVA 15%
+    por $34.200, sin ninguna clave 'type' ni 'value'. Se normaliza aqui a
+    {type, percentage, value} para que quede en el MISMO shape que
+    siigo_facturas.retenciones - las consultas de "Retenciones"/"Total
+    utilizable" en app.py leen literalmente 'type' y 'value' del JSONB, y
+    antes de este fix devolvian SIEMPRE 0 para clientes Alegra (las claves no
+    existian, no es que el valor diera 0 por dato real).
+
+    `name` (ej. "ReteIVA") se usa como `type` por ser el campo mas
+    descriptivo disponible. NO se ha confirmado con dato real como luce una
+    autorretencion en este arreglo (ninguna factura de la muestra la trae) -
+    si en el futuro aparece con un nombre que no contenga literalmente
+    "autorretencion", el filtro LIKE '%autorretencion%' de app.py no la va a
+    reconocer como tal y caeria en retenciones_sin_auto. Pendiente de validar
+    si eso llega a pasar con un cliente real.
+    """
+    if not isinstance(retentions_raw, list):
+        return None
+
+    normalizadas = []
+    for r in retentions_raw:
+        if not isinstance(r, dict):
+            continue
+
+        tipo = r.get("name") or r.get("referenceKey") or "Retencion"
+
+        try:
+            valor = float(r.get("amount")) if r.get("amount") is not None else 0.0
+        except (TypeError, ValueError):
+            valor = 0.0
+
+        try:
+            porcentaje = float(r.get("percentage")) if r.get("percentage") is not None else None
+        except (TypeError, ValueError):
+            porcentaje = None
+
+        normalizadas.append({
+            "type": str(tipo),
+            "percentage": porcentaje,
+            "value": valor,
+        })
+
+    return normalizadas or None
+
+
 def sync_facturas_desde_alegra(idcliente: int) -> str:
     email, token = _credenciales_alegra(idcliente)
     total, nuevos, actualizados = 0, 0, 0
@@ -115,7 +163,7 @@ def sync_facturas_desde_alegra(idcliente: int) -> str:
         # viene (factura en moneda extranjera), se usa su codigo real.
         moneda_obj = inv.get("currency")
         factura.moneda = moneda_obj.get("code") if isinstance(moneda_obj, dict) else "COP"
-        factura.retenciones = inv.get("retentions")
+        factura.retenciones = normalizar_retenciones_alegra(inv.get("retentions"))
         factura.payments = inv.get("payments")
         factura.stamp = inv.get("stamp")
 
