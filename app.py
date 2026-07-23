@@ -2565,34 +2565,35 @@ def construir_cruce_dian(idcliente, desde, hasta):
     # que nunca hace match en este bloque y siempre parece "extra").
     compras_siigo = [c for c in compras_siigo_todas if not str(c.idcompra or "").upper().startswith("DS-")]
 
-    # LIMITACION CONOCIDA (2026-07-17, pendiente para retomar): sumar
-    # SiigoCompraItem.impuestos por compra NO es un IVA confiable en todos
-    # los casos. Validado con datos reales (compra FC-1-2508, Astro's
-    # Catering AS-345): en el item "SNACK BOX PM" la tarifa de IVA (Impto.
-    # Cargo) era 0% pero Retefuente era 3.5%, y el campo `impuestos` trajo
-    # el valor de la RETENCION ($100.765 = 3.5% de $2.879.000), no IVA. En
-    # cambio en los items "MENAJE"/"MESERO" del mismo documento, con IVA
-    # real al 19%, `impuestos` si coincidio con el IVA. O sea: el campo
-    # trae "lo que no sea cero" por item, mezclando IVA y Retefuente segun
-    # el caso - no distingue tipo de impuesto (a diferencia de
-    # SiigoFacturaItem, que si separa iva_valor de las retenciones). Esto
-    # hace que el bucket "monto_distinto" en Facturas de Compra no sea
-    # 100% confiable para proveedores con tarifas mixtas (catering/eventos
-    # tipicamente). Pendiente evaluar si el sync de Siigo puede capturar
-    # el desglose real de impuestos por item de compra (la API de Siigo
-    # probablemente lo trae, similar a como ya se hace para facturas de
-    # venta) antes de confiar en este numero para decisiones.
+    # CORREGIDO 2026-07-23 (antes limitacion conocida desde 2026-07-17):
+    # SiigoCompraItem.impuestos ya no mezcla IVA y Retefuente. El sync
+    # (backend/siigo/siigo_sync_compras.py) antes tomaba taxes[0] de cada
+    # item sin mirar el tipo - si el item tenia Retefuente antes que IVA en
+    # la lista (o solo Retefuente, sin IVA), `impuestos` quedaba con el
+    # valor de la retencion. Validado con datos reales del Cruce DIAN: Astro's
+    # Catering mostraba "IVA Siigo" mas alto de lo real en 9 facturas
+    # distintas (item "SNACK BOX PM" con IVA 0%/Retefuente 3.5%, `impuestos`
+    # traia el Retefuente $100.765 en vez de IVA $0), y D1 S A S mostraba
+    # "IVA Siigo" en $0 en ~12 facturas aunque la DIAN si reportaba IVA real
+    # (mismo bug, orden inverso). El sync ahora suma solo las entradas de
+    # tipo IVA por item, igual que ya se hacia correctamente en facturas de
+    # venta (sum_iva_from_items). IMPORTANTE: esto solo aplica a compras
+    # sincronizadas DESDE el fix - las ya sincronizadas antes conservan el
+    # valor viejo hasta que se reprocesen (mismo patron de backfill que se
+    # uso para Retefuente en facturas de venta esa misma sesion - forzar
+    # resync con el mismo mecanismo que ya existe para compras si aplica).
     #
-    # Caso aparte SIN resolver, no relacionado con lo anterior: la compra
-    # FC-1-2508 (Astro's Catering, factura_proveedor "AS-345") tiene total
-    # real $4.436.461 en Siigo (confirmado con el PDF de Siigo), pero la
-    # DIAN reporta para el folio "AS-345" solo $209.000 de IVA (~$1.3M de
-    # factura). La diferencia de magnitud es demasiado grande para ser el
-    # problema del campo `impuestos` de arriba. Hipotesis sin confirmar:
-    # Astro's Catering reutilizo/cruzo numeracion entre AS-341/AS-342/
-    # AS-345 (facturas consecutivas de fechas muy cercanas). Requiere
-    # verificar con el proveedor o la factura fisica, no se puede resolver
-    # solo con los datos que ya tenemos.
+    # ACTUALIZADO 2026-07-23: la nota vieja sobre AS-345 (Astro's Catering,
+    # "diferencia de magnitud sin explicar", hipotesis de numeracion
+    # reutilizada) quedo desactualizada - re-chequeado con datos reales del
+    # Cruce DIAN y la brecha ya no es de magnitud, es del mismo orden que el
+    # resto de facturas Astro's (Total DIAN $4.618.320 vs Siigo $4.719.085,
+    # IVA DIAN $209.000 vs Siigo $309.765) - Astro's tuvo 9 facturas en el
+    # bucket "monto_distinto" con el mismo patron (IVA Siigo mas alto),
+    # consistente con el bug de `impuestos`=taxes[0] ya corregido arriba, no
+    # con la hipotesis de numeracion cruzada. No descartar del todo la
+    # hipotesis si el monto sigue sin cuadrar despues de que corra el
+    # backfill de este fix, pero ya no es la explicacion mas probable.
     ivas_compra_por_id = dict(
         db.session.query(SiigoCompraItem.compra_id, func.coalesce(func.sum(SiigoCompraItem.impuestos), 0))
         .join(SiigoCompra, SiigoCompra.id == SiigoCompraItem.compra_id)

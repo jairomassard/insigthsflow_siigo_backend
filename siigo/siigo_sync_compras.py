@@ -199,9 +199,32 @@ def sync_compras_desde_siigo(
                 code = item.get("code")
                 impuestos = None
 
+                # FIX (2026-07-23): antes tomaba taxes[0] sin mirar el tipo -
+                # si un item traia Retefuente antes que IVA en la lista (o
+                # solo Retefuente, sin IVA), `impuestos` quedaba con el valor
+                # de la retencion en vez de IVA (o en 0 si el IVA real estaba
+                # en una posicion != 0). Confirmado con datos reales del
+                # Cruce DIAN 2026-07-23: Astro's Catering mostraba "IVA Siigo"
+                # mas alto de lo real (item con Retefuente 3.5% e IVA 0%
+                # leido como si el Retefuente fuera IVA) y D1 S A S mostraba
+                # "IVA Siigo" en $0 aunque la DIAN si reportaba IVA real
+                # (mismo problema, orden opuesto). Ahora se suman solo las
+                # entradas de tipo IVA, igual que ya se hace correctamente
+                # del lado de facturas de venta (sum_iva_from_items).
                 taxes = item.get("taxes")
                 if isinstance(taxes, list) and taxes:
-                    impuestos = taxes[0].get("value")
+                    iva_sum = 0
+                    tiene_iva = False
+                    for tx in taxes:
+                        if not isinstance(tx, dict):
+                            continue
+                        ttype = str(tx.get("type") or "").upper()
+                        tname = str(tx.get("name") or "").upper()
+                        if "IVA" in ttype or "IVA" in tname:
+                            iva_sum += tx.get("value") or 0
+                            tiene_iva = True
+                    if tiene_iva:
+                        impuestos = iva_sum
 
                 i = SiigoCompraItem(
                     compra_id=compra.id,
