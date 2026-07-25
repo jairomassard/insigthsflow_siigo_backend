@@ -3150,19 +3150,58 @@ def _resumen_cruce(detalle, extra_en_siigo):
     }
 
 
+def _cierre_retefuente_siigo(idcliente, desde, hasta):
+    """Analogo a _cierre_reteiva_siigo pero para 2365 (Retefuente por pagar a
+    proveedores). Encontrado con datos reales de Binaria (2026-07-24,
+    comprobante CC-1-117, 30-06-2026): mismo patron que IVA - un asiento
+    contra la DIAN (tercero_nit=NIT_DIAN) resetea a $0 las subcuentas 2365xx
+    acumuladas de varios meses y mueve el neto a 236590 "RETENCIONES POR
+    PAGAR". Si cae dentro del rango filtrado, distorsiona el calculo
+    transaccional del reporte de Retenciones exactamente igual que paso con
+    2408/135517 en Cruce de IVA (confirmado: Retefuente de junio 2026 salia
+    en -$717.651 con el bug, +$28.995.295 excluyendo este comprobante).
+    ReteICA (236805) NO se toca aqui - sus cierres van contra la Tesoreria
+    Distrital de Bogota (otro NIT, es un impuesto municipal, no de la DIAN),
+    mecanismo distinto sin validar todavia."""
+    from sqlalchemy import text
+
+    sql = text("""
+        SELECT DISTINCT comprobante_numero
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable BETWEEN :d AND :h
+          AND comprobante_numero IS NOT NULL
+          AND cuenta_codigo LIKE '2365%'
+          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
+          AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
+    """)
+    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
+    return {r["comprobante_numero"] for r in rows}
+
+
 def construir_retenciones_siigo(idcliente, desde, hasta):
     """Version Siigo del reporte de Retenciones (logica original, extraida
-    tal cual del endpoint /reportes/retenciones_v1 sin cambios de
-    comportamiento). Cubre solo el lado compras (retenciones que la propia
-    empresa practica a sus proveedores, cuentas 2365%/236805% "por pagar" a
-    la DIAN) - el mismo alcance se mantiene en la version Alegra."""
-    from sqlalchemy import text
+    tal cual del endpoint /reportes/retenciones_v1). Cubre solo el lado
+    compras (retenciones que la propia empresa practica a sus proveedores,
+    cuentas 2365%/236805% "por pagar" a la DIAN) - el mismo alcance se
+    mantiene en la version Alegra.
+
+    Retefuente (2365%) excluye los comprobantes de cierre contra la DIAN
+    detectados por _cierre_retefuente_siigo (ver docstring ahi) - mismo
+    problema y mismo fix que Cruce de IVA. ReteICA (236805%) NO se excluye
+    todavia - su cierre va contra otro tercero (Tesoreria Distrital de
+    Bogota) y no esta validado con el mismo nivel de confianza (pendiente,
+    ver memoria del proyecto)."""
+    from sqlalchemy import text, bindparam
+
+    comprobantes_cierre_rf = _cierre_retefuente_siigo(idcliente, desde, hasta)
+    excl_rf = list(comprobantes_cierre_rf) if comprobantes_cierre_rf else ["__ninguno__"]
 
     sql_evolucion = text("""
         SELECT
             periodo_anio,
             periodo_mes,
-            SUM(CASE WHEN cuenta_codigo LIKE '2365%' THEN (credito - debito) ELSE 0 END) AS retefuente,
+            SUM(CASE WHEN cuenta_codigo LIKE '2365%' AND comprobante_numero NOT IN :excl_rf THEN (credito - debito) ELSE 0 END) AS retefuente,
             SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
         FROM auxiliar_contable
         WHERE idcliente = :idc
@@ -3173,7 +3212,7 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         )
         GROUP BY periodo_anio, periodo_mes
         ORDER BY periodo_anio, periodo_mes
-    """)
+    """).bindparams(bindparam("excl_rf", expanding=True))
 
     sql_composicion = text("""
         SELECT
@@ -3192,10 +3231,11 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
                 cuenta_codigo LIKE '2365%'
                 OR cuenta_codigo LIKE '236805%'
         )
+        AND NOT (cuenta_codigo LIKE '2365%' AND comprobante_numero IN :excl_rf)
         GROUP BY cuenta_codigo, cuenta_nombre
         HAVING SUM(credito - debito) <> 0
         ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
-    """)
+    """).bindparams(bindparam("excl_rf", expanding=True))
 
     sql_ica_detalle_mensual = text("""
         SELECT
@@ -3224,10 +3264,11 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
         AND cuenta_codigo LIKE '2365%'
+        AND comprobante_numero NOT IN :excl_rf
         GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
         HAVING SUM(credito - debito) <> 0
         ORDER BY periodo_anio, periodo_mes, cuenta_codigo
-    """)
+    """).bindparams(bindparam("excl_rf", expanding=True))
 
     sql_referencia_236898 = text("""
         SELECT
@@ -3238,10 +3279,10 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         AND cuenta_codigo = '236898'
     """)
 
-    res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-    res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
+    res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
     res_ica_det = db.session.execute(sql_ica_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
-    res_rf_det = db.session.execute(sql_retefuente_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_rf_det = db.session.execute(sql_retefuente_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
     ref_236898 = db.session.execute(sql_referencia_236898, {"idc": idcliente, "d": desde, "h": hasta}).mappings().first()
 
     def normalizar_concepto(cuenta: str, nombre: str) -> str:
