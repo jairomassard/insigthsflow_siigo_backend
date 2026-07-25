@@ -2016,7 +2016,7 @@ def _detectar_comprobantes_cierre(idcliente, desde, hasta, familia_prefix, umbra
     exponer los comprobantes detectados (ver _detalle_comprobantes_cierre)
     para que el usuario/contador pueda revisar y corregir si el sistema se
     equivoco, en vez de decidir en silencio."""
-    from sqlalchemy import text
+    from sqlalchemy import text, bindparam
 
     familia_like = familia_prefix + "%"
 
