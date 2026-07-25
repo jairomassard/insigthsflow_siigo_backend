@@ -1982,79 +1982,147 @@ def _inventarios_actual(idcliente, fecha_corte):
     return float(row.total if row else 0) or 0.0
 
 
-NIT_DIAN = "800197268"  # NIT de la DIAN, constante nacional (Colombia) - no depende del cliente.
+UMBRAL_LINEAS_CIERRE = 5  # ver _detectar_comprobantes_cierre
 
 
-def _cierres_iva_siigo(idcliente, desde, hasta):
-    """Detecta asientos de cierre de IVA en auxiliar_contable: comprobantes con
-    una linea contra la DIAN (tercero_nit=NIT_DIAN) en una cuenta "IVA POR
-    PAGAR" (nombre, no codigo - cada contador numera distinto), fechados el
-    ultimo dia calendario de un mes. Encontrado con datos reales de Binaria
-    (comprobante CC-1-118, 30-06-2026): ese asiento resetea a $0 las subcuentas
-    2408xx acumuladas de varios meses y mueve el neto a una cuenta resumen -
-    si cae dentro del rango de fechas filtrado, contamina el calculo
-    transaccional (ver memoria del proyecto). Devuelve (declarado_por_periodo,
-    comprobantes_a_excluir) para que el caller excluya esas lineas del calculo
-    "como vamos" y muestre el neto declarado por separado."""
+def _detectar_comprobantes_cierre(idcliente, desde, hasta, familia_prefix, umbral_lineas=UMBRAL_LINEAS_CIERRE):
+    """Detecta comprobantes de cierre/ajuste contable de forma GENERICA, sin
+    depender de conocer quien es la contraparte (DIAN, tesorerias
+    municipales, etc). Version anterior de este mecanismo anclaba en
+    tercero_nit=NIT de la DIAN - funciona para IVA/Retefuente (siempre DIAN,
+    NIT nacional fijo) pero NO generaliza a ReteICA, que se liquida ante la
+    tesoreria de cada MUNICIPIO (NIT distinto por ciudad, imposible de
+    enumerar para todos los clientes del producto). Reemplazado por una
+    regla estructural, portable entre proveedores/ciudades/contadores:
+
+    Paso 1 - "dia de cierre" para esta familia de cuentas: una fecha donde
+    algun comprobante tipo "CC" (asiento contable manual, no una factura/
+    compra/nota/pago real) toca >= umbral_lineas subcuentas distintas de esa
+    familia (ej. 5+ lineas dentro de 2365xx), fechado el ultimo dia
+    calendario de un mes (patron de cierre de periodo). Validado con datos
+    reales de Binaria: los cierres reales tienen 9-22 lineas, el ruido normal
+    (ajustes puntuales sueltos) tiene 1-2.
+
+    Paso 2 - una vez identificado el dia de cierre para la familia, se
+    incluyen TAMBIEN los demas comprobantes tipo "CC" de esa misma fecha que
+    toquen la misma familia, aunque tengan pocas lineas - confirmado con
+    datos reales que el asiento "grande" de reseteo casi siempre viene
+    acompañado el mismo dia de un comprobante chico de aplicacion/pago
+    (ej. CC-1-125 en Binaria, 1 sola linea en la cuenta resumen, que sin este
+    paso 2 quedaria fuera y el calculo seguiria mal).
+
+    Es una aproximacion, no una certeza contable - InsightsFlow es una guia
+    para el usuario, no la liquidacion oficial. Por eso el caller debe
+    exponer los comprobantes detectados (ver _detalle_comprobantes_cierre)
+    para que el usuario/contador pueda revisar y corregir si el sistema se
+    equivoco, en vez de decidir en silencio."""
     from sqlalchemy import text
 
-    sql = text("""
-        SELECT periodo_anio, periodo_mes, comprobante_numero,
-               SUM(credito - debito) AS declarado
+    familia_like = familia_prefix + "%"
+
+    sql_dias = text("""
+        SELECT fecha_contable
         FROM auxiliar_contable
         WHERE idcliente = :idc
           AND fecha_contable BETWEEN :d AND :h
-          AND comprobante_numero IS NOT NULL
-          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
-          AND cuenta_nombre ILIKE '%iva%por pagar%'
+          AND comprobante_tipo = 'CC'
+          AND cuenta_codigo LIKE :familia
           AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
-        GROUP BY 1, 2, 3
+        GROUP BY fecha_contable, comprobante_numero
+        HAVING COUNT(*) >= :umbral
     """)
-    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
+    dias = {r["fecha_contable"] for r in db.session.execute(
+        sql_dias, {"idc": idcliente, "d": desde, "h": hasta, "familia": familia_like, "umbral": umbral_lineas}
+    ).mappings().all()}
 
-    declarado_por_periodo = {}
-    comprobantes = set()
-    for r in rows:
-        key = (r["periodo_anio"], r["periodo_mes"])
-        declarado_por_periodo[key] = declarado_por_periodo.get(key, 0.0) + float(r["declarado"] or 0)
-        comprobantes.add(r["comprobante_numero"])
+    if not dias:
+        return set()
+
+    sql_comprobantes = text("""
+        SELECT DISTINCT comprobante_numero
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND comprobante_tipo = 'CC'
+          AND cuenta_codigo LIKE :familia
+          AND fecha_contable IN :dias
+          AND comprobante_numero IS NOT NULL
+    """).bindparams(bindparam("dias", expanding=True))
+    rows = db.session.execute(
+        sql_comprobantes, {"idc": idcliente, "familia": familia_like, "dias": list(dias)}
+    ).mappings().all()
+    return {r["comprobante_numero"] for r in rows}
+
+
+def _detalle_comprobantes_cierre(idcliente, desde, hasta, familia_prefix, comprobantes):
+    """Para el panel de transparencia: fecha y monto neto (credito-debito) de
+    cada comprobante detectado como cierre, para que el usuario pueda revisar
+    qué se excluyó en vez de confiar a ciegas."""
+    from sqlalchemy import text, bindparam
+
+    if not comprobantes:
+        return []
+
+    sql = text("""
+        SELECT comprobante_numero, MIN(fecha_contable) AS fecha, SUM(credito - debito) AS neto, COUNT(*) AS n_lineas
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND cuenta_codigo LIKE :familia
+          AND comprobante_numero IN :comprobantes
+        GROUP BY comprobante_numero
+        ORDER BY fecha, comprobante_numero
+    """).bindparams(bindparam("comprobantes", expanding=True))
+    rows = db.session.execute(
+        sql, {"idc": idcliente, "familia": familia_prefix + "%", "comprobantes": list(comprobantes)}
+    ).mappings().all()
+    return [
+        {
+            "comprobante": r["comprobante_numero"],
+            "fecha": r["fecha"].isoformat() if r["fecha"] else None,
+            "neto": float(r["neto"] or 0),
+            "n_lineas": r["n_lineas"],
+        }
+        for r in rows
+    ]
+
+
+def _cierres_iva_siigo(idcliente, desde, hasta):
+    """Cierre de IVA (familia 2408) via _detectar_comprobantes_cierre. El
+    "declarado" se calcula sumando, DENTRO de los comprobantes ya detectados
+    como cierre, solo las lineas cuya cuenta se llama "IVA POR PAGAR" (la
+    cuenta resumen que el contador de Binaria confirmo que guarda el valor
+    real a declarar) - terminologia contable estandar en Colombia, no
+    especifica de un cliente. Devuelve (declarado_por_periodo,
+    comprobantes_a_excluir)."""
+    from sqlalchemy import text, bindparam
+
+    comprobantes = _detectar_comprobantes_cierre(idcliente, desde, hasta, "2408")
+    if not comprobantes:
+        return {}, set()
+
+    sql = text("""
+        SELECT periodo_anio, periodo_mes, SUM(credito - debito) AS declarado
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable BETWEEN :d AND :h
+          AND comprobante_numero IN :comprobantes
+          AND cuenta_nombre ILIKE '%iva%por pagar%'
+        GROUP BY 1, 2
+    """).bindparams(bindparam("comprobantes", expanding=True))
+    rows = db.session.execute(
+        sql, {"idc": idcliente, "d": desde, "h": hasta, "comprobantes": list(comprobantes)}
+    ).mappings().all()
+
+    declarado_por_periodo = {(r["periodo_anio"], r["periodo_mes"]): float(r["declarado"] or 0) for r in rows}
     return declarado_por_periodo, comprobantes
 
 
 def _cierre_reteiva_siigo(idcliente, desde, hasta):
-    """Analogo a _cierres_iva_siigo pero para 135517 (ReteIVA a favor).
-    Confirmado con el contador de Binaria (2026-07-24): el comprobante de
-    cierre para esta cuenta NO resetea en una sola linea contra la DIAN como
-    el de IVA/Retefuente - reclasifica el saldo cliente por cliente (Stanzia,
-    Inchcape, Porsche, etc.), y los montos ahi representan "retenciones
-    practicadas de facturas de todo el año" (palabras textuales del contador),
-    no solo del mes/bimestre cerrado - mismo problema de fondo que el cierre
-    de IVA: si cae dentro del rango filtrado, mezcla varios periodos en uno.
-    El deber ser es cerrar cada bimestre (no cada mes, a diferencia de IVA/
-    Retefuente), pero a Binaria le toco un "ponerse al dia" del semestre en
-    una sola fecha (30-06-2026, comprobante CC-1-119) - mismo patron que IVA.
-    No existe todavia una cuenta resumen tipo "24089005" para ReteIVA (el
-    contador confirmo que se puede crear a futuro) - por eso esta funcion
-    solo devuelve el set de comprobantes a excluir, no hay "declarado" que
-    calcular aun. Se identifica el comprobante buscando la LINEA de cierre
-    dentro de 135517 (no en 2408, por eso no se reusa _cierres_iva_siigo) con
-    tercero=DIAN fechada el ultimo dia calendario de un mes; se excluyen
-    TODAS las lineas de ese comprobante (incluidas las de Stanzia/Inchcape/
-    etc, no solo la de DIAN), porque todas pertenecen al mismo reseteo."""
-    from sqlalchemy import text
-
-    sql = text("""
-        SELECT DISTINCT comprobante_numero
-        FROM auxiliar_contable
-        WHERE idcliente = :idc
-          AND fecha_contable BETWEEN :d AND :h
-          AND comprobante_numero IS NOT NULL
-          AND cuenta_codigo LIKE '135517%'
-          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
-          AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
-    """)
-    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
-    return {r["comprobante_numero"] for r in rows}
+    """Cierre de ReteIVA (familia 135517) via _detectar_comprobantes_cierre.
+    No hay cuenta "declarado" para ReteIVA todavia (el contador de Binaria
+    confirmo 2026-07-24 que no existe una cuenta resumen tipo 24089005 para
+    esto, aunque se puede crear a futuro) - solo se excluye del calculo
+    transaccional."""
+    return _detectar_comprobantes_cierre(idcliente, desde, hasta, "135517")
 
 
 def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
@@ -2141,7 +2209,11 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
             "mes_presentacion": mes_pres
         })
 
-    return _empaquetar_cruce_iva(series_mensuales)
+    comprobantes_detectados = (
+        _detalle_comprobantes_cierre(idcliente, desde, hasta, "2408", comprobantes_cierre)
+        + _detalle_comprobantes_cierre(idcliente, desde, hasta, "135517", comprobantes_cierre_rete)
+    )
+    return _empaquetar_cruce_iva(series_mensuales, comprobantes_detectados)
 
 
 def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
@@ -2371,7 +2443,7 @@ def _iva_declarado_alegra(idcliente, desde, hasta):
     return {(int(r["anio"]), int(r["mes"])): float(r["declarado"] or 0) for r in rows}
 
 
-def _empaquetar_cruce_iva(series_mensuales):
+def _empaquetar_cruce_iva(series_mensuales, comprobantes_cierre_detectados=None):
     def _suma_declarado(g):
         """None si NINGUN mes del grupo tiene cierre detectado (no inventar un
         0 donde no hay dato); suma solo los meses que si lo tienen."""
@@ -2423,7 +2495,12 @@ def _empaquetar_cruce_iva(series_mensuales):
         "series_agrupadas": {
             "bimensual": agrupar(series_mensuales, 2),
             "cuatrimestral": agrupar(series_mensuales, 4)
-        }
+        },
+        # Transparencia: que comprobantes se excluyeron del calculo por
+        # detectarse como cierre/ajuste contable, para que el usuario o su
+        # contador puedan revisarlos - InsightsFlow es una guia, no la
+        # liquidacion oficial (ver memoria del proyecto).
+        "comprobantes_cierre_detectados": comprobantes_cierre_detectados or []
     }
 
 
@@ -3151,58 +3228,48 @@ def _resumen_cruce(detalle, extra_en_siigo):
 
 
 def _cierre_retefuente_siigo(idcliente, desde, hasta):
-    """Analogo a _cierre_reteiva_siigo pero para 2365 (Retefuente por pagar a
-    proveedores). Encontrado con datos reales de Binaria (2026-07-24,
-    comprobante CC-1-117, 30-06-2026): mismo patron que IVA - un asiento
-    contra la DIAN (tercero_nit=NIT_DIAN) resetea a $0 las subcuentas 2365xx
-    acumuladas de varios meses y mueve el neto a 236590 "RETENCIONES POR
-    PAGAR". Si cae dentro del rango filtrado, distorsiona el calculo
-    transaccional del reporte de Retenciones exactamente igual que paso con
-    2408/135517 en Cruce de IVA (confirmado: Retefuente de junio 2026 salia
-    en -$717.651 con el bug, +$28.995.295 excluyendo este comprobante).
-    ReteICA (236805) NO se toca aqui - sus cierres van contra la Tesoreria
-    Distrital de Bogota (otro NIT, es un impuesto municipal, no de la DIAN),
-    mecanismo distinto sin validar todavia."""
-    from sqlalchemy import text
+    """Cierre de Retefuente (familia 2365) via _detectar_comprobantes_cierre.
+    Validado con datos reales de Binaria: sin excluir, junio 2026 daba
+    -$717.651 (absurdo); excluyendo el cierre, +$28.995.295 (creible)."""
+    return _detectar_comprobantes_cierre(idcliente, desde, hasta, "2365")
 
-    sql = text("""
-        SELECT DISTINCT comprobante_numero
-        FROM auxiliar_contable
-        WHERE idcliente = :idc
-          AND fecha_contable BETWEEN :d AND :h
-          AND comprobante_numero IS NOT NULL
-          AND cuenta_codigo LIKE '2365%'
-          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
-          AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
-    """)
-    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
-    return {r["comprobante_numero"] for r in rows}
+
+def _cierre_reteica_siigo(idcliente, desde, hasta):
+    """Cierre de ReteICA (familia 236805) via _detectar_comprobantes_cierre.
+    Antes esta cuenta no tenia ningun tipo de exclusion, ni siquiera la
+    version anterior basada en NIT (el ICA se liquida ante la tesoreria de
+    cada MUNICIPIO, no la DIAN - Bogota, Medellin, Cali, etc. tienen NIT
+    distinto, imposible enumerar por ciudad). La deteccion estructural (tipo
+    "CC" + varias lineas de la misma familia + fin de mes) no necesita saber
+    quien es la tesoreria de cada cliente. Validado con datos reales de
+    Binaria: sin excluir, junio 2026 daba -$445.931; excluyendo el cierre
+    (comprobante CC-1-124), +$4.800.667."""
+    return _detectar_comprobantes_cierre(idcliente, desde, hasta, "236805")
 
 
 def construir_retenciones_siigo(idcliente, desde, hasta):
     """Version Siigo del reporte de Retenciones (logica original, extraida
     tal cual del endpoint /reportes/retenciones_v1). Cubre solo el lado
     compras (retenciones que la propia empresa practica a sus proveedores,
-    cuentas 2365%/236805% "por pagar" a la DIAN) - el mismo alcance se
-    mantiene en la version Alegra.
+    cuentas 2365%/236805% "por pagar" a la DIAN/tesorerias municipales) - el
+    mismo alcance se mantiene en la version Alegra.
 
-    Retefuente (2365%) excluye los comprobantes de cierre contra la DIAN
-    detectados por _cierre_retefuente_siigo (ver docstring ahi) - mismo
-    problema y mismo fix que Cruce de IVA. ReteICA (236805%) NO se excluye
-    todavia - su cierre va contra otro tercero (Tesoreria Distrital de
-    Bogota) y no esta validado con el mismo nivel de confianza (pendiente,
-    ver memoria del proyecto)."""
+    Tanto Retefuente (2365%) como ReteICA (236805%) excluyen sus propios
+    comprobantes de cierre (ver _cierre_retefuente_siigo/_cierre_reteica_siigo)
+    - mismo problema y mismo mecanismo generico que Cruce de IVA."""
     from sqlalchemy import text, bindparam
 
     comprobantes_cierre_rf = _cierre_retefuente_siigo(idcliente, desde, hasta)
+    comprobantes_cierre_ica = _cierre_reteica_siigo(idcliente, desde, hasta)
     excl_rf = list(comprobantes_cierre_rf) if comprobantes_cierre_rf else ["__ninguno__"]
+    excl_ica = list(comprobantes_cierre_ica) if comprobantes_cierre_ica else ["__ninguno__"]
 
     sql_evolucion = text("""
         SELECT
             periodo_anio,
             periodo_mes,
             SUM(CASE WHEN cuenta_codigo LIKE '2365%' AND comprobante_numero NOT IN :excl_rf THEN (credito - debito) ELSE 0 END) AS retefuente,
-            SUM(CASE WHEN cuenta_codigo LIKE '236805%' THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
+            SUM(CASE WHEN cuenta_codigo LIKE '236805%' AND comprobante_numero NOT IN :excl_ica THEN (credito - debito) ELSE 0 END) AS reteica_conceptos
         FROM auxiliar_contable
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
@@ -3212,7 +3279,7 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         )
         GROUP BY periodo_anio, periodo_mes
         ORDER BY periodo_anio, periodo_mes
-    """).bindparams(bindparam("excl_rf", expanding=True))
+    """).bindparams(bindparam("excl_rf", expanding=True), bindparam("excl_ica", expanding=True))
 
     sql_composicion = text("""
         SELECT
@@ -3232,10 +3299,11 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
                 OR cuenta_codigo LIKE '236805%'
         )
         AND NOT (cuenta_codigo LIKE '2365%' AND comprobante_numero IN :excl_rf)
+        AND NOT (cuenta_codigo LIKE '236805%' AND comprobante_numero IN :excl_ica)
         GROUP BY cuenta_codigo, cuenta_nombre
         HAVING SUM(credito - debito) <> 0
         ORDER BY ABS(SUM(credito - debito)) DESC, cuenta_codigo
-    """).bindparams(bindparam("excl_rf", expanding=True))
+    """).bindparams(bindparam("excl_rf", expanding=True), bindparam("excl_ica", expanding=True))
 
     sql_ica_detalle_mensual = text("""
         SELECT
@@ -3248,10 +3316,11 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         WHERE idcliente = :idc
         AND fecha_contable BETWEEN :d AND :h
         AND cuenta_codigo LIKE '236805%'
+        AND comprobante_numero NOT IN :excl_ica
         GROUP BY periodo_anio, periodo_mes, cuenta_codigo, cuenta_nombre
         HAVING SUM(credito - debito) <> 0
         ORDER BY periodo_anio, periodo_mes, cuenta_codigo
-    """)
+    """).bindparams(bindparam("excl_ica", expanding=True))
 
     sql_retefuente_detalle_mensual = text("""
         SELECT
@@ -3279,9 +3348,9 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
         AND cuenta_codigo = '236898'
     """)
 
-    res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
-    res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
-    res_ica_det = db.session.execute(sql_ica_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res_evo = db.session.execute(sql_evolucion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf, "excl_ica": excl_ica}).mappings().all()
+    res_comp = db.session.execute(sql_composicion, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf, "excl_ica": excl_ica}).mappings().all()
+    res_ica_det = db.session.execute(sql_ica_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta, "excl_ica": excl_ica}).mappings().all()
     res_rf_det = db.session.execute(sql_retefuente_detalle_mensual, {"idc": idcliente, "d": desde, "h": hasta, "excl_rf": excl_rf}).mappings().all()
     ref_236898 = db.session.execute(sql_referencia_236898, {"idc": idcliente, "d": desde, "h": hasta}).mappings().first()
 
@@ -3421,6 +3490,11 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
 
     valor_236898 = float((ref_236898 or {}).get("valor_236898") or 0)
 
+    comprobantes_cierre_detectados = (
+        _detalle_comprobantes_cierre(idcliente, desde, hasta, "2365", comprobantes_cierre_rf)
+        + _detalle_comprobantes_cierre(idcliente, desde, hasta, "236805", comprobantes_cierre_ica)
+    )
+
     return {
         "kpis": {
             "total_retefuente": total_rf,
@@ -3438,6 +3512,10 @@ def construir_retenciones_siigo(idcliente, desde, hasta):
             "cuenta_236898": valor_236898,
             "nota": "La cuenta 236898 se informa solo como referencia contable y no participa en los KPIs ni en el total del período."
         },
+        # Transparencia: comprobantes excluidos por detectarse como cierre/
+        # ajuste contable - InsightsFlow es una guia, no la liquidacion
+        # oficial, asi que el usuario/contador debe poder revisar esto.
+        "comprobantes_cierre_detectados": comprobantes_cierre_detectados,
         "metadata": {
             "desde": desde,
             "hasta": hasta,
@@ -19642,10 +19720,20 @@ def create_app():
                     s = str(val).strip()
                     return s[:-2] if s.endswith(".0") else s
 
+                comprobante_str = str(row.get('Comprobante') or "").strip() or None
+                # Prefijo alfabetico del comprobante (ej "CC" de "CC-1-118", "FV"
+                # de "FV-1-2238") - Siigo no trae una columna de tipo separada
+                # como si trae el libro diario de Alegra, hay que parsearla del
+                # mismo string. Usado para detectar asientos de cierre/ajuste
+                # manual (tipo "CC") vs documentos comerciales reales.
+                match_tipo = re.match(r"^([A-Za-z]+)", comprobante_str or "")
+                tipo_comprobante = match_tipo.group(1).upper() if match_tipo else None
+
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
-                    "comprobante_numero": str(row.get('Comprobante') or "").strip() or None,
+                    "comprobante_tipo": tipo_comprobante,
+                    "comprobante_numero": comprobante_str,
                     "cuenta_codigo": codigo_limpio,
                     "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
                     "tercero_nit": clean_codigo(row.get('Identificación')),
