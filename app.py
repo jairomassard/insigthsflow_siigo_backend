@@ -1982,10 +1982,94 @@ def _inventarios_actual(idcliente, fecha_corte):
     return float(row.total if row else 0) or 0.0
 
 
-def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
-    """Version Siigo del Cruce de IVAs (logica original, extraida tal cual
-    del endpoint /reportes/cruce_iva_v2 sin cambios de comportamiento)."""
+NIT_DIAN = "800197268"  # NIT de la DIAN, constante nacional (Colombia) - no depende del cliente.
+
+
+def _cierres_iva_siigo(idcliente, desde, hasta):
+    """Detecta asientos de cierre de IVA en auxiliar_contable: comprobantes con
+    una linea contra la DIAN (tercero_nit=NIT_DIAN) en una cuenta "IVA POR
+    PAGAR" (nombre, no codigo - cada contador numera distinto), fechados el
+    ultimo dia calendario de un mes. Encontrado con datos reales de Binaria
+    (comprobante CC-1-118, 30-06-2026): ese asiento resetea a $0 las subcuentas
+    2408xx acumuladas de varios meses y mueve el neto a una cuenta resumen -
+    si cae dentro del rango de fechas filtrado, contamina el calculo
+    transaccional (ver memoria del proyecto). Devuelve (declarado_por_periodo,
+    comprobantes_a_excluir) para que el caller excluya esas lineas del calculo
+    "como vamos" y muestre el neto declarado por separado."""
     from sqlalchemy import text
+
+    sql = text("""
+        SELECT periodo_anio, periodo_mes, comprobante_numero,
+               SUM(credito - debito) AS declarado
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable BETWEEN :d AND :h
+          AND comprobante_numero IS NOT NULL
+          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
+          AND cuenta_nombre ILIKE '%iva%por pagar%'
+          AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
+        GROUP BY 1, 2, 3
+    """)
+    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
+
+    declarado_por_periodo = {}
+    comprobantes = set()
+    for r in rows:
+        key = (r["periodo_anio"], r["periodo_mes"])
+        declarado_por_periodo[key] = declarado_por_periodo.get(key, 0.0) + float(r["declarado"] or 0)
+        comprobantes.add(r["comprobante_numero"])
+    return declarado_por_periodo, comprobantes
+
+
+def _cierre_reteiva_siigo(idcliente, desde, hasta):
+    """Analogo a _cierres_iva_siigo pero para 135517 (ReteIVA a favor).
+    Confirmado con el contador de Binaria (2026-07-24): el comprobante de
+    cierre para esta cuenta NO resetea en una sola linea contra la DIAN como
+    el de IVA/Retefuente - reclasifica el saldo cliente por cliente (Stanzia,
+    Inchcape, Porsche, etc.), y los montos ahi representan "retenciones
+    practicadas de facturas de todo el año" (palabras textuales del contador),
+    no solo del mes/bimestre cerrado - mismo problema de fondo que el cierre
+    de IVA: si cae dentro del rango filtrado, mezcla varios periodos en uno.
+    El deber ser es cerrar cada bimestre (no cada mes, a diferencia de IVA/
+    Retefuente), pero a Binaria le toco un "ponerse al dia" del semestre en
+    una sola fecha (30-06-2026, comprobante CC-1-119) - mismo patron que IVA.
+    No existe todavia una cuenta resumen tipo "24089005" para ReteIVA (el
+    contador confirmo que se puede crear a futuro) - por eso esta funcion
+    solo devuelve el set de comprobantes a excluir, no hay "declarado" que
+    calcular aun. Se identifica el comprobante buscando la LINEA de cierre
+    dentro de 135517 (no en 2408, por eso no se reusa _cierres_iva_siigo) con
+    tercero=DIAN fechada el ultimo dia calendario de un mes; se excluyen
+    TODAS las lineas de ese comprobante (incluidas las de Stanzia/Inchcape/
+    etc, no solo la de DIAN), porque todas pertenecen al mismo reseteo."""
+    from sqlalchemy import text
+
+    sql = text("""
+        SELECT DISTINCT comprobante_numero
+        FROM auxiliar_contable
+        WHERE idcliente = :idc
+          AND fecha_contable BETWEEN :d AND :h
+          AND comprobante_numero IS NOT NULL
+          AND cuenta_codigo LIKE '135517%'
+          AND regexp_replace(COALESCE(tercero_nit, ''), '[^0-9]', '', 'g') LIKE :nit_dian || '%'
+          AND fecha_contable = (date_trunc('month', fecha_contable) + interval '1 month - 1 day')::date
+    """)
+    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "nit_dian": NIT_DIAN}).mappings().all()
+    return {r["comprobante_numero"] for r in rows}
+
+
+def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
+    """Version Siigo del Cruce de IVAs. El calculo transaccional (iva_ventas/
+    iva_compras/reteiva_favor) excluye los comprobantes de cierre detectados
+    por _cierres_iva_siigo y _cierre_reteiva_siigo (ver docstrings ahi) - sin
+    eso, un cierre contable que caiga dentro del rango de fechas mezcla el
+    reseteo con movimiento real y distorsiona tanto el signo como la magnitud
+    (confirmado con datos reales de Binaria mayo-junio 2026, IVA y ReteIVA)."""
+    from sqlalchemy import text, bindparam
+
+    declarado_por_periodo, comprobantes_cierre = _cierres_iva_siigo(idcliente, desde, hasta)
+    comprobantes_cierre_rete = _cierre_reteiva_siigo(idcliente, desde, hasta)
+    excl = list(comprobantes_cierre) if comprobantes_cierre else ["__ninguno__"]
+    excl_rete = list(comprobantes_cierre_rete) if comprobantes_cierre_rete else ["__ninguno__"]
 
     f_vtas = []
     f_comps = []
@@ -2002,24 +2086,27 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
     sql_vtas_dinamico = " OR ".join(f_vtas) if f_vtas else "1=0"
     sql_comps_dinamico = " OR ".join(f_comps) if f_comps else "1=0"
 
+    # Las cuentas 2408xx (ventas/compras) excluyen los comprobantes de cierre
+    # de IVA; 135517 (rete) excluye los suyos propios (distintos comprobantes,
+    # ver _cierre_reteiva_siigo).
     sql = text(f"""
         SELECT
             periodo_anio, periodo_mes,
-            SUM(CASE WHEN (cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%') THEN (credito - debito) ELSE 0 END) AS v19,
-            SUM(CASE WHEN cuenta_codigo LIKE '24080603%' THEN (credito - debito) ELSE 0 END) AS v5,
-            SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081002%' OR cuenta_codigo LIKE '24081501%' OR cuenta_codigo LIKE '24081502%') THEN (debito - credito) ELSE 0 END) AS c19,
-            SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') THEN (debito - credito) ELSE 0 END) AS c5,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24080601%' OR cuenta_codigo LIKE '24080602%') AND comprobante_numero NOT IN :excl THEN (credito - debito) ELSE 0 END) AS v19,
+            SUM(CASE WHEN cuenta_codigo LIKE '24080603%' AND comprobante_numero NOT IN :excl THEN (credito - debito) ELSE 0 END) AS v5,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24081001%' OR cuenta_codigo LIKE '24081002%' OR cuenta_codigo LIKE '24081501%' OR cuenta_codigo LIKE '24081502%') AND comprobante_numero NOT IN :excl THEN (debito - credito) ELSE 0 END) AS c19,
+            SUM(CASE WHEN (cuenta_codigo LIKE '24081003%' OR cuenta_codigo LIKE '24081503%') AND comprobante_numero NOT IN :excl THEN (debito - credito) ELSE 0 END) AS c5,
 
-            SUM(CASE WHEN ({sql_vtas_dinamico}) THEN (credito - debito) ELSE 0 END) AS v_total,
-            SUM(CASE WHEN ({sql_comps_dinamico}) THEN (debito - credito) ELSE 0 END) AS c_total,
+            SUM(CASE WHEN ({sql_vtas_dinamico}) AND comprobante_numero NOT IN :excl THEN (credito - debito) ELSE 0 END) AS v_total,
+            SUM(CASE WHEN ({sql_comps_dinamico}) AND comprobante_numero NOT IN :excl THEN (debito - credito) ELSE 0 END) AS c_total,
 
-            SUM(CASE WHEN cuenta_codigo LIKE '135517%' THEN (debito - credito) ELSE 0 END) AS rete
+            SUM(CASE WHEN cuenta_codigo LIKE '135517%' AND comprobante_numero NOT IN :excl_rete THEN (debito - credito) ELSE 0 END) AS rete
         FROM auxiliar_contable
         WHERE idcliente = :idc AND fecha_contable BETWEEN :d AND :h
         GROUP BY 1, 2 ORDER BY 1, 2
-    """)
+    """).bindparams(bindparam("excl", expanding=True), bindparam("excl_rete", expanding=True))
 
-    res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    res = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta, "excl": excl, "excl_rete": excl_rete}).mappings().all()
 
     series_mensuales = []
     for r in res:
@@ -2030,6 +2117,8 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
         iva_v5 = float(r['v5'] or 0)
         iva_c19 = float(r['c19'] or 0)
         iva_c5 = float(r['c5'] or 0)
+        iva_declarado = declarado_por_periodo.get((r['periodo_anio'], r['periodo_mes']))
+        saldo_iva = float(r['v_total'] or 0) - float(r['c_total'] or 0) - float(r['rete'] or 0)
 
         series_mensuales.append({
             "label": f"{r['periodo_anio']}-{r['periodo_mes']:02d}",
@@ -2046,7 +2135,9 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
             "iva_ventas": float(r['v_total'] or 0),
             "iva_compras": float(r['c_total'] or 0),
             "reteiva_favor": float(r['rete'] or 0),
-            "saldo_iva": float(r['v_total'] or 0) - float(r['c_total'] or 0) - float(r['rete'] or 0),
+            "saldo_iva": saldo_iva,
+            "iva_declarado_contabilidad": iva_declarado,
+            "diferencia_vs_declarado": (saldo_iva - iva_declarado) if iva_declarado is not None else None,
             "mes_presentacion": mes_pres
         })
 
@@ -2200,6 +2291,8 @@ def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
     # distribuye tal cual, sin netear contra nada.
     compras_por_periodo = _netear(bruto_compras_por_periodo, {})
 
+    declarado_por_periodo = _iva_declarado_alegra(idcliente, desde, hasta)
+
     periodos = sorted(
         set(ventas_por_periodo.keys())
         | set(compras_por_periodo.keys())
@@ -2220,6 +2313,9 @@ def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
         f_actual = datetime(anio, mes, 1)
         mes_pres = (f_actual + timedelta(days=32)).strftime("%Y-%m")
 
+        iva_declarado = declarado_por_periodo.get((anio, mes))
+        saldo_iva = v_total - c_total - rete
+
         series_mensuales.append({
             "label": f"{anio}-{mes:02d}",
             "iva_v19": v["t19"],
@@ -2235,14 +2331,53 @@ def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
             "iva_ventas": v_total,
             "iva_compras": c_total,
             "reteiva_favor": rete,
-            "saldo_iva": v_total - c_total - rete,
+            "saldo_iva": saldo_iva,
+            "iva_declarado_contabilidad": iva_declarado,
+            "diferencia_vs_declarado": (saldo_iva - iva_declarado) if iva_declarado is not None else None,
             "mes_presentacion": mes_pres,
         })
 
     return _empaquetar_cruce_iva(series_mensuales)
 
 
+def _iva_declarado_alegra(idcliente, desde, hasta):
+    """Equivalente Alegra de _cierres_iva_siigo. Alegra ya sincroniza su
+    propio libro diario (/journals -> alegra_movimientos, automatico, sin
+    necesidad de Excel) y ademas etiqueta las cuentas con una categoria
+    semantica propia (alegra_cuentas_contables.category_rule_key, ej.
+    'IVA_TO_PAY_COL') que identifica la cuenta de IVA por pagar sin importar
+    como la haya nombrado el contador del cliente - mas confiable que buscar
+    por nombre o por tercero=DIAN (que aqui no hace falta). Devuelve
+    {(anio, mes): declarado}; vacio si el cliente nunca activo
+    "Parametrizacion contable" en Alegra (mismo caveat ya documentado en
+    construir_cruce_iva_alegra) o simplemente no tiene esa cuenta cerrada."""
+    from sqlalchemy import text
+
+    sql = text("""
+        SELECT
+            EXTRACT(YEAR FROM m.fecha)::int AS anio,
+            EXTRACT(MONTH FROM m.fecha)::int AS mes,
+            SUM(m.credito - m.debito) AS declarado
+        FROM alegra_movimientos m
+        JOIN alegra_cuentas_contables c
+          ON c.idcliente = m.idcliente AND c.alegra_id = m.alegra_account_id
+        WHERE m.idcliente = :idc
+          AND m.fecha BETWEEN :d AND :h
+          AND c.category_rule_key = 'IVA_TO_PAY_COL'
+          AND m.fecha = (date_trunc('month', m.fecha) + interval '1 month - 1 day')::date
+        GROUP BY 1, 2
+    """)
+    rows = db.session.execute(sql, {"idc": idcliente, "d": desde, "h": hasta}).mappings().all()
+    return {(int(r["anio"]), int(r["mes"])): float(r["declarado"] or 0) for r in rows}
+
+
 def _empaquetar_cruce_iva(series_mensuales):
+    def _suma_declarado(g):
+        """None si NINGUN mes del grupo tiene cierre detectado (no inventar un
+        0 donde no hay dato); suma solo los meses que si lo tienen."""
+        valores = [x.get('iva_declarado_contabilidad') for x in g if x.get('iva_declarado_contabilidad') is not None]
+        return sum(valores) if valores else None
+
     def agrupar(datos, salto):
         agrupados = []
         for i in range(0, len(datos), salto):
@@ -2254,6 +2389,8 @@ def _empaquetar_cruce_iva(series_mensuales):
             r_s = sum(x['reteiva_favor'] for x in g)
             bv_s = sum(x.get('base_ventas', 0) for x in g)
             bc_s = sum(x.get('base_compras', 0) for x in g)
+            saldo_iva = v_s - c_s - r_s
+            declarado = _suma_declarado(g)
             agrupados.append({
                 "label": " + ".join([x['label'] for x in g]),
                 "base_ventas": bv_s,
@@ -2261,10 +2398,15 @@ def _empaquetar_cruce_iva(series_mensuales):
                 "base_compras": bc_s,
                 "iva_compras": c_s,
                 "reteiva_favor": r_s,
-                "saldo_iva": v_s - c_s - r_s,
+                "saldo_iva": saldo_iva,
+                "iva_declarado_contabilidad": declarado,
+                "diferencia_vs_declarado": (saldo_iva - declarado) if declarado is not None else None,
                 "mes_presentacion": g[-1]['mes_presentacion']
             })
         return agrupados
+
+    saldo_iva_total = sum(s['saldo_iva'] for s in series_mensuales)
+    declarado_total = _suma_declarado(series_mensuales)
 
     return {
         "series": series_mensuales,
@@ -2274,7 +2416,9 @@ def _empaquetar_cruce_iva(series_mensuales):
             "base_compras": sum(s.get('base_compras', 0) for s in series_mensuales),
             "iva_compras": sum(s['iva_compras'] for s in series_mensuales),
             "reteiva_favor": sum(s['reteiva_favor'] for s in series_mensuales),
-            "saldo_iva": sum(s['saldo_iva'] for s in series_mensuales)
+            "saldo_iva": saldo_iva_total,
+            "iva_declarado_contabilidad": declarado_total,
+            "diferencia_vs_declarado": (saldo_iva_total - declarado_total) if declarado_total is not None else None
         },
         "series_agrupadas": {
             "bimensual": agrupar(series_mensuales, 2),
@@ -19452,11 +19596,19 @@ def create_app():
                     if val is None or str(val).lower() == 'nan': return 0.0
                     return float(str(val).replace(",", "").replace(" ", "").replace("$", ""))
 
+                def clean_codigo(val):
+                    if val is None or str(val).lower() == 'nan': return None
+                    s = str(val).strip()
+                    return s[:-2] if s.endswith(".0") else s
+
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_contable": f_dt.date(),
+                    "comprobante_numero": str(row.get('Comprobante') or "").strip() or None,
                     "cuenta_codigo": codigo_limpio,
                     "cuenta_nombre": str(row.get('Cuenta contable') or "").strip(),
+                    "tercero_nit": clean_codigo(row.get('Identificación')),
+                    "tercero_nombre": str(row.get('Nombre tercero') or "").strip() or None,
                     "debito": clean_num(row.get('Débito')),
                     "credito": clean_num(row.get('Crédito')),
                     "periodo_anio": f_dt.year,
