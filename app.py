@@ -15738,25 +15738,46 @@ def create_app():
         desde_valida = validar_fecha(desde) if desde else None
         hasta_valida = validar_fecha(hasta) if hasta else None
 
-        condiciones = ["c.idcliente = :idcliente", "c.cost_center IS NOT NULL"]
+        # Antes solo consultaba siigo_compras: para un cliente Alegra el
+        # dropdown de Centro de Costos quedaba siempre vacio (idcliente nunca
+        # aparece en esa tabla), asi que el filtro nunca tenia opciones para
+        # elegir. Se agrega la rama Alegra por UNION ALL, igual que ya hace
+        # compras_enriquecidas - cada cliente solo tiene filas en una de las
+        # dos tablas, asi que no hay riesgo de mezclar datos entre clientes.
+        condiciones_s = ["c.idcliente = :idcliente", "c.cost_center IS NOT NULL"]
+        condiciones_a = ["ac.idcliente = :idcliente", "ac.centro_costo_id IS NOT NULL"]
         params = {"idcliente": idcliente}
 
         if desde_valida:
-            condiciones.append("c.fecha >= :desde")
+            condiciones_s.append("c.fecha >= :desde")
+            condiciones_a.append("ac.fecha >= :desde")
             params["desde"] = desde_valida
         if hasta_valida:
-            condiciones.append("c.fecha <= :hasta")
+            condiciones_s.append("c.fecha <= :hasta")
+            condiciones_a.append("ac.fecha <= :hasta")
             params["hasta"] = hasta_valida
 
-        where_sql = " AND ".join(condiciones)
+        where_s = " AND ".join(condiciones_s)
+        where_a = " AND ".join(condiciones_a)
 
         sql = text(f"""
-            SELECT DISTINCT
-                c.cost_center AS id,
-                COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
-            FROM siigo_compras c
-            LEFT JOIN siigo_centros_costo cc ON c.cost_center = cc.id
-            WHERE {where_sql}
+            SELECT DISTINCT id, nombre FROM (
+                SELECT
+                    c.cost_center::text AS id,
+                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                FROM siigo_compras c
+                LEFT JOIN siigo_centros_costo cc ON c.cost_center = cc.id AND cc.idcliente = c.idcliente
+                WHERE {where_s}
+
+                UNION ALL
+
+                SELECT
+                    ac.centro_costo_id AS id,
+                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                FROM alegra_compras ac
+                LEFT JOIN alegra_centros_costo cc ON cc.alegra_id = ac.centro_costo_id AND cc.idcliente = ac.idcliente
+                WHERE {where_a}
+            ) sub
             ORDER BY nombre
         """)
 
@@ -15886,7 +15907,12 @@ def create_app():
             params_egr["hasta"] = fecha_hasta_val
 
         if centro_costos:
-            condiciones_egr.append("c.cost_center = :centro_costos")
+            # centro_costos llega parseado como int (comparte variable con el
+            # filtro de ventas_movimientos_enriquecidos.cost_center, que sigue
+            # siendo integer) - compras_enriquecidas.cost_center ahora es text
+            # (ver alegra_fix_centro_costo_compras_enriquecidas.sql), por eso
+            # el cast explicito en vez de comparar tipos distintos.
+            condiciones_egr.append("c.cost_center = CAST(:centro_costos AS TEXT)")
             params_egr["centro_costos"] = centro_costos
 
         where_egr = " AND ".join(condiciones_egr)
@@ -16421,7 +16447,9 @@ def create_app():
             params["proveedor"] = proveedor.strip()
 
         if centro_costos:
-            condiciones.append("c.cost_center = :centro_costos")
+            # centro_costos llega parseado como int - compras_enriquecidas.cost_center
+            # ahora es text (ver alegra_fix_centro_costo_compras_enriquecidas.sql).
+            condiciones.append("c.cost_center = CAST(:centro_costos AS TEXT)")
             params["centro_costos"] = centro_costos
 
         where_sql = " AND ".join(condiciones)
@@ -21626,7 +21654,10 @@ def create_app():
 
             if centro_costos:
                 condiciones_ing.append("m.cost_center = :centro_costos")
-                condiciones_egr.append("c.cost_center = :centro_costos")
+                # centro_costos llega parseado como int - compras_enriquecidas.cost_center
+                # ahora es text (ver alegra_fix_centro_costo_compras_enriquecidas.sql);
+                # ventas_movimientos_enriquecidos.cost_center (m.) sigue siendo integer.
+                condiciones_egr.append("c.cost_center = CAST(:centro_costos AS TEXT)")
                 params["centro_costos"] = centro_costos
 
             where_ing = " AND ".join(condiciones_ing)
