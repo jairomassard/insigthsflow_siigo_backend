@@ -15537,11 +15537,16 @@ def create_app():
         alegra_base_sq = """(SELECT COALESCE(SUM(COALESCE(aci.subtotal, aci.total)), 0)
                              FROM alegra_compra_items aci
                              WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente)"""
+        # Impuestos = IVA + ICO (Impoconsumo). Confirmado con dato real
+        # 2026-08-13 (Maslux, idcliente 16): 26 compras con type='ICO' en
+        # aci.tax, $275.099 en total, que antes quedaba escondido dentro de
+        # Subtotal por no filtrarse aqui (solo se sumaba IVA). No se separa
+        # en tarjeta propia por ahora - se suma junto con IVA en "Impuestos".
         alegra_iva_sq = """(SELECT COALESCE(SUM((t->>'amount')::numeric), 0)
                             FROM alegra_compra_items aci
                             CROSS JOIN LATERAL jsonb_array_elements(aci.tax) AS t
                             WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente
-                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' = 'IVA')"""
+                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' IN ('IVA', 'ICO'))"""
 
         subtotal_expr = f"""(
             COALESCE((SELECT SUM(sci.precio * sci.cantidad) FROM siigo_compras_items sci
@@ -15734,11 +15739,16 @@ def create_app():
         alegra_base_sq = """(SELECT COALESCE(SUM(COALESCE(aci.subtotal, aci.total)), 0)
                              FROM alegra_compra_items aci
                              WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente)"""
+        # Impuestos = IVA + ICO (Impoconsumo). Confirmado con dato real
+        # 2026-08-13 (Maslux, idcliente 16): 26 compras con type='ICO' en
+        # aci.tax, $275.099 en total, que antes quedaba escondido dentro de
+        # Subtotal por no filtrarse aqui (solo se sumaba IVA). No se separa
+        # en tarjeta propia por ahora - se suma junto con IVA en "Impuestos".
         alegra_iva_sq = """(SELECT COALESCE(SUM((t->>'amount')::numeric), 0)
                             FROM alegra_compra_items aci
                             CROSS JOIN LATERAL jsonb_array_elements(aci.tax) AS t
                             WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente
-                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' = 'IVA')"""
+                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' IN ('IVA', 'ICO'))"""
 
         subtotal_expr = f"""(
             COALESCE((SELECT SUM(sci.precio * sci.cantidad) FROM siigo_compras_items sci
