@@ -143,6 +143,28 @@ def sync_compras_desde_siigo(
             saldo = c.get("balance")
             cost_center = c.get("cost_center")
 
+            # Desglose informativo de retenciones a nivel de compra (ReteICA/
+            # ReteIVA/Autorretención) - viene del arreglo `retentions` de
+            # /v1/purchases, separado de `taxes` (IVA) de cada item. NO se usa
+            # para nada del cálculo de saldo/estado de pago (eso sigue
+            # dependiendo únicamente de `retencion_total`, que hoy solo se
+            # llena para Documento Soporte - ver nota en models.py). Es
+            # puramente para mostrarle al usuario qué retención tiene cada
+            # factura. Se usa el nombre humano ("ReteICA 9.66") como `type`
+            # en vez del código numérico que trae Siigo, porque es lo que se
+            # le muestra al usuario en el modal.
+            retentions_raw = c.get("retentions")
+            retenciones_compra = []
+            if isinstance(retentions_raw, list):
+                for r in retentions_raw:
+                    if not isinstance(r, dict):
+                        continue
+                    retenciones_compra.append({
+                        "type": r.get("name") or str(r.get("type") or "Retención"),
+                        "percentage": r.get("percentage"),
+                        "value": r.get("value"),
+                    })
+
             provider_invoice = c.get("provider_invoice")
             factura_proveedor = None
             if provider_invoice:
@@ -169,7 +191,8 @@ def sync_compras_desde_siigo(
                     saldo=saldo,
                     cost_center=cost_center,
                     creado=creado,
-                    factura_proveedor=factura_proveedor
+                    factura_proveedor=factura_proveedor,
+                    retenciones=retenciones_compra or None,
                 )
                 db.session.add(compra)
                 nuevas += 1
@@ -185,6 +208,7 @@ def sync_compras_desde_siigo(
                 compra.cost_center = cost_center
                 compra.creado = creado
                 compra.factura_proveedor = factura_proveedor
+                compra.retenciones = retenciones_compra or None
                 actualizadas += 1
                 print(f"🔁 Compra actualizada: {idcompra}")
 
@@ -226,6 +250,25 @@ def sync_compras_desde_siigo(
                     if tiene_iva:
                         impuestos = iva_sum
 
+                # Retefuente/ReteIVA por item: viene mezclada con el IVA en el
+                # mismo arreglo `taxes` (confirmado en el fix de IVA de
+                # arriba). Se guarda aparte de `impuestos` (que es solo IVA)
+                # para no romper nada de lo que ya depende de ese campo.
+                retenciones_item = []
+                if isinstance(taxes, list):
+                    for tx in taxes:
+                        if not isinstance(tx, dict):
+                            continue
+                        ttype = str(tx.get("type") or "").upper()
+                        tname = str(tx.get("name") or "").upper()
+                        if "IVA" in ttype or "IVA" in tname:
+                            continue
+                        retenciones_item.append({
+                            "type": tx.get("name") or tx.get("type") or "Retención",
+                            "percentage": tx.get("percentage"),
+                            "value": tx.get("value"),
+                        })
+
                 i = SiigoCompraItem(
                     compra_id=compra.id,
                     idcliente=idcliente,
@@ -233,7 +276,8 @@ def sync_compras_desde_siigo(
                     cantidad=cantidad,
                     precio=precio,
                     impuestos=impuestos,
-                    codigo=code
+                    codigo=code,
+                    retenciones_item=retenciones_item or None,
                 )
                 db.session.add(i)
 

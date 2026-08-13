@@ -555,6 +555,14 @@ class SiigoCompra(db.Model):
     # restarla del total bruto antes de comparar contra saldo. Solo se llena para DS.
     retencion_total = db.Column(db.Numeric(15, 2), nullable=False, server_default="0")
 
+    # Desglose informativo de retenciones a nivel de compra (ReteICA/ReteIVA/
+    # Autorretención, viene del arreglo `retentions` de /v1/purchases) - dicts
+    # con type/percentage/value. Puramente para mostrarle al usuario qué
+    # retención se le practicó; NO participa en retencion_total/saldo/estado
+    # de pago (ver nota en detalle_facturas_mes en app.py). NULL en compras
+    # sincronizadas antes de este campo (pendiente de backfill).
+    retenciones = db.Column(db.JSON)
+
     items = db.relationship(
         "SiigoCompraItem",
         backref="compra",
@@ -584,6 +592,7 @@ class SiigoCompra(db.Model):
             "creado": self.creado.isoformat() if self.creado else None,
             "factura_proveedor": self.factura_proveedor,
             "retencion_total": float(self.retencion_total or 0),
+            "retenciones": self.retenciones,
         }
 
 
@@ -600,7 +609,10 @@ class SiigoCompraItem(db.Model):
     codigo = db.Column(db.String(100))
     idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
 
-
+    # Retefuente/ReteIVA que Siigo mezcla dentro de items[].taxes[] junto al
+    # IVA (que sí se guarda en `impuestos` arriba) - dicts con type/percentage/
+    # value. Ver misma nota de alcance informativo en SiigoCompra.retenciones.
+    retenciones_item = db.Column(db.JSON)
 
     def as_dict(self):
         return {
@@ -612,6 +624,7 @@ class SiigoCompraItem(db.Model):
             "precio": float(self.precio or 0),
             "impuestos": float(self.impuestos or 0),
             "codigo": self.codigo,
+            "retenciones_item": self.retenciones_item,
 
         }
 

@@ -15515,6 +15515,77 @@ def create_app():
         # documento (no es un pago real). Ver nota completa en query_kpis.
         total_expr = "GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)"
 
+        # Desglose informativo (Subtotal/Impuestos/Retenciones) para el modal -
+        # NO participa en total_expr/saldo/estado_pago de arriba, es puramente
+        # para mostrarle al usuario en qué se compone la factura. Fuente:
+        # items de siigo_compras_items (Siigo) + alegra_compra_items/
+        # alegra_compra_retenciones (Alegra), vía subqueries correlacionadas
+        # con c.id + c.idcliente (evita choques de id entre ambos proveedores,
+        # ya que un idcliente solo tiene filas en una de las dos ramas).
+        # alegra_compra_items.subtotal viene NULL cuando la compra es un gasto
+        # directo a cuenta contable (purchases.categories[], no items[] -
+        # confirmado en alegra_sync_compras.py: solo items[] guarda subtotal,
+        # categories[] guarda subtotal=None a propósito). Para ese caso se usa
+        # total del item como base y se le resta el IVA de ese mismo item más
+        # abajo, para que Subtotal+Impuestos siga sumando el Total mostrado.
+        alegra_base_sq = """(SELECT COALESCE(SUM(COALESCE(aci.subtotal, aci.total)), 0)
+                             FROM alegra_compra_items aci
+                             WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente)"""
+        alegra_iva_sq = """(SELECT COALESCE(SUM((t->>'amount')::numeric), 0)
+                            FROM alegra_compra_items aci
+                            CROSS JOIN LATERAL jsonb_array_elements(aci.tax) AS t
+                            WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente
+                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' = 'IVA')"""
+
+        subtotal_expr = f"""(
+            COALESCE((SELECT SUM(sci.precio * sci.cantidad) FROM siigo_compras_items sci
+                      WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+            + {alegra_base_sq} - {alegra_iva_sq}
+        )"""
+
+        impuestos_expr = f"""(
+            COALESCE((SELECT SUM(sci.impuestos) FROM siigo_compras_items sci
+                      WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+            + {alegra_iva_sq}
+        )"""
+
+        # Prioridad del desglose de retenciones (siempre informativo, nunca
+        # toca c.retencion_total/total_expr/saldo):
+        # 1) Alegra: alegra_compra_retenciones ya trae el desglose real.
+        # 2) Siigo con re-sync nuevo (Fase 3): siigo_compras.retenciones
+        #    (ReteICA/ReteIVA a nivel de compra) + siigo_compras_items.
+        #    retenciones_item (Retefuente por ítem, mezclada con IVA en
+        #    taxes[]) - NULL en compras sincronizadas antes de este campo.
+        # 3) Fallback: un único ítem genérico con c.retencion_total (cubre
+        #    Documento Soporte histórico y compras Siigo aún sin re-sync).
+        # El CASE jsonb_typeof(...)='array' evita el bug ya visto con
+        # `retenciones` de ventas ("cannot get array length of a scalar")
+        # si el JSON guardado no fuera un array real.
+        retenciones_expr = """COALESCE(
+            (SELECT json_agg(json_build_object('type', acr.name, 'percentage', acr.percentage, 'value', acr.amount))
+             FROM alegra_compra_retenciones acr
+             WHERE acr.compra_id = c.id AND acr.idcliente = c.idcliente),
+            (SELECT json_agg(elem) FROM (
+                SELECT elem
+                FROM siigo_compras sc,
+                     jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(sc.retenciones::jsonb) = 'array' THEN sc.retenciones::jsonb ELSE '[]'::jsonb END
+                     ) elem
+                WHERE sc.id = c.id AND sc.idcliente = c.idcliente
+                UNION ALL
+                SELECT elem
+                FROM siigo_compras_items sci,
+                     jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(sci.retenciones_item::jsonb) = 'array' THEN sci.retenciones_item::jsonb ELSE '[]'::jsonb END
+                     ) elem
+                WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente
+            ) u),
+            CASE WHEN COALESCE(c.retencion_total, 0) > 0
+                THEN json_build_array(json_build_object('type', 'Retención', 'percentage', NULL, 'value', c.retencion_total))
+                ELSE '[]'::json
+            END
+        )"""
+
         if estado == "pagado":
             condiciones.append(f"({total_expr} = 0 OR COALESCE(c.saldo,0) = 0)")
         elif estado == "pendiente":
@@ -15549,6 +15620,10 @@ def create_app():
                 COALESCE(c.retencion_total, 0) AS retencion_total,
                 COALESCE(c.estado_ajuste, 'sin_ajuste') AS estado_ajuste,
                 COALESCE(c.ajustes_count,0) AS ajustes_count,
+
+                {subtotal_expr} AS subtotal,
+                {impuestos_expr} AS impuestos,
+                {retenciones_expr} AS retenciones,
 
                 LEAST(
                     COALESCE(c.saldo,0),
@@ -15642,6 +15717,62 @@ def create_app():
         # documento (no es un pago real). Ver nota completa en query_kpis.
         total_expr = "GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)"
 
+        # Ver nota completa en detalle_facturas_mes(): desglose puramente
+        # informativo, no participa en total_expr/saldo/estado_pago.
+        # alegra_compra_items.subtotal viene NULL cuando la compra es un gasto
+        # directo a cuenta contable (purchases.categories[], no items[] -
+        # confirmado en alegra_sync_compras.py: solo items[] guarda subtotal,
+        # categories[] guarda subtotal=None a propósito). Para ese caso se usa
+        # total del item como base y se le resta el IVA de ese mismo item más
+        # abajo, para que Subtotal+Impuestos siga sumando el Total mostrado.
+        alegra_base_sq = """(SELECT COALESCE(SUM(COALESCE(aci.subtotal, aci.total)), 0)
+                             FROM alegra_compra_items aci
+                             WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente)"""
+        alegra_iva_sq = """(SELECT COALESCE(SUM((t->>'amount')::numeric), 0)
+                            FROM alegra_compra_items aci
+                            CROSS JOIN LATERAL jsonb_array_elements(aci.tax) AS t
+                            WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente
+                              AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' = 'IVA')"""
+
+        subtotal_expr = f"""(
+            COALESCE((SELECT SUM(sci.precio * sci.cantidad) FROM siigo_compras_items sci
+                      WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+            + {alegra_base_sq} - {alegra_iva_sq}
+        )"""
+
+        impuestos_expr = f"""(
+            COALESCE((SELECT SUM(sci.impuestos) FROM siigo_compras_items sci
+                      WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+            + {alegra_iva_sq}
+        )"""
+
+        # Ver misma nota de prioridad (Alegra -> Siigo nuevo -> fallback) en
+        # detalle_facturas_mes().
+        retenciones_expr = """COALESCE(
+            (SELECT json_agg(json_build_object('type', acr.name, 'percentage', acr.percentage, 'value', acr.amount))
+             FROM alegra_compra_retenciones acr
+             WHERE acr.compra_id = c.id AND acr.idcliente = c.idcliente),
+            (SELECT json_agg(elem) FROM (
+                SELECT elem
+                FROM siigo_compras sc,
+                     jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(sc.retenciones::jsonb) = 'array' THEN sc.retenciones::jsonb ELSE '[]'::jsonb END
+                     ) elem
+                WHERE sc.id = c.id AND sc.idcliente = c.idcliente
+                UNION ALL
+                SELECT elem
+                FROM siigo_compras_items sci,
+                     jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(sci.retenciones_item::jsonb) = 'array' THEN sci.retenciones_item::jsonb ELSE '[]'::jsonb END
+                     ) elem
+                WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente
+            ) u),
+            CASE WHEN COALESCE(c.retencion_total, 0) > 0
+                THEN json_build_array(json_build_object('type', 'Retención', 'percentage', NULL, 'value', c.retencion_total))
+                ELSE '[]'::json
+            END
+        )"""
+
         # Mismo criterio de estado usado en detalle_facturas_mes(): este modal
         # (el de "Top 15 Proveedores") no tenia filtro de estado - se agrega
         # para dar coherencia con el modal de detalle por mes.
@@ -15670,6 +15801,10 @@ def create_app():
                 COALESCE(c.retencion_total, 0) AS retencion_total,
                 COALESCE(c.estado_ajuste, 'sin_ajuste') AS estado_ajuste,
                 COALESCE(c.ajustes_count,0) AS ajustes_count,
+
+                {subtotal_expr} AS subtotal,
+                {impuestos_expr} AS impuestos,
+                {retenciones_expr} AS retenciones,
 
                 LEAST(
                     COALESCE(c.saldo,0),
