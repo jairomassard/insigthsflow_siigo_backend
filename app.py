@@ -82,7 +82,10 @@ from balance import (
 )
 
 from siigo.siigo_sync_documentos_soporte_staging import sync_documentos_soporte_staging_desde_siigo
-from siigo.siigo_insert_documentos_soporte_desde_staging import insertar_documentos_soporte_desde_staging
+from siigo.siigo_insert_documentos_soporte_desde_staging import (
+    insertar_documentos_soporte_desde_staging,
+    backfill_retenciones_documentos_soporte,
+)
 
 from urllib.parse import urlencode
 
@@ -22501,6 +22504,41 @@ def create_app():
                 "fecha_desde": fecha_desde,
             }), 500
 
+
+    @app.route("/siigo/backfill-retenciones-documentos-soporte", methods=["POST"])
+    def siigo_backfill_retenciones_documentos_soporte():
+        """
+        Recalcula retenciones/retenciones_item (y corrige impuestos, ver fix
+        de _sum_item_taxes) para los Documento Soporte que ya están en
+        siigo_compras, releyendo el raw_json ya cacheado en staging - no
+        llama a la API de Siigo, es puramente local/rápido.
+
+        dry_run = true  -> Simulación (preview, no escribe nada)
+        dry_run = false -> Backfill real
+        """
+        idcliente = obtener_idcliente_desde_request()
+        if not idcliente:
+            return jsonify({"error": "Cliente no autorizado"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        dry_run = (
+            request.args.get("dry_run", "").lower() in ("1", "true", "yes")
+            or bool(payload.get("dry_run"))
+        )
+
+        try:
+            resultado = backfill_retenciones_documentos_soporte(
+                idcliente=idcliente,
+                dry_run=dry_run,
+            )
+            return jsonify(resultado), 200
+        except Exception as e:
+            db.session.rollback()
+            traceback.print_exc()
+            return jsonify({
+                "error": "Error en backfill de retenciones de documentos soporte",
+                "detalle": str(e),
+            }), 500
 
 
     #Endpoints para consultar historial ed sincronizaciones
