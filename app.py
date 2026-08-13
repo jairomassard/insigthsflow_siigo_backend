@@ -14093,6 +14093,8 @@ def create_app():
                 "total": _dec(c.total),
                 "saldo": _dec(c.saldo),
                 "created_at": c.created_at.isoformat() if c.created_at else None,
+                "retencion_total": _dec(c.retencion_total),
+                "retenciones": c.retenciones,
             }
 
         def item_to_dict(i):
@@ -14103,6 +14105,7 @@ def create_app():
                 "cantidad": _dec(i.cantidad),
                 "precio": _dec(i.precio),
                 "impuestos": _dec(i.impuestos),
+                "retenciones_item": i.retenciones_item,
             }
 
         return jsonify({
