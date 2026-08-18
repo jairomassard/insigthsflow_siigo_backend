@@ -15123,12 +15123,68 @@ def create_app():
         detalle = []
 
         if incluir_detalle:
+            # Desglose informativo (Subtotal/Impuestos/Retenciones) por
+            # factura, mismo criterio y subqueries correlacionadas ya
+            # usadas en detalle_facturas_mes()/detalle_proveedor() de
+            # compras-gastos (app.py, buscar "alegra_base_sq" para la nota
+            # completa) - puramente para mostrarle al usuario en que se
+            # compone cada factura, NO participa en saldo/estado de pago.
+            alegra_base_sq = """(SELECT COALESCE(SUM(COALESCE(aci.subtotal, aci.total)), 0)
+                                 FROM alegra_compra_items aci
+                                 WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente)"""
+            alegra_iva_sq = """(SELECT COALESCE(SUM((t->>'amount')::numeric), 0)
+                                FROM alegra_compra_items aci
+                                CROSS JOIN LATERAL jsonb_array_elements(aci.tax) AS t
+                                WHERE aci.compra_id = c.id AND aci.idcliente = c.idcliente
+                                  AND jsonb_typeof(aci.tax) = 'array' AND t->>'type' IN ('IVA', 'ICO'))"""
+
+            subtotal_expr = f"""(
+                COALESCE((SELECT SUM(sci.precio * sci.cantidad) FROM siigo_compras_items sci
+                          WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+                + {alegra_base_sq} - {alegra_iva_sq}
+            )"""
+
+            impuestos_expr = f"""(
+                COALESCE((SELECT SUM(sci.impuestos) FROM siigo_compras_items sci
+                          WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente), 0)
+                + {alegra_iva_sq}
+            )"""
+
+            retenciones_expr = """COALESCE(
+                (SELECT json_agg(json_build_object('type', acr.name, 'percentage', acr.percentage, 'value', acr.amount))
+                 FROM alegra_compra_retenciones acr
+                 WHERE acr.compra_id = c.id AND acr.idcliente = c.idcliente),
+                (SELECT json_agg(elem) FROM (
+                    SELECT elem
+                    FROM siigo_compras sc,
+                         jsonb_array_elements(
+                            CASE WHEN jsonb_typeof(sc.retenciones::jsonb) = 'array' THEN sc.retenciones::jsonb ELSE '[]'::jsonb END
+                         ) elem
+                    WHERE sc.id = c.id AND sc.idcliente = c.idcliente
+                    UNION ALL
+                    SELECT elem
+                    FROM siigo_compras_items sci,
+                         jsonb_array_elements(
+                            CASE WHEN jsonb_typeof(sci.retenciones_item::jsonb) = 'array' THEN sci.retenciones_item::jsonb ELSE '[]'::jsonb END
+                         ) elem
+                    WHERE sci.compra_id = c.id AND sci.idcliente = c.idcliente
+                ) u),
+                CASE WHEN COALESCE(c.retencion_total, 0) > 0
+                    THEN json_build_array(json_build_object('type', 'Retención', 'percentage', NULL, 'value', c.retencion_total))
+                    ELSE '[]'::json
+                END
+            )"""
+
             query_detalle = f"""
                 SELECT
                     c.idcompra,
                     c.factura_proveedor,
                     c.proveedor_identificacion,
                     c.proveedor_nombre,
+
+                    {subtotal_expr} AS subtotal,
+                    {impuestos_expr} AS impuestos,
+                    {retenciones_expr} AS retenciones,
 
                     -- Se castea a texto ISO explicito: sin esto, Flask serializa
                     -- un date/datetime crudo como RFC 822 ("Tue, 24 Mar 2026..."),
