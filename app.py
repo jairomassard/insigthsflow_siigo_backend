@@ -25,6 +25,17 @@ from flask_jwt_extended import jwt_required, get_jwt
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 
 
+from analisis_ia import (
+    generar_analisis_pyg,
+    generar_analisis_balance,
+    generar_analisis_indicadores,
+    generar_analisis_transversal,
+    generar_word_analisis,
+    consultar_uso_mensual,
+    listar_historial_analisis,
+    TOPE_MENSUAL,
+    TopeAlcanzadoError,
+)
 from siigo_api import auth as siigo_auth, SiigoError
 from siigo.siigo_sync_refactor import sync_facturas_desde_siigo
 from datetime import datetime
@@ -5836,7 +5847,7 @@ def create_app():
     CORS(
         app,
         resources={r"/*": {
-            "origins": "https://insigthsflow.up.railway.app",
+            "origins": ["https://insigthsflow.up.railway.app"],
             "allow_headers": ["Content-Type", "Authorization", "X-ID-CLIENTE"],
             "supports_credentials": True
         }}
@@ -20431,6 +20442,94 @@ def create_app():
             }), 500
 
 
+    @app.route("/reportes/pnl_v1/analisis-ia", methods=["POST"])
+    @jwt_required()
+    def post_pnl_analisis_ia():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+        forzar = bool(data.get("forzar"))
+
+        if not desde or not hasta:
+            return jsonify({"error": "Debes enviar desde y hasta"}), 400
+
+        try:
+            pnl_data = construir_pnl(idcliente, desde, hasta)
+            resultado = generar_analisis_pyg(idcliente, desde, hasta, pnl_data, forzar=forzar)
+            return jsonify(resultado), 200
+        except TopeAlcanzadoError as e:
+            return jsonify({
+                "error": "Ya usaste tus análisis con IA de este mes.",
+                "motivo": "tope_mensual_alcanzado",
+                "uso_actual": e.uso_actual,
+                "tope_mensual": e.tope,
+            }), 429
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/pnl_v1/analisis-ia/word", methods=["POST"])
+    @jwt_required()
+    def post_pnl_analisis_ia_word():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        analisis_markdown = data.get("analisis_markdown")
+        nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
+        periodo = data.get("periodo") or ""
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+
+        if not analisis_markdown:
+            return jsonify({"error": "Debes enviar analisis_markdown"}), 400
+
+        try:
+            # Mismo grafico que ya se ve en pantalla (Ingresos/Costos y
+            # Gastos/EBITDA) - se recalcula con construir_pnl (consulta a
+            # la BD, sin costo de IA) para insertarlo como imagen en el
+            # Word. Si no vienen fechas o falla el calculo, el Word sale
+            # igual pero sin grafico (no bloquea la exportacion).
+            evolucion = None
+            if desde and hasta:
+                try:
+                    evolucion = construir_pnl(idcliente, desde, hasta).get("evolucion")
+                except Exception:
+                    evolucion = None
+
+            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion)
+            nombre_archivo = f"analisis_ia_PyG_{nombre_cliente.replace(' ', '_')}.docx"
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=nombre_archivo,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el Word del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/pnl_v1/analisis-ia/estado", methods=["GET"])
+    @jwt_required()
+    def get_pnl_analisis_ia_estado():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }), 200
+
+
+    @app.route("/reportes/pnl_v1/analisis-ia/historial", methods=["GET"])
+    @jwt_required()
+    def get_pnl_analisis_ia_historial():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({"historial": listar_historial_analisis(idcliente)}), 200
+
 
     @app.route("/dashboard/pnl-v2", methods=["GET"])
     def get_pnl_v2():
@@ -20650,6 +20749,91 @@ def create_app():
                 "error": "No fue posible consultar el balance general",
                 "detalle": str(e)
             }), 500
+
+
+    @app.route("/reportes/balance_general_v1/analisis-ia", methods=["POST"])
+    @jwt_required()
+    def post_balance_general_analisis_ia():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        fecha_corte = data.get("fecha_corte")
+        comparar_con = data.get("comparar_con")
+        forzar = bool(data.get("forzar"))
+
+        if not fecha_corte:
+            return jsonify({"error": "Debes enviar fecha_corte"}), 400
+
+        try:
+            balance_data = construir_balance_general(idcliente, fecha_corte, comparar_con)
+            if not balance_data.get("ok"):
+                return jsonify({
+                    "error": balance_data.get("error", "No fue posible construir el balance")
+                }), 404
+
+            resultado = generar_analisis_balance(
+                idcliente, fecha_corte, comparar_con, balance_data, forzar=forzar
+            )
+            return jsonify(resultado), 200
+        except TopeAlcanzadoError as e:
+            return jsonify({
+                "error": "Ya usaste tus análisis con IA de este mes.",
+                "motivo": "tope_mensual_alcanzado",
+                "uso_actual": e.uso_actual,
+                "tope_mensual": e.tope,
+            }), 429
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/balance_general_v1/analisis-ia/word", methods=["POST"])
+    @jwt_required()
+    def post_balance_general_analisis_ia_word():
+        data = request.get_json(silent=True) or {}
+        analisis_markdown = data.get("analisis_markdown")
+        nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
+        periodo = data.get("periodo") or ""
+
+        if not analisis_markdown:
+            return jsonify({"error": "Debes enviar analisis_markdown"}), 400
+
+        try:
+            # El Balance no tiene una evolucion mes a mes como el PyG, asi
+            # que el Word sale sin grafico - solo el markdown formateado.
+            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            nombre_archivo = f"analisis_ia_Balance_{nombre_cliente.replace(' ', '_')}.docx"
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=nombre_archivo,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el Word del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/balance_general_v1/analisis-ia/estado", methods=["GET"])
+    @jwt_required()
+    def get_balance_general_analisis_ia_estado():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }), 200
+
+
+    @app.route("/reportes/balance_general_v1/analisis-ia/historial", methods=["GET"])
+    @jwt_required()
+    def get_balance_general_analisis_ia_historial():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "historial": listar_historial_analisis(idcliente, tipo_reporte="balance_general")
+        }), 200
 
 
     # ENDPOINT: Buscador inteligente de facturas por contenido
@@ -20928,22 +21112,15 @@ def create_app():
     # Conserva la lógica anterior + parametrización
     # ============================================================
 
-    @app.route("/reportes/auxiliares/indicadores-financieros", methods=["GET"])
-    @jwt_required()
-    def indicadores_financieros_auxiliares():
+    # Extraida de la ruta GET de abajo para poder reusar exactamente el
+    # mismo calculo desde el endpoint de "Analizar con IA" (igual que
+    # construir_pnl/construir_balance_general en sus propios modulos) -
+    # sin esto, el analisis de IA hubiera tenido que duplicar ~400 lineas
+    # de calculo de indicadores, con riesgo real de que las dos copias se
+    # desincronicen con el tiempo.
+    def construir_indicadores_financieros(idcliente, anio, mes_inicio, mes_fin):
         from datetime import date
         from calendar import monthrange
-
-        idcliente = get_jwt().get("idcliente")
-        anio = request.args.get("anio", type=int)
-        mes_inicio = request.args.get("mes_inicio", type=int)
-        mes_fin = request.args.get("mes_fin", type=int)
-
-        if not idcliente or not anio or not mes_inicio or not mes_fin:
-            return jsonify({"error": "Faltan parámetros"}), 400
-
-        if mes_inicio < 1 or mes_inicio > 12 or mes_fin < 1 or mes_fin > 12 or mes_inicio > mes_fin:
-            return jsonify({"error": "Rango de meses inválido"}), 400
 
         fecha_desde = date(anio, mes_inicio, 1)
         fecha_hasta = date(anio, mes_fin, monthrange(anio, mes_fin)[1])
@@ -20980,9 +21157,10 @@ def create_app():
             # --------------------------------------------------
             balance = construir_balance_general(idcliente, str(fecha_hasta))
             if not balance.get("ok"):
-                return jsonify({
+                return {
+                    "ok": False,
                     "error": balance.get("error", "No fue posible construir el balance general")
-                }), 400
+                }
 
             bk = balance.get("kpis", {})
             meta_balance = balance.get("meta", {})
@@ -21277,7 +21455,8 @@ def create_app():
             # =========================
             # Respuesta
             # =========================
-            return jsonify({
+            return {
+                "ok": True,
                 "resumen_financiero": resumen_financiero,
                 "indicadores": indicadores,
                 "explicaciones": explicaciones,
@@ -21314,15 +21493,123 @@ def create_app():
                     "modo_interpretacion": modo_interpretacion,
                     "parametros_configurados": parametros_configurados
                 }
-            }), 200
+            }
 
         except Exception as e:
-            current_app.logger.exception("Error en indicadores_financieros_auxiliares")
+            current_app.logger.exception("Error en construir_indicadores_financieros")
             db.session.rollback()
-            return jsonify({
+            return {
+                "ok": False,
                 "error": "No fue posible calcular indicadores financieros desde auxiliares",
                 "detalle": str(e)
+            }
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros", methods=["GET"])
+    @jwt_required()
+    def get_indicadores_financieros_auxiliares():
+        idcliente = get_jwt().get("idcliente")
+        anio = request.args.get("anio", type=int)
+        mes_inicio = request.args.get("mes_inicio", type=int)
+        mes_fin = request.args.get("mes_fin", type=int)
+
+        if not idcliente or not anio or not mes_inicio or not mes_fin:
+            return jsonify({"error": "Faltan parámetros"}), 400
+
+        if mes_inicio < 1 or mes_inicio > 12 or mes_fin < 1 or mes_fin > 12 or mes_inicio > mes_fin:
+            return jsonify({"error": "Rango de meses inválido"}), 400
+
+        resultado = construir_indicadores_financieros(idcliente, anio, mes_inicio, mes_fin)
+        if not resultado.get("ok"):
+            return jsonify(resultado), 400
+        return jsonify(resultado), 200
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/analisis-ia", methods=["POST"])
+    @jwt_required()
+    def post_indicadores_financieros_analisis_ia():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        anio = data.get("anio")
+        mes_inicio = data.get("mes_inicio")
+        mes_fin = data.get("mes_fin")
+        forzar = bool(data.get("forzar"))
+
+        if not anio or not mes_inicio or not mes_fin:
+            return jsonify({"error": "Debes enviar anio, mes_inicio y mes_fin"}), 400
+
+        try:
+            indicadores_data = construir_indicadores_financieros(idcliente, int(anio), int(mes_inicio), int(mes_fin))
+            if not indicadores_data.get("ok"):
+                return jsonify({
+                    "error": indicadores_data.get("error", "No fue posible calcular los indicadores financieros")
+                }), 404
+
+            meta = indicadores_data.get("meta", {})
+            resultado = generar_analisis_indicadores(
+                idcliente, meta.get("fecha_desde"), meta.get("fecha_hasta"), indicadores_data, forzar=forzar
+            )
+            return jsonify(resultado), 200
+        except TopeAlcanzadoError as e:
+            return jsonify({
+                "error": "Ya usaste tus análisis con IA de este mes.",
+                "motivo": "tope_mensual_alcanzado",
+                "uso_actual": e.uso_actual,
+                "tope_mensual": e.tope,
+            }), 429
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
             }), 500
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/analisis-ia/word", methods=["POST"])
+    @jwt_required()
+    def post_indicadores_financieros_analisis_ia_word():
+        data = request.get_json(silent=True) or {}
+        analisis_markdown = data.get("analisis_markdown")
+        nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
+        periodo = data.get("periodo") or ""
+
+        if not analisis_markdown:
+            return jsonify({"error": "Debes enviar analisis_markdown"}), 400
+
+        try:
+            # Igual que Balance General: sin evolucion mensual tipo PyG que
+            # graficar, el Word sale sin imagen, solo el markdown formateado.
+            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            nombre_archivo = f"analisis_ia_Indicadores_{nombre_cliente.replace(' ', '_')}.docx"
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=nombre_archivo,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el Word del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/analisis-ia/estado", methods=["GET"])
+    @jwt_required()
+    def get_indicadores_financieros_analisis_ia_estado():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }), 200
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/analisis-ia/historial", methods=["GET"])
+    @jwt_required()
+    def get_indicadores_financieros_analisis_ia_historial():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "historial": listar_historial_analisis(idcliente, tipo_reporte="indicadores_financieros")
+        }), 200
 
 
     # ----------------------------------------------------------
@@ -21577,27 +21864,19 @@ def create_app():
     # =========================================================
     # ENDPOINT RESUMEN EJECUTIVO
     # =========================================================
-    @app.route("/dashboard/resumen-ejecutivo", methods=["GET"])
-    @jwt_required()
-    def dashboard_resumen_ejecutivo():
-        claims = get_jwt()
-        idcliente = claims.get("idcliente")
-        if not idcliente:
-            return jsonify({"error": "Token sin cliente"}), 403
-
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        centro_costos = request.args.get("centro_costos", type=int)
-        modo_periodo = request.args.get("modo_periodo")
-
+    # Extraida de la ruta GET de abajo para poder reusar exactamente el
+    # mismo calculo desde el endpoint de "Analizar con IA" del panel
+    # ejecutivo - mismo patron que construir_indicadores_financieros.
+    def construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo):
         try:
             corte = _resolver_corte_confiable_auxiliar(idcliente)
             config = _obtener_config_dashboard(idcliente)
 
             if not corte["ultima_fecha_auxiliar"]:
-                return jsonify({
+                return {
+                    "ok": False,
                     "error": "No hay auxiliar contable cargado para construir el dashboard"
-                }), 400
+                }
 
             modo_periodo = (
                 str(modo_periodo or (config.get("modo_periodo_default") if config else None) or "ytd_cerrado")
@@ -21643,7 +21922,7 @@ def create_app():
                     fecha_desde = datetime.strptime(desde, "%Y-%m-%d").date()
                     fecha_hasta = datetime.strptime(hasta, "%Y-%m-%d").date()
                 except Exception:
-                    return jsonify({"error": "Formato de fecha inválido. Usa YYYY-MM-DD"}), 400
+                    return {"ok": False, "error": "Formato de fecha inválido. Usa YYYY-MM-DD"}
 
             # 2) Ajuste según modo
             tipo_corte = "al_dia" if modo_periodo == "manual" else "cerrado"
@@ -21774,8 +22053,16 @@ def create_app():
             for row in evolucion_nm:
                 ventas_mes = _safe_float(row.get("ingresos_operacionales", 0))
                 ebitda_mes = _safe_float(row.get("ebitda", 0))
+                utilidad_neta_mes = _safe_float(row.get("utilidad_neta", 0))
+                costos_mes = _safe_float(row.get("costos_venta", 0))
                 gastos_op_mes = _safe_float(row.get("gastos_operacionales", 0))
+                gastos_no_op_mes = _safe_float(row.get("gastos_no_operacionales", 0))
                 dep_mes = _safe_float(row.get("dep_amort", 0))
+                # Egresos totales del mes (costos de venta + gastos
+                # operacionales + no operacionales) - contraparte directa
+                # de "ventas" para poder ver ambas series lado a lado en
+                # la evolución mensual, no solo el resultado neto (EBITDA).
+                egresos_totales_mes = costos_mes + gastos_op_mes + gastos_no_op_mes
                 eficiencia_mes = (ebitda_mes / ventas_mes * 100) if ventas_mes else 0
 
                 eficiencias_nm.append(eficiencia_mes)
@@ -21784,8 +22071,12 @@ def create_app():
                     "label": row.get("label"),
                     "ventas": _round2(ventas_mes),
                     "ebitda": _round2(ebitda_mes),
+                    "utilidad_neta": _round2(utilidad_neta_mes),
                     "eficiencia_operativa": _round2(eficiencia_mes),
+                    "costos_venta": _round2(costos_mes),
                     "gastos_operacionales": _round2(gastos_op_mes),
+                    "gastos_no_operacionales": _round2(gastos_no_op_mes),
+                    "egresos_totales": _round2(egresos_totales_mes),
                     "dep_amort": _round2(dep_mes),
                 })
 
@@ -21959,7 +22250,8 @@ def create_app():
             # =========================================================
             # 9. RESPUESTA FINAL
             # =========================================================
-            return jsonify({
+            return {
+                "ok": True,
                 "periodo": {
                     "desde": desde,
                     "hasta": hasta,
@@ -22001,9 +22293,24 @@ def create_app():
                         kpis_actual.get("ingresos_operacionales", 0),
                         kpis_anterior.get("ingresos_operacionales", 0)
                     ),
+                    # Contraparte directa de ventas_netas - mismo criterio que
+                    # egresos_totales de la serie mensual (costos de venta +
+                    # gastos operacionales + no operacionales).
+                    "egresos_totales": _variacion(
+                        _safe_float(kpis_actual.get("costos_venta", 0))
+                        + _safe_float(kpis_actual.get("gastos_operacionales", 0))
+                        + _safe_float(kpis_actual.get("gastos_no_operacionales", 0)),
+                        _safe_float(kpis_anterior.get("costos_venta", 0))
+                        + _safe_float(kpis_anterior.get("gastos_operacionales", 0))
+                        + _safe_float(kpis_anterior.get("gastos_no_operacionales", 0)),
+                    ),
                     "ebitda": _variacion(
                         kpis_actual.get("ebitda", 0),
                         kpis_anterior.get("ebitda", 0)
+                    ),
+                    "utilidad_neta": _variacion(
+                        kpis_actual.get("utilidad_neta", 0),
+                        kpis_anterior.get("utilidad_neta", 0)
                     ),
                     "utilidad_operativa": _variacion(
                         kpis_actual.get("utilidad_operativa", 0),
@@ -22028,14 +22335,149 @@ def create_app():
                 "explicaciones": explicaciones,
                 "acciones": acciones,
                 "alertas": alertas
-            }), 200
+            }
 
         except Exception as e:
-            return jsonify({
+            return {
+                "ok": False,
                 "error": "No fue posible construir el resumen ejecutivo",
+                "detalle": str(e)
+            }
+
+
+    @app.route("/dashboard/resumen-ejecutivo", methods=["GET"])
+    @jwt_required()
+    def get_dashboard_resumen_ejecutivo():
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        centro_costos = request.args.get("centro_costos", type=int)
+        modo_periodo = request.args.get("modo_periodo")
+
+        resultado = construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo)
+        if not resultado.get("ok"):
+            return jsonify(resultado), 400
+        return jsonify(resultado), 200
+
+
+    @app.route("/dashboard/resumen-ejecutivo/analisis-ia", methods=["POST"])
+    @jwt_required()
+    def post_dashboard_resumen_ejecutivo_analisis_ia():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+        # El GET usa request.args.get(..., type=int); acá viene de un body
+        # JSON (puede llegar como string "5" o vacío) - se normaliza igual.
+        try:
+            centro_costos = int(data.get("centro_costos")) if data.get("centro_costos") not in (None, "") else None
+        except (TypeError, ValueError):
+            centro_costos = None
+        modo_periodo = data.get("modo_periodo")
+        forzar = bool(data.get("forzar"))
+
+        try:
+            dashboard_data = construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo)
+            if not dashboard_data.get("ok"):
+                return jsonify({
+                    "error": dashboard_data.get("error", "No fue posible construir el resumen ejecutivo")
+                }), 404
+
+            # El diagnóstico integral siempre usa el período YA RESUELTO
+            # por el dashboard (periodo.desde/hasta), no el que vino en la
+            # petición - el dashboard puede ajustarlo (corte cerrado, mes
+            # parcial, etc.) y las 4 fuentes deben quedar alineadas al
+            # mismo período exacto, no a lo que el usuario pidió antes del
+            # ajuste.
+            periodo = dashboard_data.get("periodo", {})
+            desde_resuelto = periodo.get("desde")
+            hasta_resuelto = periodo.get("hasta")
+            anterior_hasta = periodo.get("anterior_hasta")
+
+            pnl_data = construir_pnl(idcliente, desde_resuelto, hasta_resuelto)
+            balance_data = construir_balance_general(idcliente, hasta_resuelto, anterior_hasta)
+
+            # Indicadores Financieros trabaja con anio/mes_inicio/mes_fin
+            # de un solo año - si el período resuelto cruza fin de año
+            # (caso raro en este producto, pero posible), se omite esa
+            # fuente en vez de calcular un rango de meses sin sentido.
+            anio_desde = int(desde_resuelto[:4])
+            anio_hasta = int(hasta_resuelto[:4])
+            mes_inicio = int(desde_resuelto[5:7])
+            mes_fin = int(hasta_resuelto[5:7])
+            if anio_desde == anio_hasta and mes_inicio <= mes_fin:
+                indicadores_data = construir_indicadores_financieros(idcliente, anio_hasta, mes_inicio, mes_fin)
+            else:
+                indicadores_data = {"ok": False, "error": "El período cruza más de un año, no se calculó."}
+
+            resultado = generar_analisis_transversal(
+                idcliente, desde_resuelto, hasta_resuelto,
+                pnl_data, balance_data, indicadores_data, dashboard_data,
+                forzar=forzar,
+            )
+            return jsonify(resultado), 200
+        except TopeAlcanzadoError as e:
+            return jsonify({
+                "error": "Ya usaste tus análisis con IA de este mes.",
+                "motivo": "tope_mensual_alcanzado",
+                "uso_actual": e.uso_actual,
+                "tope_mensual": e.tope,
+            }), 429
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el diagnóstico integral con IA",
                 "detalle": str(e)
             }), 500
 
+
+    @app.route("/dashboard/resumen-ejecutivo/analisis-ia/word", methods=["POST"])
+    @jwt_required()
+    def post_dashboard_resumen_ejecutivo_analisis_ia_word():
+        data = request.get_json(silent=True) or {}
+        analisis_markdown = data.get("analisis_markdown")
+        nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
+        periodo = data.get("periodo") or ""
+
+        if not analisis_markdown:
+            return jsonify({"error": "Debes enviar analisis_markdown"}), 400
+
+        try:
+            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            nombre_archivo = f"diagnostico_integral_IA_{nombre_cliente.replace(' ', '_')}.docx"
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=nombre_archivo,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el Word del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/dashboard/resumen-ejecutivo/analisis-ia/estado", methods=["GET"])
+    @jwt_required()
+    def get_dashboard_resumen_ejecutivo_analisis_ia_estado():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }), 200
+
+
+    @app.route("/dashboard/resumen-ejecutivo/analisis-ia/historial", methods=["GET"])
+    @jwt_required()
+    def get_dashboard_resumen_ejecutivo_analisis_ia_historial():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "historial": listar_historial_analisis(idcliente, tipo_reporte="diagnostico_integral")
+        }), 200
 
 
     # =========================================================
@@ -23155,6 +23597,13 @@ def create_app():
                 codigo = "ver_configuraciones_varias"
             elif "resumen-config" in request.path or "configuraciones_varias" in request.path:
                 codigo = "ver_configuraciones_varias"
+            # Debe ir ANTES de "resumen-ejecutivo" - mismo motivo que el
+            # bloque de pnl/estado-resultados: sin esto, el permiso pago
+            # separado de la IA quedaría eclipsado por "ver_resumen_ejecutivo"
+            # (que casi cualquier cliente tiene) y la IA quedaría gratis
+            # para todos, sin importar el plan.
+            elif "analisis-ia" in request.path:
+                codigo = "usar_analisis_ia"
             elif "resumen-ejecutivo" in request.path:
                 codigo = "ver_resumen_ejecutivo"
             else:
@@ -23369,6 +23818,17 @@ def create_app():
             # ------------------------------------------
             # Estado de Resultados / P&L
             # ------------------------------------------
+            # ------------------------------------------
+            # Analizar con IA (Estado de Resultados) - permiso propio,
+            # separado de "ver_reporte_estado_resultados", para poder
+            # activarlo/desactivarlo por plan y por cliente
+            # independientemente de si el cliente puede ver el reporte.
+            # Debe ir ANTES del bloque genérico de "pnl"/"estado-resultados"
+            # de abajo, porque esa ruta también contiene "pnl".
+            # ------------------------------------------
+            elif "analisis-ia" in path_norm:
+                codigo = "usar_analisis_ia"
+
             elif (
                 "pnl-v1" in path_norm
                 or "pnl" in path_norm

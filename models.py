@@ -1280,3 +1280,54 @@ class IndicadoresFinancierosConfig(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+# ============================================================
+# Analizar con IA (reportes financieros) - ver
+# backend/analisis_ia.py y memoria
+# project_insightflow_analisis_ia_reportes para el diseno completo.
+# ============================================================
+
+class AnalisisIAUso(db.Model):
+    """Contador mensual de analisis REALES generados (no cuentan los
+    hits de cache) - el tope (15/mes) se controla en analisis_ia.py,
+    esta tabla solo lleva el conteo."""
+    __tablename__ = "analisis_ia_uso"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+    periodo_anio = db.Column(db.Integer, nullable=False)
+    periodo_mes = db.Column(db.Integer, nullable=False)
+    cantidad = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("idcliente", "periodo_anio", "periodo_mes", name="uq_analisis_ia_uso_periodo"),
+    )
+
+
+class AnalisisIACache(db.Model):
+    """Una fila por (cliente, tipo_reporte, periodo exacto). Si
+    huella_datos coincide con la huella recalculada al pedir el mismo
+    periodo, se sirve este analisis sin llamar a la API. Si no
+    coincide (los datos subyacentes cambiaron), se regenera y esta
+    misma fila se actualiza (UPSERT), no se acumula historial."""
+    __tablename__ = "analisis_ia_cache"
+
+    id = db.Column(db.Integer, primary_key=True)
+    idcliente = db.Column(db.Integer, db.ForeignKey("clientes.idcliente", ondelete="CASCADE"), nullable=False)
+    tipo_reporte = db.Column(db.String(50), nullable=False)
+    periodo_desde = db.Column(db.Date, nullable=False)
+    periodo_hasta = db.Column(db.Date, nullable=False)
+    huella_datos = db.Column(db.String(64), nullable=False)
+    modelo = db.Column(db.String(50), nullable=False)
+    analisis_texto = db.Column(db.Text, nullable=False)
+    tokens_entrada = db.Column(db.Integer)
+    tokens_salida = db.Column(db.Integer)
+    costo_cop = db.Column(db.Numeric(12, 2))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("idcliente", "tipo_reporte", "periodo_desde", "periodo_hasta", name="uq_analisis_ia_cache_periodo"),
+    )
