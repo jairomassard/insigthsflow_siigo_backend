@@ -277,13 +277,34 @@ def _resumen_pyg_para_ia(pnl_data: dict) -> dict:
     }
 
 
-def generar_analisis_pyg(idcliente: int, desde: str, hasta: str, pnl_data: dict, forzar: bool = False) -> dict:
+def _resultado_verificacion(cache, huella: str) -> dict:
+    """Respuesta liviana para el chequeo "¿esto va a salir gratis del
+    caché o va a generar un análisis nuevo?" - SIN llamar a la IA. Sirve
+    para avisarle al usuario ANTES de gastar cupo, no solo después."""
+    return {
+        "actualizado": bool(cache and cache.huella_datos == huella),
+        "existe_cache": cache is not None,
+    }
+
+
+def generar_analisis_pyg(
+    idcliente: int,
+    desde: str,
+    hasta: str,
+    pnl_data: dict,
+    forzar: bool = False,
+    solo_verificar: bool = False,
+) -> dict:
     """
     Punto de entrada principal para el Estado de Resultados.
 
     Devuelve un dict con "fuente" ("cache" o "nuevo"), "analisis"
     (markdown), "modelo" y "generado_en". Levanta TopeAlcanzadoError si
     hace falta generar de nuevo pero el cliente ya no tiene cupo este mes.
+
+    solo_verificar=True corta antes de llamar a la IA y devuelve solo si
+    el caché sigue vigente - usado por el endpoint de "verificar" para
+    poder avisarle al usuario antes de gastar, no después.
     """
     tipo_reporte = "estado_resultados"
     periodo_desde = date.fromisoformat(desde)
@@ -298,6 +319,9 @@ def generar_analisis_pyg(idcliente: int, desde: str, hasta: str, pnl_data: dict,
         periodo_desde=periodo_desde,
         periodo_hasta=periodo_hasta,
     ).first()
+
+    if solo_verificar:
+        return _resultado_verificacion(cache, huella)
 
     if cache and cache.huella_datos == huella and not forzar:
         return {
@@ -415,7 +439,12 @@ def _resumen_balance_para_ia(balance_data: dict) -> dict:
 
 
 def generar_analisis_balance(
-    idcliente: int, fecha_corte: str, comparar_con: str | None, balance_data: dict, forzar: bool = False
+    idcliente: int,
+    fecha_corte: str,
+    comparar_con: str | None,
+    balance_data: dict,
+    forzar: bool = False,
+    solo_verificar: bool = False,
 ) -> dict:
     """
     Punto de entrada principal para el Balance General. Mismo patron de
@@ -427,6 +456,9 @@ def generar_analisis_balance(
     periodo_hasta guarda el corte que se esta analizando y periodo_desde
     guarda el corte de comparacion (o el mismo corte si no hay
     comparacion), asi cada combinacion de cortes cachea por separado.
+
+    solo_verificar=True corta antes de llamar a la IA (ver
+    generar_analisis_pyg).
     """
     tipo_reporte = "balance_general"
     periodo_hasta = date.fromisoformat(fecha_corte)
@@ -441,6 +473,9 @@ def generar_analisis_balance(
         periodo_desde=periodo_desde,
         periodo_hasta=periodo_hasta,
     ).first()
+
+    if solo_verificar:
+        return _resultado_verificacion(cache, huella)
 
     if cache and cache.huella_datos == huella and not forzar:
         return {
@@ -555,11 +590,19 @@ def _resumen_indicadores_para_ia(data: dict) -> dict:
 
 
 def generar_analisis_indicadores(
-    idcliente: int, fecha_desde: str, fecha_hasta: str, indicadores_data: dict, forzar: bool = False
+    idcliente: int,
+    fecha_desde: str,
+    fecha_hasta: str,
+    indicadores_data: dict,
+    forzar: bool = False,
+    solo_verificar: bool = False,
 ) -> dict:
     """
     Punto de entrada principal para Indicadores Financieros. Mismo patron
     de cache/tope/huella que generar_analisis_pyg()/generar_analisis_balance().
+
+    solo_verificar=True corta antes de llamar a la IA (ver
+    generar_analisis_pyg).
     """
     tipo_reporte = "indicadores_financieros"
     periodo_desde = date.fromisoformat(fecha_desde)
@@ -574,6 +617,9 @@ def generar_analisis_indicadores(
         periodo_desde=periodo_desde,
         periodo_hasta=periodo_hasta,
     ).first()
+
+    if solo_verificar:
+        return _resultado_verificacion(cache, huella)
 
     if cache and cache.huella_datos == huella and not forzar:
         return {
@@ -739,9 +785,26 @@ def _resumen_dashboard_para_ia(dashboard_data: dict) -> dict:
     """Payload curado de la capa operativa exclusiva del Resumen
     Ejecutivo - caja, autonomia de caja, evolucion mensual, y
     concentracion en clientes/proveedores/gastos. Nada de esto vive en
-    PyG/Balance/Indicadores, por eso se manda aparte."""
+    PyG/Balance/Indicadores, por eso se manda aparte.
+
+    IMPORTANTE: NO se manda el dict "periodo" completo. Trae campos como
+    ultima_fecha_auxiliar/fecha_corte_confiable que reflejan el estado
+    del sistema "a hoy" (avanzan solos con cada sincronizacion nueva),
+    sin relacion con el periodo Jan-Jul que se esta analizando - si
+    entran a la huella, cualquier sincronizacion de rutina hace pensar
+    al sistema que los datos del periodo cambiaron cuando en realidad
+    siguen iguales, y dispara regeneraciones (con costo) innecesarias.
+    Solo se incluyen los campos que describen el periodo en si."""
+    periodo = dashboard_data.get("periodo", {})
     return {
-        "periodo": dashboard_data.get("periodo", {}),
+        "periodo": {
+            "desde": periodo.get("desde"),
+            "hasta": periodo.get("hasta"),
+            "anterior_desde": periodo.get("anterior_desde"),
+            "anterior_hasta": periodo.get("anterior_hasta"),
+            "modo_periodo": periodo.get("modo_periodo"),
+            "tipo_corte": periodo.get("tipo_corte"),
+        },
         "kpis_operativos": dashboard_data.get("kpis", {}),
         "evolucion_mensual": dashboard_data.get("series", {}).get("mensual", []),
         "top_gastos": dashboard_data.get("top_gastos", []),
@@ -787,10 +850,14 @@ def generar_analisis_transversal(
     indicadores_data: dict,
     dashboard_data: dict,
     forzar: bool = False,
+    solo_verificar: bool = False,
 ) -> dict:
     """
     Punto de entrada principal para el Diagnóstico Integral (Panel
     Ejecutivo). Mismo patron de cache/tope/huella que los otros 3.
+
+    solo_verificar=True corta antes de llamar a la IA (ver
+    generar_analisis_pyg).
     """
     tipo_reporte = "diagnostico_integral"
     periodo_desde = date.fromisoformat(desde)
@@ -805,6 +872,9 @@ def generar_analisis_transversal(
         periodo_desde=periodo_desde,
         periodo_hasta=periodo_hasta,
     ).first()
+
+    if solo_verificar:
+        return _resultado_verificacion(cache, huella)
 
     if cache and cache.huella_datos == huella and not forzar:
         return {

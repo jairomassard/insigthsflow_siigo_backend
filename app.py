@@ -20472,6 +20472,33 @@ def create_app():
             }), 500
 
 
+    @app.route("/reportes/pnl_v1/analisis-ia/verificar", methods=["POST"])
+    @jwt_required()
+    def post_pnl_analisis_ia_verificar():
+        # Chequeo liviano (sin llamar a la IA): compara la huella de los
+        # datos actuales contra la del último análisis guardado para ese
+        # período - deja saber ANTES de gastar si volver a ver un período
+        # del historial va a salir gratis del caché o va a disparar una
+        # regeneración paga (porque los datos cambiaron desde entonces).
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+
+        if not desde or not hasta:
+            return jsonify({"error": "Debes enviar desde y hasta"}), 400
+
+        try:
+            pnl_data = construir_pnl(idcliente, desde, hasta)
+            resultado = generar_analisis_pyg(idcliente, desde, hasta, pnl_data, solo_verificar=True)
+            return jsonify(resultado), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible verificar el estado del análisis",
+                "detalle": str(e)
+            }), 500
+
+
     @app.route("/reportes/pnl_v1/analisis-ia/word", methods=["POST"])
     @jwt_required()
     def post_pnl_analisis_ia_word():
@@ -20784,6 +20811,35 @@ def create_app():
         except Exception as e:
             return jsonify({
                 "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/balance_general_v1/analisis-ia/verificar", methods=["POST"])
+    @jwt_required()
+    def post_balance_general_analisis_ia_verificar():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        fecha_corte = data.get("fecha_corte")
+        comparar_con = data.get("comparar_con")
+
+        if not fecha_corte:
+            return jsonify({"error": "Debes enviar fecha_corte"}), 400
+
+        try:
+            balance_data = construir_balance_general(idcliente, fecha_corte, comparar_con)
+            if not balance_data.get("ok"):
+                return jsonify({
+                    "error": balance_data.get("error", "No fue posible construir el balance")
+                }), 404
+
+            resultado = generar_analisis_balance(
+                idcliente, fecha_corte, comparar_con, balance_data, solo_verificar=True
+            )
+            return jsonify(resultado), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible verificar el estado del análisis",
                 "detalle": str(e)
             }), 500
 
@@ -21560,6 +21616,37 @@ def create_app():
         except Exception as e:
             return jsonify({
                 "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/auxiliares/indicadores-financieros/analisis-ia/verificar", methods=["POST"])
+    @jwt_required()
+    def post_indicadores_financieros_analisis_ia_verificar():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        anio = data.get("anio")
+        mes_inicio = data.get("mes_inicio")
+        mes_fin = data.get("mes_fin")
+
+        if not anio or not mes_inicio or not mes_fin:
+            return jsonify({"error": "Debes enviar anio, mes_inicio y mes_fin"}), 400
+
+        try:
+            indicadores_data = construir_indicadores_financieros(idcliente, int(anio), int(mes_inicio), int(mes_fin))
+            if not indicadores_data.get("ok"):
+                return jsonify({
+                    "error": indicadores_data.get("error", "No fue posible calcular los indicadores financieros")
+                }), 404
+
+            meta = indicadores_data.get("meta", {})
+            resultado = generar_analisis_indicadores(
+                idcliente, meta.get("fecha_desde"), meta.get("fecha_hasta"), indicadores_data, solo_verificar=True
+            )
+            return jsonify(resultado), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible verificar el estado del análisis",
                 "detalle": str(e)
             }), 500
 
@@ -22430,6 +22517,56 @@ def create_app():
         except Exception as e:
             return jsonify({
                 "error": "No fue posible generar el diagnóstico integral con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/dashboard/resumen-ejecutivo/analisis-ia/verificar", methods=["POST"])
+    @jwt_required()
+    def post_dashboard_resumen_ejecutivo_analisis_ia_verificar():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+        try:
+            centro_costos = int(data.get("centro_costos")) if data.get("centro_costos") not in (None, "") else None
+        except (TypeError, ValueError):
+            centro_costos = None
+        modo_periodo = data.get("modo_periodo")
+
+        try:
+            dashboard_data = construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo)
+            if not dashboard_data.get("ok"):
+                return jsonify({
+                    "error": dashboard_data.get("error", "No fue posible construir el resumen ejecutivo")
+                }), 404
+
+            periodo = dashboard_data.get("periodo", {})
+            desde_resuelto = periodo.get("desde")
+            hasta_resuelto = periodo.get("hasta")
+            anterior_hasta = periodo.get("anterior_hasta")
+
+            pnl_data = construir_pnl(idcliente, desde_resuelto, hasta_resuelto)
+            balance_data = construir_balance_general(idcliente, hasta_resuelto, anterior_hasta)
+
+            anio_desde = int(desde_resuelto[:4])
+            anio_hasta = int(hasta_resuelto[:4])
+            mes_inicio = int(desde_resuelto[5:7])
+            mes_fin = int(hasta_resuelto[5:7])
+            if anio_desde == anio_hasta and mes_inicio <= mes_fin:
+                indicadores_data = construir_indicadores_financieros(idcliente, anio_hasta, mes_inicio, mes_fin)
+            else:
+                indicadores_data = {"ok": False, "error": "El período cruza más de un año, no se calculó."}
+
+            resultado = generar_analisis_transversal(
+                idcliente, desde_resuelto, hasta_resuelto,
+                pnl_data, balance_data, indicadores_data, dashboard_data,
+                solo_verificar=True,
+            )
+            return jsonify(resultado), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible verificar el estado del diagnóstico",
                 "detalle": str(e)
             }), 500
 
