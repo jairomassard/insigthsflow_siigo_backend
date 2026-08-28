@@ -2227,7 +2227,29 @@ def construir_cruce_iva_siigo(idcliente, desde, hasta, inc_19, inc_5):
         _detalle_comprobantes_cierre(idcliente, desde, hasta, "2408", comprobantes_cierre)
         + _detalle_comprobantes_cierre(idcliente, desde, hasta, "135517", comprobantes_cierre_rete)
     )
-    return _empaquetar_cruce_iva(series_mensuales, comprobantes_detectados)
+
+    # Cobertura real del auxiliar contable cargado, POR FAMILIA DE CUENTA (no
+    # filtrada por desde/hasta - ver docstring de cobertura_auxiliar_hasta
+    # arriba). El maximo global de toda la tabla NO sirve aqui: confirmado
+    # con datos reales de Binaria que otras cuentas (no IVA) seguian
+    # cargadas hasta fin de mes siguiente mientras la cuenta de IVA venta
+    # (240806%) se habia quedado 8 dias atras - un maximo global hubiera
+    # ocultado justo el caso que motivo este fix.
+    cobertura_auxiliar = db.session.execute(
+        text("""
+            SELECT
+                MAX(CASE WHEN cuenta_codigo LIKE '240806%' THEN fecha_contable END) AS ventas,
+                MAX(CASE WHEN cuenta_codigo LIKE '24081%' THEN fecha_contable END) AS compras
+            FROM auxiliar_contable WHERE idcliente = :idc
+        """),
+        {"idc": idcliente},
+    ).mappings().first()
+
+    return _empaquetar_cruce_iva(
+        series_mensuales, comprobantes_detectados,
+        cobertura_auxiliar_ventas_hasta=cobertura_auxiliar["ventas"].isoformat() if cobertura_auxiliar["ventas"] else None,
+        cobertura_auxiliar_compras_hasta=cobertura_auxiliar["compras"].isoformat() if cobertura_auxiliar["compras"] else None,
+    )
 
 
 def construir_cruce_iva_alegra(idcliente, desde, hasta, inc_19, inc_5):
@@ -2457,7 +2479,8 @@ def _iva_declarado_alegra(idcliente, desde, hasta):
     return {(int(r["anio"]), int(r["mes"])): float(r["declarado"] or 0) for r in rows}
 
 
-def _empaquetar_cruce_iva(series_mensuales, comprobantes_cierre_detectados=None):
+def _empaquetar_cruce_iva(series_mensuales, comprobantes_cierre_detectados=None,
+                           cobertura_auxiliar_ventas_hasta=None, cobertura_auxiliar_compras_hasta=None):
     def _suma_declarado(g):
         """None si NINGUN mes del grupo tiene cierre detectado (no inventar un
         0 donde no hay dato); suma solo los meses que si lo tienen."""
@@ -2514,7 +2537,18 @@ def _empaquetar_cruce_iva(series_mensuales, comprobantes_cierre_detectados=None)
         # detectarse como cierre/ajuste contable, para que el usuario o su
         # contador puedan revisarlos - InsightsFlow es una guia, no la
         # liquidacion oficial (ver memoria del proyecto).
-        "comprobantes_cierre_detectados": comprobantes_cierre_detectados or []
+        "comprobantes_cierre_detectados": comprobantes_cierre_detectados or [],
+        # Hasta que fecha hay auxiliar contable cargado, por familia de
+        # cuenta (independiente del rango filtrado) - puramente informativo,
+        # igual que cobertura_dian_hasta en Cruce DIAN: si el filtro pide un
+        # rango mas reciente que esto, "Calculado" va a verse mas bajo de lo
+        # real porque el libro contable todavia no tiene esas facturas, no
+        # porque falte ingresarlas en Siigo. Separado ventas/compras porque
+        # una cuenta puede quedar mas atrasada que la otra (ver docstring en
+        # construir_cruce_iva_siigo). Solo aplica a Siigo (auxiliar_contable);
+        # Alegra ya calcula directo de facturas, sin este desfase posible.
+        "cobertura_auxiliar_ventas_hasta": cobertura_auxiliar_ventas_hasta,
+        "cobertura_auxiliar_compras_hasta": cobertura_auxiliar_compras_hasta,
     }
 
 
