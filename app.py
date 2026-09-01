@@ -10431,8 +10431,12 @@ def create_app():
 
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
-        seller_id   = request.args.get("seller_id", type=int)
-        cost_center = request.args.get("cost_center", type=int)
+        # Sin type=int (ver centro_costo_id/vendedor_id mas abajo): para
+        # Alegra el id real es texto (ej. "12345" del catalogo de Alegra),
+        # y comparar como texto tambien funciona igual de bien para Siigo
+        # (el id sigue siendo el mismo valor, solo cambia la representacion).
+        seller_id   = request.args.get("seller_id")
+        cost_center = request.args.get("cost_center")
         cliente     = request.args.get("cliente")
         limit       = request.args.get("limit", type=int) or 5000
 
@@ -10471,12 +10475,18 @@ def create_app():
                 wh_rows.append("f.fecha <= :hasta")
                 params["hasta"] = hasta
 
+            # Filtra por centro_costo_id/vendedor_id (texto, resuelto para
+            # Siigo Y Alegra) en vez de cost_center/seller_id (entero,
+            # siempre NULL para Alegra - ver
+            # Docs_integracion/alegra_agregar_centro_costo_id_vendedor_id_ventas.sql).
+            # Antes de este fix, el filtro de Vendedor/Centro de Costo
+            # simplemente no funcionaba para ningun cliente Alegra.
             if seller_id:
-                wh_rows.append("f.seller_id = :seller_id")
+                wh_rows.append("f.vendedor_id = :seller_id")
                 params["seller_id"] = seller_id
 
             if cost_center:
-                wh_rows.append("f.cost_center = :cost_center")
+                wh_rows.append("f.centro_costo_id = :cost_center")
                 params["cost_center"] = cost_center
 
             if cliente:
@@ -10530,10 +10540,10 @@ def create_app():
                 wh_mov.append("m.fecha <= :hasta")
 
             if seller_id:
-                wh_mov.append("m.seller_id = :seller_id")
+                wh_mov.append("m.vendedor_id = :seller_id")
 
             if cost_center:
-                wh_mov.append("m.cost_center = :cost_center")
+                wh_mov.append("m.centro_costo_id = :cost_center")
 
             if cliente:
                 wh_mov.append("m.cliente_nombre = :cliente")
@@ -12599,14 +12609,19 @@ def create_app():
 
             where_clause = " AND ".join(wh)
 
+            # Usa centro_costo_id (texto, resuelto para Siigo Y Alegra por la
+            # vista) en vez de cost_center (entero, siempre NULL para Alegra
+            # - ver Docs_integracion/alegra_agregar_centro_costo_id_vendedor_id_ventas.sql).
+            # centro_costo_nombre ya viene resuelto por la vista, sin
+            # necesidad de re-unir siigo_centros_costo aqui (ese join era
+            # Siigo-only y por eso el dropdown quedaba vacio para Alegra).
             sql = text(f"""
                 SELECT DISTINCT
-                    f.cost_center AS id,
-                    COALESCE(cc.nombre, 'Sin centro de costo') AS nombre
+                    f.centro_costo_id AS id,
+                    f.centro_costo_nombre AS nombre
                 FROM facturas_enriquecidas f
-                LEFT JOIN siigo_centros_costo cc ON f.cost_center = cc.id
                 WHERE {where_clause}
-                AND f.cost_center IS NOT NULL
+                AND f.centro_costo_id IS NOT NULL
                 ORDER BY nombre
             """)
             rows = [dict(r) for r in db.session.execute(sql, params).mappings().all()]
