@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraNotaCredito, AlegraNotaCreditoFactura
-from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get, paginate
+from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, AlegraError, get, paginate
 from alegra.alegra_sync_catalogos import _credenciales_alegra
 
 
@@ -128,13 +128,20 @@ def sync_notas_credito_desde_alegra(idcliente: int) -> str:
                 break
         _procesar(cn)
 
+    # Ver nota en alegra_sync_facturas.py (mismo bug real, mismo patron): una
+    # nota credito borrada/inexistente en Alegra (404) no debe tumbar el
+    # resto del loop de re-consulta.
     if ultima_fecha:
         abiertas = [
             n for n in existentes.values()
             if n.alegra_id not in ids_procesados and (n.balance or 0) > 0
         ]
         for n in abiertas:
-            cn = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"credit-notes/{n.alegra_id}")
+            try:
+                cn = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"credit-notes/{n.alegra_id}")
+            except AlegraError as e:
+                print(f"[alegra_sync_notas_credito] No se pudo re-consultar nota credito alegra_id={n.alegra_id} (idcliente={idcliente}): {e}")
+                continue
             _procesar(cn)
 
     db.session.commit()

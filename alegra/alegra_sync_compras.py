@@ -35,7 +35,7 @@ from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraCompra, AlegraCompraItem, AlegraCompraRetencion
-from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get, paginate
+from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, AlegraError, get, paginate
 from alegra.alegra_sync_catalogos import _credenciales_alegra
 
 
@@ -170,13 +170,20 @@ def sync_compras_desde_alegra(idcliente: int) -> str:
                 break
         _procesar(bill)
 
+    # Ver nota en alegra_sync_facturas.py (mismo bug real, mismo patron): una
+    # compra borrada/inexistente en Alegra (404) no debe tumbar el resto del
+    # loop de re-consulta.
     if ultima_fecha:
         abiertas = [
             c for c in existentes.values()
             if c.alegra_id not in ids_procesados and (c.balance or 0) > 0
         ]
         for c in abiertas:
-            bill = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"bills/{c.alegra_id}")
+            try:
+                bill = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"bills/{c.alegra_id}")
+            except AlegraError as e:
+                print(f"[alegra_sync_compras] No se pudo re-consultar compra alegra_id={c.alegra_id} (idcliente={idcliente}): {e}")
+                continue
             _procesar(bill)
 
     db.session.commit()

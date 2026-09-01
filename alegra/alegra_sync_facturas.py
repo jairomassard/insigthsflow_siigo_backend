@@ -37,7 +37,7 @@ from sqlalchemy.exc import IntegrityError
 
 from models import db
 from models_alegra import AlegraFactura, AlegraFacturaItem
-from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get, paginate
+from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, AlegraError, get, paginate
 from alegra.alegra_sync_catalogos import _credenciales_alegra
 
 
@@ -198,13 +198,27 @@ def sync_facturas_desde_alegra(idcliente: int) -> str:
 
     # Re-consulta puntual de facturas viejas que sigan con saldo pendiente -
     # son las unicas que pueden haber cambiado sin que cambiara su fecha.
+    # IMPORTANTE (bug real encontrado 2026-09-01, Maslux/idcliente=16): una
+    # sola factura borrada/inexistente en Alegra (404) tumbaba el resto del
+    # loop sin capturar - confirmado con AlegraSyncLog real, el paso
+    # "facturas" fallo 5+ dias seguidos siempre en la misma factura (721),
+    # dejando SIN refrescar el balance de facturas posteriores en la lista
+    # (ej. 759/760, que Alegra ya tenia en balance=0/status=closed tras una
+    # nota credito real aplicada el 19-ago, pero seguian en balance lleno en
+    # nuestra BD - "Pendiente" del reporte de Ventas salio inflado por esto,
+    # no por un error de calculo). Un error puntual en una factura ya no debe
+    # impedir que se revisen las demas.
     if ultima_fecha:
         abiertas = [
             f for f in existentes.values()
             if f.alegra_id not in ids_procesados and (f.balance or 0) > 0
         ]
         for f in abiertas:
-            inv = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"invoices/{f.alegra_id}")
+            try:
+                inv = get(ALEGRA_BASE_URL_DEFAULT, email, token, f"invoices/{f.alegra_id}")
+            except AlegraError as e:
+                print(f"[alegra_sync_facturas] No se pudo re-consultar factura alegra_id={f.alegra_id} (idcliente={idcliente}): {e}")
+                continue
             _procesar(inv)
 
     db.session.commit()
