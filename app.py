@@ -13,7 +13,7 @@ from licenciamiento import obtener_codigos_permitidos_cliente, cliente_tiene_per
  
 from config import Config
 from models import db, Usuario, Cliente, Perfil, SesionActiva, SiigoCredencial, SiigoFactura, SiigoFacturaItem, SiigoVendedor, SiigoCentroCosto, SiigoCustomer, SiigoNotaCredito, SiigoPagoProveedor, SiigoProveedor, SiigoCompra, SiigoCompraItem, SiigoCuentasPorCobrar, SiigoNomina, SiigoProducto, BalancePrueba, Permiso, PerfilPermiso, SiigoSyncConfig, SiigoSyncLog, SiigoSyncMetric, SystemNotification, PaqueteInsightflow, PaquetePermiso, ClientePaquete, AuxiliarSaldosCorte, DianDocumento
-from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog, AlegraSyncConfig, AlegraFactura
+from models_alegra import FuenteDatosCliente, AlegraCredencial, AlegraSyncLog, AlegraSyncConfig, AlegraFactura, AlegraVendedor
 from alegra.alegra_api import ALEGRA_BASE_URL_DEFAULT, get as alegra_api_get, AlegraError
 from alegra.alegra_sync_all import sync_completo_desde_alegra, sync_completo_desde_alegra_con_log
 from flask_cors import CORS
@@ -9339,15 +9339,34 @@ def create_app():
             return jsonify({"error": "No autorizado"}), 403
 
         try:
-            vendedores = SiigoVendedor.query.all()
-            data = [
-                {
-                    "id": v.id,
-                    "nombre": v.nombre,
-                    "activo": v.activo,
-                }
-                for v in vendedores
-            ]
+            # BUG REAL corregido 2026-09-01: esta consulta no filtraba por
+            # idcliente en absoluto (SiigoVendedor.query.all() traia los
+            # vendedores de TODOS los clientes del sistema mezclados) -
+            # encontrado por el usuario probando Ingresos por Ventas de
+            # Maslux (idcliente=16, Alegra), donde el selector de "Vendedor"
+            # mostraba nombres de otros clientes reales (ej. "Binaria Media
+            # Group SAS"). De paso, tampoco soportaba clientes Alegra (la
+            # tabla de vendedores es distinta, alegra_vendedores).
+            if _proveedor_datos_cliente(idcliente) == "alegra":
+                vendedores = AlegraVendedor.query.filter_by(idcliente=idcliente).all()
+                data = [
+                    {
+                        "id": v.alegra_id,
+                        "nombre": v.nombre,
+                        "activo": v.activo,
+                    }
+                    for v in vendedores
+                ]
+            else:
+                vendedores = SiigoVendedor.query.filter_by(idcliente=idcliente).all()
+                data = [
+                    {
+                        "id": v.id,
+                        "nombre": v.nombre,
+                        "activo": v.activo,
+                    }
+                    for v in vendedores
+                ]
             return jsonify(data), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -9371,7 +9390,10 @@ def create_app():
             return jsonify({"error": "No autorizado"}), 403
 
         try:
-            centros = SiigoCentroCosto.query.all()
+            # Mismo bug de fuga entre clientes que /catalogos/vendedores (ver
+            # nota ahi) - sin frontend que llame esta ruta hoy (confirmado
+            # 2026-09-01), pero corregido igual por seguridad.
+            centros = SiigoCentroCosto.query.filter_by(idcliente=idcliente).all()
             data = [
                 {
                     "id": c.id,
