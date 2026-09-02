@@ -625,7 +625,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
     cliente = (request.args.get("cliente") or "").strip()
     desde = request.args.get("desde") or "2025-01-01"
     hasta = request.args.get("hasta") or datetime.now().strftime("%Y-%m-%d")
-    cost_center = request.args.get("cost_center", type=int)
+    cost_center = request.args.get("cost_center")
     estado_pago = (request.args.get("estado_pago") or "").strip().lower()
     estado_factura = (request.args.get("estado_factura") or request.args.get("estado") or "").strip().lower()
     limit = request.args.get("limit", type=int) or 5000
@@ -686,7 +686,7 @@ def _obtener_busqueda_inteligente_facturas_data(idcliente, perfilid):
         params["cliente"] = cliente
 
     if cost_center:
-        where_main.append("m.cost_center = :cost_center")
+        where_main.append("m.centro_costo_id = :cost_center")
         params["cost_center"] = cost_center
 
     if estado_factura:
@@ -10942,8 +10942,8 @@ def create_app():
 
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
-        seller_id   = request.args.get("seller_id", type=int)
-        cost_center = request.args.get("cost_center", type=int)
+        seller_id   = request.args.get("seller_id")
+        cost_center = request.args.get("cost_center")
         cliente     = request.args.get("cliente")
         tipo        = request.args.get("tipo")  # FACTURA / NOTA_CREDITO opcional
         limit       = request.args.get("limit", type=int) or 10000
@@ -10974,11 +10974,11 @@ def create_app():
                 params["hasta"] = hasta
 
             if seller_id:
-                wh.append("m.seller_id = :seller_id")
+                wh.append("m.vendedor_id = :seller_id")
                 params["seller_id"] = seller_id
 
             if cost_center:
-                wh.append("m.cost_center = :cost_center")
+                wh.append("m.centro_costo_id = :cost_center")
                 params["cost_center"] = cost_center
 
             if cliente:
@@ -11179,8 +11179,8 @@ def create_app():
 
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
-        seller_id   = request.args.get("seller_id", type=int)
-        cost_center = request.args.get("cost_center", type=int)
+        seller_id   = request.args.get("seller_id")
+        cost_center = request.args.get("cost_center")
         cliente     = request.args.get("cliente")
 
         wh = ["f.idcliente = :idcliente"]
@@ -11195,11 +11195,11 @@ def create_app():
             params["hasta"] = hasta
 
         if seller_id:
-            wh.append("f.seller_id = :seller_id")
+            wh.append("f.vendedor_id = :seller_id")
             params["seller_id"] = seller_id
 
         if cost_center:
-            wh.append("f.cost_center = :cost_center")
+            wh.append("f.centro_costo_id = :cost_center")
             params["cost_center"] = cost_center
 
         if cliente:
@@ -11266,8 +11266,8 @@ def create_app():
 
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
-        seller_id   = request.args.get("seller_id", type=int)
-        cost_center = request.args.get("cost_center", type=int)
+        seller_id   = request.args.get("seller_id")
+        cost_center = request.args.get("cost_center")
 
         wh = ["f.idcliente = :idcliente", "f.cliente_nombre = :cliente"]
         params = {"idcliente": idcliente, "cliente": cliente_nombre}
@@ -11281,11 +11281,11 @@ def create_app():
             params["hasta"] = hasta
 
         if seller_id:
-            wh.append("f.seller_id = :seller_id")
+            wh.append("f.vendedor_id = :seller_id")
             params["seller_id"] = seller_id
 
         if cost_center:
-            wh.append("f.cost_center = :cost_center")
+            wh.append("f.centro_costo_id = :cost_center")
             params["cost_center"] = cost_center
 
         sql = text(f"""
@@ -11342,8 +11342,8 @@ def create_app():
         # ---- Filtros compartidos (igual que en facturas_enriquecidas) ----
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
-        seller_id   = request.args.get("seller_id", type=int)
-        cost_center = request.args.get("cost_center", type=int)
+        seller_id   = request.args.get("seller_id")
+        cost_center = request.args.get("cost_center")
         cliente     = request.args.get("cliente")
 
         wh = ["f.idcliente = :idcliente"]
@@ -11358,11 +11358,11 @@ def create_app():
             params["hasta"] = hasta
 
         if seller_id:
-            wh.append("f.seller_id = :seller_id")
+            wh.append("f.vendedor_id = :seller_id")
             params["seller_id"] = seller_id
 
         if cost_center:
-            wh.append("f.cost_center = :cost_center")
+            wh.append("f.centro_costo_id = :cost_center")
             params["cost_center"] = cost_center
 
         if cliente:
@@ -11558,7 +11558,7 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
-        cost_center = request.args.get("cost_center", type=int)
+        cost_center = request.args.get("cost_center")
         filtro_estado = request.args.get("estado")
         limit_facturas_raw = request.args.get("limit_facturas", default="8")
 
@@ -11605,7 +11605,7 @@ def create_app():
                 params_mov["cliente"] = cliente
 
             if cost_center:
-                wh_mov.append("m.cost_center = :cost_center")
+                wh_mov.append("m.centro_costo_id = :cost_center")
                 params_mov["cost_center"] = cost_center
 
             where_mov = " AND ".join(wh_mov)
@@ -11650,7 +11650,7 @@ def create_app():
                 params_fac["cliente"] = cliente
 
             if cost_center:
-                wh_fac.append("fb.cost_center = :cost_center")
+                wh_fac.append("fb.centro_costo_id = :cost_center")
                 params_fac["cost_center"] = cost_center
 
             filtro_estado_normalizado = None
@@ -11685,6 +11685,7 @@ def create_app():
                         f.saldo,
                         f.public_url,
                         f.cost_center,
+                        f.centro_costo_id,
                         f.cliente_nombre AS cliente_nombre_ok,
                         f.centro_costo_nombre AS centro_costo_nombre_ok
                     FROM facturas_enriquecidas f
@@ -12525,7 +12526,7 @@ def create_app():
         desde       = request.args.get("desde")
         hasta       = request.args.get("hasta")
         cliente     = request.args.get("cliente")
-        cost_center = request.args.get("cost_center", type=int)
+        cost_center = request.args.get("cost_center")
         limit       = request.args.get("limit", type=int)
         offset      = request.args.get("offset", type=int) or 0
         filtro_estado = request.args.get("estado")  # 👈 'sano' | 'alerta' | 'vencido' | 'pagado'
@@ -12544,7 +12545,7 @@ def create_app():
                 wh.append("LOWER(TRIM(f.cliente_nombre)) = LOWER(TRIM(:cliente))")
                 params["cliente"] = cliente
             if cost_center:
-                wh.append("f.cost_center = :cost_center")
+                wh.append("f.centro_costo_id = :cost_center")
                 params["cost_center"] = cost_center
 
             where_clause = " AND ".join(wh)
@@ -16110,7 +16111,7 @@ def create_app():
         # -------- Filtros --------
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        centro_costos = request.args.get("centro_costos", type=int)
+        centro_costos = request.args.get("centro_costos")
 
         def validar_fecha(fecha_str):
             try:
@@ -16139,7 +16140,10 @@ def create_app():
             params_ing["hasta"] = fecha_hasta_val
 
         if centro_costos:
-            condiciones_ing.append("m.cost_center = :centro_costos")
+            # centro_costo_id (texto, resuelto para Siigo Y Alegra) en vez
+            # de cost_center (entero, siempre NULL para Alegra) - ver
+            # Docs_integracion/alegra_agregar_centro_costo_id_vendedor_id_ventas.sql.
+            condiciones_ing.append("m.centro_costo_id = :centro_costos")
             params_ing["centro_costos"] = centro_costos
 
         where_ing = " AND ".join(condiciones_ing)
@@ -16526,9 +16530,9 @@ def create_app():
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
         cliente = request.args.get("cliente")
-        centro_costos = request.args.get("centro_costos", type=int)
+        centro_costos = request.args.get("centro_costos")
         if not centro_costos:
-            centro_costos = request.args.get("cost_center", type=int)
+            centro_costos = request.args.get("cost_center")
         limit = request.args.get("limit", type=int) or 10000
 
         def validar_fecha(fecha_str):
@@ -16556,7 +16560,7 @@ def create_app():
             params["cliente"] = cliente
 
         if centro_costos:
-            condiciones.append("m.cost_center = :centro_costos")
+            condiciones.append("m.centro_costo_id = :centro_costos")
             params["centro_costos"] = centro_costos
 
         # Filtro de estado de pago (pagada/pendiente/parcial) para el modal de
@@ -22309,10 +22313,11 @@ def create_app():
                 params["hasta"] = fecha_hasta_ajustada
 
             if centro_costos:
-                condiciones_ing.append("m.cost_center = :centro_costos")
-                # centro_costos llega parseado como int - compras_enriquecidas.cost_center
-                # ahora es text (ver alegra_fix_centro_costo_compras_enriquecidas.sql);
-                # ventas_movimientos_enriquecidos.cost_center (m.) sigue siendo integer.
+                # centro_costos ahora llega como texto (ver
+                # Docs_integracion/alegra_agregar_centro_costo_id_vendedor_id_ventas.sql):
+                # m.centro_costo_id resuelve el id real para Siigo Y Alegra
+                # (antes m.cost_center quedaba siempre NULL para Alegra).
+                condiciones_ing.append("m.centro_costo_id = :centro_costos")
                 condiciones_egr.append("c.cost_center = CAST(:centro_costos AS TEXT)")
                 params["centro_costos"] = centro_costos
 
@@ -22513,7 +22518,7 @@ def create_app():
 
         desde = request.args.get("desde")
         hasta = request.args.get("hasta")
-        centro_costos = request.args.get("centro_costos", type=int)
+        centro_costos = request.args.get("centro_costos")
         modo_periodo = request.args.get("modo_periodo")
 
         resultado = construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo)
@@ -22529,12 +22534,9 @@ def create_app():
         data = request.get_json(silent=True) or {}
         desde = data.get("desde")
         hasta = data.get("hasta")
-        # El GET usa request.args.get(..., type=int); acá viene de un body
-        # JSON (puede llegar como string "5" o vacío) - se normaliza igual.
-        try:
-            centro_costos = int(data.get("centro_costos")) if data.get("centro_costos") not in (None, "") else None
-        except (TypeError, ValueError):
-            centro_costos = None
+        # centro_costo_id es texto (ver construir_resumen_ejecutivo) - ya no
+        # se fuerza a int, solo se normaliza vacio/None igual que el GET.
+        centro_costos = data.get("centro_costos") if data.get("centro_costos") not in (None, "") else None
         modo_periodo = data.get("modo_periodo")
         forzar = bool(data.get("forzar"))
 
@@ -22599,10 +22601,9 @@ def create_app():
         data = request.get_json(silent=True) or {}
         desde = data.get("desde")
         hasta = data.get("hasta")
-        try:
-            centro_costos = int(data.get("centro_costos")) if data.get("centro_costos") not in (None, "") else None
-        except (TypeError, ValueError):
-            centro_costos = None
+        # centro_costo_id es texto (ver construir_resumen_ejecutivo) - ya no
+        # se fuerza a int, solo se normaliza vacio/None.
+        centro_costos = data.get("centro_costos") if data.get("centro_costos") not in (None, "") else None
         modo_periodo = data.get("modo_periodo")
 
         try:
