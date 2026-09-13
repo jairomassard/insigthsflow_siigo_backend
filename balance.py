@@ -170,6 +170,179 @@ def clasificar_cuenta(cuenta_codigo: str):
 
 
 # =========================================================
+# Cobertura Alegra sin código PUC, para Balance General
+# =========================================================
+
+def _cobertura_balance_sin_codigo(idcliente: int, fecha_corte: str):
+    """Cuentas Alegra sin código PUC de tipo asset/liability/equity
+    (misma tabla alegra_cobertura_contable que ya usa calcular_cobertura_alegra
+    para el PyG), acumuladas hasta fecha_corte y netas por tipo. Para Siigo,
+    o Alegra sin este mecanismo activo, la tabla está vacía y esto devuelve
+    todo en cero - sin efecto.
+
+    A diferencia del PyG (donde el "cajón" no importa porque la Utilidad
+    Neta no cambia), en el Balance sí importa clasificar bien Activo/
+    Pasivo/Patrimonio - y hay un riesgo real de incluir basura: con datos
+    reales de Maslux LED (idcliente=16, 2026-09) se encontró una corrección
+    contable mal hecha en Alegra ("el sistema estaba parametrizando todos
+    los items como inventarios") que dejó ~$25.7 mil millones sin código en
+    una cuenta de Inventarios/Inversiones - ~46x el tamaño real del balance
+    de ese cliente. Por eso el caller de esta función debe aplicar un
+    chequeo de plausibilidad antes de sumar esto al snapshot (ver uso en
+    regenerar_snapshot_saldos_corte) - esta función solo agrega y neta,
+    no decide si es seguro incluirlo."""
+    filas = db.session.execute(text("""
+        SELECT cuenta_nombre, tipo_cuenta,
+               SUM(debito) AS debito, SUM(credito) AS credito
+        FROM alegra_cobertura_contable
+        WHERE idcliente = :idc AND fecha <= :fc
+          AND tipo_cuenta IN ('asset', 'liability', 'equity')
+        GROUP BY cuenta_nombre, tipo_cuenta
+    """), {"idc": idcliente, "fc": fecha_corte}).mappings().all()
+
+    neto_por_tipo = {"asset": 0.0, "liability": 0.0, "equity": 0.0}
+    detalle = []
+    for f in filas:
+        debito = safe_float(f["debito"])
+        credito = safe_float(f["credito"])
+        neto = (debito - credito) if f["tipo_cuenta"] == "asset" else (credito - debito)
+        neto_por_tipo[f["tipo_cuenta"]] += neto
+        if abs(neto) >= 1:
+            detalle.append({
+                "cuenta_nombre": f["cuenta_nombre"],
+                "tipo_cuenta": f["tipo_cuenta"],
+                "neto": redondear(neto, 2)
+            })
+
+    return neto_por_tipo, detalle
+
+
+# Umbral de plausibilidad: si lo sin-código de un tipo (activo/pasivo/
+# patrimonio) supera esta cantidad de veces el tamaño ya clasificado del
+# cliente, se considera sospechoso y NO se suma al snapshot (queda solo
+# visible en el detalle de cobertura del reporte, para revisión humana).
+UMBRAL_MULTIPLICADOR_COBERTURA_BALANCE = 2.0
+
+# (código sintético, clase/grupo que hace que clasificar_cuenta() lo
+# resuelva correctamente, nombre a mostrar)
+_MAPA_SINTETICO_COBERTURA = {
+    "asset": ("13999999", "Activo Alegra sin código PUC (clasificado por tipo)"),
+    "liability": ("23999999", "Pasivo Alegra sin código PUC (clasificado por tipo)"),
+    "equity": ("39999998", "Patrimonio Alegra sin código PUC (clasificado por tipo)"),
+}
+
+
+def _agregar_filas_sin_codigo_si_es_seguro(rows, idcliente, fecha_corte):
+    """Agrega a `rows` (in-place, vía append) una fila sintética por cada
+    tipo (asset/liability/equity) con movimiento sin código PUC, siempre
+    que pase el chequeo de plausibilidad. Ver _cobertura_balance_sin_codigo
+    para el contexto completo (caso real Maslux)."""
+    neto_por_tipo, _detalle = _cobertura_balance_sin_codigo(idcliente, fecha_corte)
+
+    if not any(abs(v) >= 1 for v in neto_por_tipo.values()):
+        return
+
+    activo_clasificado = sum(
+        safe_float(r["saldo"]) for r in rows if str(r["cuenta_codigo"]).strip().startswith("1")
+    )
+    pasivo_clasificado = sum(
+        safe_float(r["saldo"]) for r in rows if str(r["cuenta_codigo"]).strip().startswith("2")
+    )
+    patrimonio_clasificado = sum(
+        safe_float(r["saldo"]) for r in rows if str(r["cuenta_codigo"]).strip().startswith("3")
+    )
+    clasificado_por_tipo = {
+        "asset": activo_clasificado,
+        "liability": pasivo_clasificado,
+        "equity": patrimonio_clasificado,
+    }
+    # Escala de referencia del cliente (tamaño de su activo ya clasificado);
+    # sirve de piso cuando el propio cajón (ej. patrimonio) está en $0.
+    escala_cliente = max(abs(activo_clasificado), 1.0)
+
+    for tipo, (codigo_sintetico, nombre) in _MAPA_SINTETICO_COBERTURA.items():
+        neto = neto_por_tipo.get(tipo, 0.0)
+        if abs(neto) < 1:
+            continue
+        referencia = max(abs(clasificado_por_tipo[tipo]), escala_cliente)
+        if abs(neto) > UMBRAL_MULTIPLICADOR_COBERTURA_BALANCE * referencia:
+            continue  # outlier, no se suma - ver docstring de _cobertura_balance_sin_codigo
+        rows.append({
+            "cuenta_codigo": codigo_sintetico,
+            "cuenta_nombre": nombre,
+            "saldo": neto,
+        })
+
+
+_CODIGOS_SINTETICOS_COBERTURA = {v[0] for v in _MAPA_SINTETICO_COBERTURA.values()}
+
+
+def calcular_cobertura_balance_alegra(idcliente: int, fecha_corte: str):
+    """Para el banner de transparencia del Balance General (mismo principio
+    que calcular_cobertura_alegra del PyG, en app.py): cuánta plata Alegra
+    sin código PUC hay, cuánta se incluyó en el balance (pasó el chequeo de
+    plausibilidad) y cuánta se excluyó por sospechosa. Se recalcula en cada
+    consulta del reporte (no se persiste) - mismo patrón que el PyG."""
+    neto_por_tipo, detalle = _cobertura_balance_sin_codigo(idcliente, fecha_corte)
+
+    vacio = {
+        "monto_incluido": 0.0,
+        "monto_excluido_por_revisar": 0.0,
+        "detalle_incluido": [],
+        "detalle_excluido": [],
+    }
+    if not any(abs(v) >= 1 for v in neto_por_tipo.values()):
+        return vacio
+
+    filas_snapshot = AuxiliarSaldosCorte.query.filter_by(
+        idcliente=idcliente, fecha_corte=fecha_corte
+    ).all()
+
+    def _clasificado(prefijo):
+        return sum(
+            safe_float(r.saldo) for r in filas_snapshot
+            if str(r.cuenta_codigo).strip().startswith(prefijo)
+            and str(r.cuenta_codigo).strip() not in _CODIGOS_SINTETICOS_COBERTURA
+        )
+
+    clasificado_por_tipo = {
+        "asset": _clasificado("1"),
+        "liability": _clasificado("2"),
+        "equity": _clasificado("3"),
+    }
+    escala_cliente = max(abs(clasificado_por_tipo["asset"]), 1.0)
+
+    detalle_incluido = []
+    detalle_excluido = []
+    monto_incluido = 0.0
+    monto_excluido = 0.0
+
+    for tipo, (_codigo, _nombre) in _MAPA_SINTETICO_COBERTURA.items():
+        neto = neto_por_tipo.get(tipo, 0.0)
+        if abs(neto) < 1:
+            continue
+        referencia = max(abs(clasificado_por_tipo[tipo]), escala_cliente)
+        item = {
+            "tipo_cuenta": tipo,
+            "monto": round(neto, 2),
+            "cuentas": [d for d in detalle if d["tipo_cuenta"] == tipo],
+        }
+        if abs(neto) > UMBRAL_MULTIPLICADOR_COBERTURA_BALANCE * referencia:
+            detalle_excluido.append(item)
+            monto_excluido += abs(neto)
+        else:
+            detalle_incluido.append(item)
+            monto_incluido += abs(neto)
+
+    return {
+        "monto_incluido": round(monto_incluido, 2),
+        "monto_excluido_por_revisar": round(monto_excluido, 2),
+        "detalle_incluido": detalle_incluido,
+        "detalle_excluido": detalle_excluido,
+    }
+
+
+# =========================================================
 # Snapshot acumulado
 # =========================================================
 
@@ -271,6 +444,9 @@ def regenerar_snapshot_saldos_corte(idcliente: int, fecha_corte: str):
             "idc": idcliente,
             "fc": fecha_corte
         }).mappings().all()
+
+    rows = list(rows)
+    _agregar_filas_sin_codigo_si_es_seguro(rows, idcliente, fecha_corte)
 
     AuxiliarSaldosCorte.query.filter_by(
         idcliente=idcliente,
@@ -992,12 +1168,15 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
 
     alertas_texto, alertas_grupo = _agrupar_alertas(alertas_dict)
 
+    cobertura_alegra = calcular_cobertura_balance_alegra(idcliente, fecha_corte)
+
     return {
         "ok": True,
         "fechas": {
             "fecha_corte": fecha_corte,
             "comparar_con": comparar_con_norm
         },
+        "cobertura": cobertura_alegra,
         "meta": {
             "modo_comparativo": bool(modo_comparativo and snapshot_comparativo_existe),
             "comparacion_solicitada": bool(comparar_con),
