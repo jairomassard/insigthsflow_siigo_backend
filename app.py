@@ -2014,6 +2014,12 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
     map_fin = {r.cuenta_codigo: r for r in snap_fin}
     todos_codigos = set(map_inicio) | set(map_fin)
 
+    # Saldo absoluto de Caja y Bancos (grupo '11') en cada punta - independiente
+    # del filtro de "delta >= 1" del loop de abajo, para que una cuenta sin
+    # movimiento en el periodo no quede fuera del saldo inicial/final mostrado.
+    caja_inicial_total = sum(safe_float(r.saldo) for r in snap_inicio if str(r.grupo or "") == "11")
+    caja_final_total = sum(safe_float(r.saldo) for r in snap_fin if str(r.grupo or "") == "11")
+
     caja_delta = 0.0
     operacion_delta = 0.0
     inversion_delta = 0.0
@@ -2108,6 +2114,8 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
             "flujo_inversion": flujo_inversion,
             "flujo_financiacion": flujo_financiacion,
             "total_flujos_calculado": total_flujos,
+            "caja_inicial": redondear(caja_inicial_total, 2),
+            "caja_final": redondear(caja_final_total, 2),
             "delta_caja_real": caja_delta,
             "diferencia": diferencia,
             "diferencia_pct": diferencia_pct,
