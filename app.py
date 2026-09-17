@@ -22844,8 +22844,29 @@ def create_app():
             # =========================================================
             # 9. RESPUESTA FINAL
             # =========================================================
+            # Flujo de Efectivo del mismo periodo, si hay Balance de Prueba
+            # real en ambas puntas (fecha_desde - 1 dia = cierre del periodo
+            # anterior, "hasta" = cierre de este periodo - construir_flujo_
+            # efectivo exige snapshot origen=BALANCE_PRUEBA en ambas). La
+            # mayoria de periodos del dashboard NO van a tener eso (no estan
+            # pensados para coincidir con fechas de Balance de Prueba), asi
+            # que esto normalmente sale "ok: False" - eso es esperado, no un
+            # error: el panel operativo y las demas fuentes siguen sirviendo
+            # solas. Nunca debe tumbar el resto del dashboard si falla algo
+            # inesperado aqui, por eso su propio try/except separado.
+            try:
+                flujo_fecha_inicio = (fecha_desde - timedelta(days=1)).strftime("%Y-%m-%d")
+                flujo_efectivo_data = construir_flujo_efectivo(idcliente, flujo_fecha_inicio, hasta)
+            except Exception as e:
+                flujo_efectivo_data = {
+                    "ok": False,
+                    "error": "No fue posible calcular el flujo de efectivo para este período.",
+                    "detalle": str(e),
+                }
+
             return {
                 "ok": True,
+                "flujo_efectivo": flujo_efectivo_data,
                 "periodo": {
                     "desde": desde,
                     "hasta": hasta,

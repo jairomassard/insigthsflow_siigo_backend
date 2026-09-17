@@ -911,20 +911,25 @@ def generar_analisis_indicadores(
 PROMPT_SISTEMA_DIAGNOSTICO_INTEGRAL = (
     "Eres un analista financiero senior / CFO fraccional entregando un "
     "diagnóstico COMPLETO e INTEGRADO de una PyME colombiana al dueño o "
-    "gerente, combinando en un solo análisis cuatro fuentes: el Estado de "
-    "Resultados (rentabilidad del período), el Balance General "
+    "gerente, combinando en un solo análisis hasta cinco fuentes: el "
+    "Estado de Resultados (rentabilidad del período), el Balance General "
     "(estructura patrimonial al corte), los Indicadores Financieros "
-    "(liquidez, endeudamiento, ROE/ROA, ciclo de caja) y el panel "
-    "operativo del Resumen Ejecutivo (caja disponible, autonomía de caja, "
-    "utilidad neta del período - la línea de fondo, lo que realmente le "
-    "queda a la empresa -, egresos totales - costos y gastos reconocidos "
-    "contablemente, la contraparte de las ventas -, evolución mensual de "
-    "ventas/egresos/EBITDA/utilidad neta/eficiencia operativa, "
-    "concentración en clientes/proveedores/gastos principales). Vas a "
-    "recibir las cuatro ya calculadas en JSON - no inventes cifras que no "
-    "estén ahí. Si alguna fuente viene marcada como no disponible "
-    "(\"disponible\": false), dilo explícitamente y seguí con las demás, "
-    "no la inventes.\n\n"
+    "(liquidez, endeudamiento, ROE/ROA, ciclo de caja), el Estado de "
+    "Flujo de Efectivo (de dónde salió realmente el efectivo - operación, "
+    "inversión o financiación - y si eso cuadra contra el movimiento real "
+    "de caja) y el panel operativo del Resumen Ejecutivo (caja "
+    "disponible, autonomía de caja, utilidad neta del período - la línea "
+    "de fondo, lo que realmente le queda a la empresa -, egresos totales "
+    "- costos y gastos reconocidos contablemente, la contraparte de las "
+    "ventas -, evolución mensual de ventas/egresos/EBITDA/utilidad neta/"
+    "eficiencia operativa, concentración en clientes/proveedores/gastos "
+    "principales). Vas a recibir todas las que estén disponibles ya "
+    "calculadas en JSON - no inventes cifras que no estén ahí. El Flujo "
+    "de Efectivo con frecuencia viene marcado como no disponible "
+    "(\"disponible\": false) porque exige Balance de Prueba real en "
+    "ambas puntas del período, algo que no siempre está cargado - eso es "
+    "normal, no un error; decilo explícitamente si pasa y seguí con las "
+    "demás fuentes.\n\n"
     "ESTO NO ES UN RESUMEN DE CADA REPORTE POR SEPARADO. El objetivo "
     "central es CONECTAR la información entre fuentes - encontrar lo que "
     "solo se ve combinándolas. Ejemplos del tipo de cruce esperado "
@@ -948,7 +953,19 @@ PROMPT_SISTEMA_DIAGNOSTICO_INTEGRAL = (
     "- Si la evolución mensual muestra un mes atípico (una caída o un "
     "pico que no se repite en los demás meses), señalalo explícitamente y "
     "conectalo con lo que el Balance o Indicadores puedan explicar de ese "
-    "mismo período.\n\n"
+    "mismo período.\n"
+    "- Si flujo_efectivo está disponible: compará la utilidad neta del "
+    "Estado de Resultados contra kpis.flujo_operacion real - si son muy "
+    "distintos, decí de dónde vino la diferencia (cobros de cartera "
+    "vieja, pagos atrasados a proveedores, etc., usando detalle_operacion) "
+    "y si esa caja es sostenible o fue un evento de una sola vez. Cruzalo "
+    "también con la caja disponible/autonomía del panel operativo - si el "
+    "flujo de operación es negativo pero la caja disponible se ve bien, "
+    "explicá que probablemente sea financiación (deuda/aportes) tapando "
+    "un problema operativo de fondo, no una posición realmente sana. Si "
+    "kpis.cuadra es false, tratalo como hallazgo prioritario - compromete "
+    "la confiabilidad de esa fuente específica (las demás siguen siendo "
+    "válidas).\n\n"
     "Sobre la evolución mensual (evolucion_mensual del panel operativo): "
     "explicá la tendencia real de ventas, egresos totales, EBITDA, "
     "utilidad neta y eficiencia operativa a lo largo del período "
@@ -1020,12 +1037,20 @@ def _resumen_dashboard_para_ia(dashboard_data: dict) -> dict:
 def _resumen_transversal_para_ia(
     pnl_data: dict, balance_data: dict, indicadores_data: dict, dashboard_data: dict
 ) -> dict:
-    """Ensambla los 3 payloads ya validados (PyG/Balance/Indicadores) mas
-    la capa operativa del dashboard - no reconstruye extraccion de datos,
-    solo reusa lo que cada reporte individual ya probo. Si Balance o
-    Indicadores no se pudieron construir para el periodo (ej. snapshot
-    faltante), se marca como no disponible en vez de fallar todo el
-    diagnostico - PyG y el panel operativo solos ya aportan valor."""
+    """Ensambla los payloads ya validados (PyG/Balance/Indicadores/Flujo de
+    Efectivo) mas la capa operativa del dashboard - no reconstruye
+    extraccion de datos, solo reusa lo que cada reporte individual ya
+    probo. Si Balance, Indicadores o Flujo de Efectivo no se pudieron
+    construir para el periodo (ej. snapshot faltante), se marca como no
+    disponible en vez de fallar todo el diagnostico - PyG y el panel
+    operativo solos ya aportan valor.
+
+    Flujo de Efectivo llega DENTRO de dashboard_data["flujo_efectivo"]
+    (calculado una sola vez en construir_resumen_ejecutivo, reusado aqui
+    para no duplicar el calculo) - normalmente sale "no disponible" porque
+    el periodo del dashboard rara vez coincide con fechas de Balance de
+    Prueba real; eso es esperado, no un error."""
+    flujo_efectivo_data = dashboard_data.get("flujo_efectivo") or {}
     return {
         "estado_resultados": _resumen_pyg_para_ia(pnl_data),
         "balance_general": (
@@ -1037,6 +1062,16 @@ def _resumen_transversal_para_ia(
             _resumen_indicadores_para_ia(indicadores_data)
             if indicadores_data.get("ok")
             else {"disponible": False, "motivo": indicadores_data.get("error", "No disponible para este período")}
+        ),
+        "flujo_efectivo": (
+            _resumen_flujo_efectivo_para_ia(flujo_efectivo_data)
+            if flujo_efectivo_data.get("ok")
+            else {
+                "disponible": False,
+                "motivo": flujo_efectivo_data.get(
+                    "error", "No disponible para este período (requiere Balance de Prueba real en ambas puntas)"
+                ),
+            }
         ),
         "panel_operativo": _resumen_dashboard_para_ia(dashboard_data),
     }
