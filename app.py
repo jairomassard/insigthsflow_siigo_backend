@@ -90,6 +90,11 @@ from balance import (
     regenerar_snapshot_saldos_corte_desde_balance_prueba,
     regenerar_snapshots_balance,
     construir_balance_general,
+    clasificar_cuenta,
+    es_cuenta_contra_activo,
+    ultimo_dia_del_mes,
+    safe_float,
+    redondear,
 )
 
 from siigo.siigo_sync_documentos_soporte_staging import sync_documentos_soporte_staging_desde_siigo
@@ -1259,6 +1264,7 @@ def construir_pnl_auxiliares(idcliente, desde, hasta):
             "gastos_operacionales": gastos_operacionales,
             "utilidad_operativa": utilidad_operativa,
             "ebitda": ebitda,
+            "dep_amort": dep_amort,
             "gastos_no_operacionales": gastos_no_operacionales,
             "utilidad_antes_impuestos": utilidad_antes_impuestos,
             "utilidad_neta": utilidad_neta,
@@ -1868,6 +1874,7 @@ def construir_pnl_alegra_facturas(idcliente, desde, hasta):
             "gastos_operacionales": gastos_operacionales,
             "utilidad_operativa": utilidad_operativa,
             "ebitda": ebitda,
+            "dep_amort": dep_amort,
             "gastos_no_operacionales": gastos_no_operacionales,
             "utilidad_antes_impuestos": utilidad_antes_impuestos,
             "utilidad_neta": utilidad_neta,
@@ -1897,6 +1904,225 @@ def construir_pnl(idcliente, desde, hasta):
     if _proveedor_datos_cliente(idcliente) == "alegra":
         return construir_pnl_alegra_facturas(idcliente, desde, hasta)
     return construir_pnl_auxiliares(idcliente, desde, hasta)
+
+
+# =========================================================
+# Estado de Flujo de Efectivo (metodo indirecto) - Fase 2 del brief
+# Docs_integracion/InsightsFlow_Brief_Flujo_de_Efectivo.md
+# =========================================================
+
+_GRUPO_FLUJO_FINANCIACION = {"21"}  # Obligaciones Financieras
+_CUENTA_PADRE_FLUJO_FINANCIACION_EXTRA = {"2355"}  # Socios/accionistas
+_GRUPO_PATRIMONIO_FINANCIACION = {"31", "33"}  # Capital, Reserva Legal (aportes reales)
+
+
+def _armar_narrativa_flujo_efectivo(flujo_operacion, flujo_inversion, flujo_financiacion, cuadra, diferencia_pct):
+    narrativa = []
+    if flujo_operacion >= 0:
+        narrativa.append("La operación del negocio generó caja en este periodo.")
+    else:
+        narrativa.append("La operación del negocio consumió más caja de la que generó en este periodo.")
+
+    if abs(flujo_inversion) >= 1:
+        narrativa.append(
+            "Hubo compra o venta de activos fijos en el periodo."
+            if flujo_inversion < 0 else
+            "Se liberó caja por venta de activos fijos en el periodo."
+        )
+    if abs(flujo_financiacion) >= 1:
+        narrativa.append(
+            "Entró caja por deuda o aportes de capital en el periodo."
+            if flujo_financiacion > 0 else
+            "Se pagó deuda o se hicieron retiros/dividendos en el periodo."
+        )
+
+    if cuadra:
+        narrativa.append("El cálculo cuadra dentro de un margen razonable contra el movimiento real de caja.")
+    else:
+        pct_txt = f"{diferencia_pct:.1f}%" if diferencia_pct is not None else "no calculable"
+        narrativa.append(
+            f"El cálculo NO cuadra contra el movimiento real de caja (diferencia {pct_txt}) - "
+            "hay cuentas que probablemente necesitan revisión contable antes de confiar en este reporte."
+        )
+    return narrativa
+
+
+def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
+    """Estado de Flujo de Efectivo, método indirecto. SOLO SIIGO por ahora -
+    Alegra queda para una fase futura (tiene sus propios problemas de
+    completitud de datos, ver calcular_cobertura_alegra /
+    calcular_cobertura_balance_alegra en balance.py).
+
+    Exige snapshot origen='BALANCE_PRUEBA' en AMBAS fechas de corte: el
+    camino general de Siigo (regenerar_snapshot_saldos_corte sin Balance de
+    Prueba) no tiene ancla de saldo inicial - construir el flujo sobre eso
+    daría un número que se ve razonable pero puede estar mal sin que se
+    note (piloto real con Binaria Media Group, 2026-09: validado a 0.063%
+    de diferencia, pero SOLO cuando ambas fechas usan Balance de Prueba
+    real y reconciliado - ver memoria project_insightflow_flujo_efectivo).
+
+    Reglas de clasificación aprendidas del piloto real (no de teoría):
+    - Cuentas contra-activo (depreciación/amortización acumulada,
+      es_cuenta_contra_activo) se EXCLUYEN de inversión - ya están
+      revertidas vía dep_amort en operación; incluirlas de nuevo duplica
+      el efecto (encontrado y corregido a mano en el segundo piloto).
+    - Obligaciones Financieras (grupo '21') y Socios/accionistas
+      (cuenta_padre '2355') son financiación, no capital de trabajo
+      operativo, aunque estén en Pasivo Corriente.
+    - Patrimonio: solo Capital y Reserva Legal (grupos '31'/'33') cuentan
+      como financiación real. El resto de Patrimonio (utilidades o
+      resultados acumulados) se EXCLUYE de financiación por defecto -
+      casi siempre es apropiación de una utilidad que ya se contó arriba
+      en operación, no una entrada real de caja (caso real: la cuenta
+      "Utilidad Ejercicio 2023" de Binaria se movió $69M sin ninguna
+      entrada real de plata - confirmado con el contador del cliente).
+    """
+    fecha_inicio = ultimo_dia_del_mes(fecha_inicio)
+    fecha_fin = ultimo_dia_del_mes(fecha_fin)
+
+    if _proveedor_datos_cliente(idcliente) != "siigo":
+        return {
+            "ok": False,
+            "error": "El Estado de Flujo de Efectivo todavía solo está disponible para clientes Siigo."
+        }
+
+    snap_inicio = AuxiliarSaldosCorte.query.filter_by(
+        idcliente=idcliente, fecha_corte=fecha_inicio, origen="BALANCE_PRUEBA"
+    ).all()
+    snap_fin = AuxiliarSaldosCorte.query.filter_by(
+        idcliente=idcliente, fecha_corte=fecha_fin, origen="BALANCE_PRUEBA"
+    ).all()
+
+    if not snap_inicio or not snap_fin:
+        faltantes = [f for f, snap in ((fecha_inicio, snap_inicio), (fecha_fin, snap_fin)) if not snap]
+        return {
+            "ok": False,
+            "error": (
+                "Este reporte necesita el Balance de Prueba real de Siigo cargado y "
+                "aplicado (no el auxiliar acumulado) para ambas fechas de corte, porque "
+                "solo así el saldo inicial es confiable. Falta para: " + ", ".join(faltantes)
+            ),
+            "fechas_faltantes": faltantes,
+        }
+
+    fecha_pyg_desde = (datetime.strptime(fecha_inicio, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    pnl = construir_pnl_auxiliares(idcliente, fecha_pyg_desde, fecha_fin)
+    utilidad_neta = safe_float(pnl["kpis"]["utilidad_neta"])
+    dep_amort = safe_float(pnl["kpis"]["dep_amort"])
+
+    map_inicio = {r.cuenta_codigo: r for r in snap_inicio}
+    map_fin = {r.cuenta_codigo: r for r in snap_fin}
+    todos_codigos = set(map_inicio) | set(map_fin)
+
+    caja_delta = 0.0
+    operacion_delta = 0.0
+    inversion_delta = 0.0
+    financiacion_delta = 0.0
+    detalle_operacion = []
+    detalle_inversion = []
+    detalle_financiacion = []
+    detalle_excluido = []
+
+    for codigo in todos_codigos:
+        r_ini = map_inicio.get(codigo)
+        r_fin = map_fin.get(codigo)
+        row_ref = r_fin or r_ini
+        clase = str(row_ref.clase or "")
+
+        if clase in ("4", "5", "6", "7"):
+            continue  # cuentas de resultado: ya capturadas via utilidad_neta, no son saldo de balance
+
+        saldo_ini = safe_float(r_ini.saldo) if r_ini else 0.0
+        saldo_fin = safe_float(r_fin.saldo) if r_fin else 0.0
+        delta = saldo_fin - saldo_ini
+        if abs(delta) < 1:
+            continue
+
+        nombre = row_ref.cuenta_nombre
+        grupo_balance = row_ref.grupo_balance
+        grupo = str(row_ref.grupo or "")
+        cuenta_padre = str(row_ref.cuenta_padre or "")
+        item = {"cuenta": codigo, "nombre": nombre, "delta": redondear(delta, 2)}
+
+        if grupo == "11":
+            caja_delta += delta
+            continue
+
+        if grupo_balance == "ACTIVO_NO_CORRIENTE":
+            if es_cuenta_contra_activo(codigo, nombre):
+                continue
+            item["efecto_caja"] = redondear(-delta, 2)
+            inversion_delta += -delta
+            detalle_inversion.append(item)
+            continue
+
+        if grupo_balance == "PATRIMONIO":
+            if grupo in _GRUPO_PATRIMONIO_FINANCIACION:
+                item["efecto_caja"] = redondear(delta, 2)
+                financiacion_delta += delta
+                detalle_financiacion.append(item)
+            else:
+                detalle_excluido.append(item)
+            continue
+
+        if grupo_balance == "ACTIVO_CORRIENTE":
+            item["efecto_caja"] = redondear(-delta, 2)
+            operacion_delta += -delta
+            detalle_operacion.append(item)
+            continue
+
+        if grupo_balance in ("PASIVO_CORRIENTE", "PASIVO_NO_CORRIENTE"):
+            if grupo in _GRUPO_FLUJO_FINANCIACION or cuenta_padre in _CUENTA_PADRE_FLUJO_FINANCIACION_EXTRA:
+                item["efecto_caja"] = redondear(delta, 2)
+                financiacion_delta += delta
+                detalle_financiacion.append(item)
+            else:
+                item["efecto_caja"] = redondear(delta, 2)
+                operacion_delta += delta
+                detalle_operacion.append(item)
+            continue
+
+    flujo_operacion = redondear(utilidad_neta + dep_amort + operacion_delta, 2)
+    flujo_inversion = redondear(inversion_delta, 2)
+    flujo_financiacion = redondear(financiacion_delta, 2)
+    total_flujos = redondear(flujo_operacion + flujo_inversion + flujo_financiacion, 2)
+    caja_delta = redondear(caja_delta, 2)
+    diferencia = redondear(total_flujos - caja_delta, 2)
+    diferencia_pct = redondear((diferencia / caja_delta) * 100, 3) if abs(caja_delta) >= 1 else None
+
+    UMBRAL_CUADRATURA_PCT = 5.0
+    cuadra = (abs(diferencia_pct) <= UMBRAL_CUADRATURA_PCT) if diferencia_pct is not None else (abs(diferencia) < 1)
+
+    narrativa = _armar_narrativa_flujo_efectivo(
+        flujo_operacion, flujo_inversion, flujo_financiacion, cuadra, diferencia_pct
+    )
+
+    return {
+        "ok": True,
+        "fechas": {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin},
+        "kpis": {
+            "utilidad_neta": redondear(utilidad_neta, 2),
+            "dep_amort": redondear(dep_amort, 2),
+            "variacion_capital_trabajo": redondear(operacion_delta, 2),
+            "flujo_operacion": flujo_operacion,
+            "flujo_inversion": flujo_inversion,
+            "flujo_financiacion": flujo_financiacion,
+            "total_flujos_calculado": total_flujos,
+            "delta_caja_real": caja_delta,
+            "diferencia": diferencia,
+            "diferencia_pct": diferencia_pct,
+            "cuadra": cuadra,
+        },
+        "detalle": {
+            "operacion": sorted(detalle_operacion, key=lambda x: -abs(x["delta"])),
+            "inversion": sorted(detalle_inversion, key=lambda x: -abs(x["delta"])),
+            "financiacion": sorted(detalle_financiacion, key=lambda x: -abs(x["delta"])),
+            "excluido_patrimonio": sorted(detalle_excluido, key=lambda x: -abs(x["delta"])),
+        },
+        "resumen": {
+            "narrativa": narrativa,
+        },
+    }
 
 
 # =========================================================
@@ -20853,6 +21079,35 @@ def create_app():
             }), 500
 
 
+    @app.route("/reportes/flujo_efectivo_v1", methods=["GET"])
+    @jwt_required()
+    def get_flujo_efectivo_v1():
+        idcliente = get_jwt().get("idcliente")
+        fecha_inicio = request.args.get("fecha_inicio")
+        fecha_fin = request.args.get("fecha_fin")
+
+        if not fecha_inicio or not fecha_fin:
+            return jsonify({"error": "Debes enviar fecha_inicio y fecha_fin"}), 400
+
+        try:
+            result = construir_flujo_efectivo(idcliente, fecha_inicio, fecha_fin)
+
+            if not result.get("ok"):
+                return jsonify({
+                    "error": result.get("error", "No fue posible construir el flujo de efectivo"),
+                    "fechas_faltantes": result.get("fechas_faltantes"),
+                }), 404
+
+            return jsonify(result), 200
+
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({
+                "error": "No fue posible consultar el flujo de efectivo",
+                "detalle": str(e)
+            }), 500
+
+
     @app.route("/reportes/balance_general_v1/analisis-ia", methods=["POST"])
     @jwt_required()
     def post_balance_general_analisis_ia():
@@ -24072,6 +24327,12 @@ def create_app():
             # ------------------------------------------
             elif "indicadores" in path_norm:
                 codigo = "ver_reporte_indicadores"
+
+            # ------------------------------------------
+            # Flujo de Efectivo
+            # ------------------------------------------
+            elif "flujo-efectivo" in path_norm:
+                codigo = "ver_reporte_flujo_efectivo"
 
             # ------------------------------------------
             # Balance General
