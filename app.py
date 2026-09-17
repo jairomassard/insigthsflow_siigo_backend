@@ -21108,6 +21108,29 @@ def create_app():
             }), 500
 
 
+    @app.route("/reportes/flujo_efectivo_v1/fechas_disponibles", methods=["GET"])
+    @jwt_required()
+    def get_flujo_efectivo_fechas_disponibles():
+        """Fechas de corte que sí tienen Balance de Prueba real (origen
+        BALANCE_PRUEBA) cargado - las únicas con las que el Flujo de
+        Efectivo puede calcularse de forma confiable (ver
+        construir_flujo_efectivo). El frontend usa esto para que el
+        usuario solo pueda elegir combinaciones que van a funcionar, en
+        vez de "elige y falla" con un date picker libre."""
+        idcliente = get_jwt().get("idcliente")
+        try:
+            filas = db.session.query(AuxiliarSaldosCorte.fecha_corte).filter_by(
+                idcliente=idcliente, origen="BALANCE_PRUEBA"
+            ).distinct().order_by(AuxiliarSaldosCorte.fecha_corte).all()
+            fechas = [f[0].isoformat() for f in filas]
+            return jsonify({"fechas": fechas}), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible consultar las fechas disponibles",
+                "detalle": str(e)
+            }), 500
+
+
     @app.route("/reportes/balance_general_v1/analisis-ia", methods=["POST"])
     @jwt_required()
     def post_balance_general_analisis_ia():
