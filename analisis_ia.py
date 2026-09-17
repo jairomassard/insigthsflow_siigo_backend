@@ -227,6 +227,59 @@ PROMPT_SISTEMA_INDICADORES = (
 )
 
 
+PROMPT_SISTEMA_FLUJO_EFECTIVO = (
+    "Eres un analista financiero senior ayudando al dueño o gerente de una "
+    "PyME colombiana a entender su Estado de Flujo de Efectivo (método "
+    "indirecto). Vas a recibir en JSON: los KPIs del período (utilidad "
+    "neta, depreciación/amortización, variación de capital de trabajo, "
+    "los 3 flujos - operación, inversión, financiación -, la caja inicial "
+    "y final reales, y la cuadratura contra el movimiento real de caja), "
+    "el detalle de cuentas dentro de cada flujo, y las cuentas de "
+    "patrimonio que el sistema excluyó de financiación por ser "
+    "probablemente apropiación de utilidad ya contada (no un aporte o "
+    "retiro real). No inventes cifras que no estén ahí.\n\n"
+    "El objetivo central de este reporte es responder la pregunta que más "
+    "confunde a un dueño de negocio: '¿por qué mi utilidad no se parece a "
+    "la plata que tengo en el banco?' - tu análisis tiene que resolver "
+    "eso explícitamente, no solo describir los 3 flujos por separado.\n\n"
+    "Responde siempre en español, en formato markdown, con esta "
+    "estructura fija y sin exceder ~2000-2500 palabras en total:\n\n"
+    "## Resumen ejecutivo\n"
+    "2-3 frases: de dónde vino realmente el cambio en la caja de este "
+    "período (operación, inversión o financiación), y si ese origen es "
+    "sostenible o fue un evento de una sola vez.\n\n"
+    "## Hallazgos principales\n"
+    "Entre 3 y 5 hallazgos, cada uno con el número que lo respalda. "
+    "Cubrí explícitamente, cuando los datos lo permitan:\n"
+    "- Calidad de la utilidad: compará utilidad_neta contra "
+    "flujo_operacion. Si son muy distintos, explicá por qué (ej. cobros "
+    "de cartera vieja, pagos atrasados a proveedores) y qué significa "
+    "para la caja futura si esa diferencia no se repite.\n"
+    "- Qué cuentas de capital de trabajo (dentro de detalle.operacion) "
+    "tuvieron el mayor efecto en caja, positivo o negativo, y si eso "
+    "parece una tendencia sana (cobrar más rápido, pagar a tiempo) o un "
+    "riesgo (cartera creciendo, proveedores acumulándose).\n"
+    "- Inversión: si hubo compra o venta de activos fijos, si es "
+    "coherente con una empresa que está creciendo o desinvirtiendo.\n"
+    "- Financiación: si la empresa se está apalancando más (entra deuda) "
+    "o desapalancando (sale deuda/hay retiros), y si eso es sano dado el "
+    "resto del panorama.\n"
+    "- Cuentas excluidas de financiación (detalle.excluido_patrimonio): "
+    "mencioná si hay algo ahí y recordá que necesita confirmación del "
+    "contador antes de tratarse como un movimiento real de caja.\n"
+    "- Cuadratura: si kpis.cuadra es false, decilo como hallazgo "
+    "prioritario (primero en la lista) - compromete la confiabilidad de "
+    "todo lo demás en este reporte.\n\n"
+    "## Recomendaciones\n"
+    "Entre 3 y 5 acciones concretas y accionables (ej. sobre gestión de "
+    "cartera, ritmo de pago a proveedores, o si conviene esperar antes de "
+    "comprometer la caja actual en gastos o inversiones nuevas), ligadas "
+    "directamente a los hallazgos de arriba.\n\n"
+    "Si algo no se puede determinar con los datos disponibles, dilo "
+    "explícitamente en vez de asumir u omitirlo."
+)
+
+
 class TopeAlcanzadoError(Exception):
     """El cliente ya usó sus análisis reales del mes."""
 
@@ -435,6 +488,138 @@ def _resumen_balance_para_ia(balance_data: dict) -> dict:
         "pasivo_corriente": balance.get("pasivo_corriente", []),
         "pasivo_no_corriente": balance.get("pasivo_no_corriente", []),
         "patrimonio": balance.get("patrimonio", []),
+    }
+
+
+def _resumen_flujo_efectivo_para_ia(flujo_data: dict) -> dict:
+    """Payload curado para el Flujo de Efectivo - usa exactamente los
+    mismos bloques (kpis, detalle por seccion) que ve el usuario en
+    pantalla, incluyendo la lectura ejecutiva ya redactada con los
+    numeros reales (resumen.narrativa) para que la IA parta de la misma
+    base que el usuario ya vio, no la re-derive desde cero."""
+    detalle = flujo_data.get("detalle", {})
+    return {
+        "fechas": flujo_data.get("fechas", {}),
+        "kpis": flujo_data.get("kpis", {}),
+        "narrativa_ya_mostrada": flujo_data.get("resumen", {}).get("narrativa", []),
+        "detalle_operacion": detalle.get("operacion", []),
+        "detalle_inversion": detalle.get("inversion", []),
+        "detalle_financiacion": detalle.get("financiacion", []),
+        "excluido_patrimonio": detalle.get("excluido_patrimonio", []),
+    }
+
+
+def generar_analisis_flujo_efectivo(
+    idcliente: int,
+    fecha_inicio: str,
+    fecha_fin: str,
+    flujo_data: dict,
+    forzar: bool = False,
+    solo_verificar: bool = False,
+) -> dict:
+    """Punto de entrada principal para el Flujo de Efectivo. Mismo patron
+    de cache/tope/huella que generar_analisis_balance() - el periodo se
+    guarda en periodo_desde/periodo_hasta igual que los demas reportes."""
+    tipo_reporte = "flujo_efectivo"
+    periodo_desde = date.fromisoformat(fecha_inicio)
+    periodo_hasta = date.fromisoformat(fecha_fin)
+
+    payload = _resumen_flujo_efectivo_para_ia(flujo_data)
+    huella = _huella_datos(payload)
+
+    cache = AnalisisIACache.query.filter_by(
+        idcliente=idcliente,
+        tipo_reporte=tipo_reporte,
+        periodo_desde=periodo_desde,
+        periodo_hasta=periodo_hasta,
+    ).first()
+
+    if solo_verificar:
+        return _resultado_verificacion(cache, huella)
+
+    if cache and cache.huella_datos == huella and not forzar:
+        return {
+            "fuente": "cache",
+            "analisis": cache.analisis_texto,
+            "modelo": cache.modelo,
+            "generado_en": cache.updated_at.isoformat() if cache.updated_at else None,
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }
+
+    uso_actual = consultar_uso_mensual(idcliente)
+    if uso_actual >= TOPE_MENSUAL:
+        raise TopeAlcanzadoError(uso_actual, TOPE_MENSUAL)
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY no está configurada en el entorno del backend.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    mensaje_usuario = (
+        f"Aquí está el Estado de Flujo de Efectivo del periodo {fecha_inicio} a {fecha_fin}, "
+        "en formato JSON:\n\n"
+        + json.dumps(payload, ensure_ascii=False, default=str)
+    )
+
+    with client.beta.messages.stream(
+        model=MODELO_ANALISIS,
+        max_tokens=32000,
+        system=PROMPT_SISTEMA_FLUJO_EFECTIVO,
+        thinking={"type": "adaptive"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        messages=[{"role": "user", "content": mensaje_usuario}],
+    ) as stream:
+        response = stream.get_final_message()
+
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "La respuesta de la IA se cortó por max_tokens antes de terminar. "
+            "No se guardó en caché ni se consumió el cupo mensual - intenta de nuevo."
+        )
+
+    texto = "".join(block.text for block in response.content if block.type == "text")
+
+    tokens_in = response.usage.input_tokens
+    tokens_out = response.usage.output_tokens
+    precio = PRECIO_POR_MILLON_USD[MODELO_ANALISIS]
+    costo_usd = (tokens_in / 1_000_000 * precio["input"]) + (tokens_out / 1_000_000 * precio["output"])
+    costo_cop = round(costo_usd * TRM_COP_POR_USD, 2)
+
+    if cache:
+        cache.huella_datos = huella
+        cache.modelo = MODELO_ANALISIS
+        cache.analisis_texto = texto
+        cache.tokens_entrada = tokens_in
+        cache.tokens_salida = tokens_out
+        cache.costo_cop = costo_cop
+    else:
+        cache = AnalisisIACache(
+            idcliente=idcliente,
+            tipo_reporte=tipo_reporte,
+            periodo_desde=periodo_desde,
+            periodo_hasta=periodo_hasta,
+            huella_datos=huella,
+            modelo=MODELO_ANALISIS,
+            analisis_texto=texto,
+            tokens_entrada=tokens_in,
+            tokens_salida=tokens_out,
+            costo_cop=costo_cop,
+        )
+        db.session.add(cache)
+
+    db.session.commit()
+    _incrementar_uso_mensual(idcliente)
+
+    return {
+        "fuente": "nuevo",
+        "analisis": texto,
+        "modelo": MODELO_ANALISIS,
+        "generado_en": datetime.utcnow().isoformat(),
+        "uso_mensual": consultar_uso_mensual(idcliente),
+        "tope_mensual": TOPE_MENSUAL,
     }
 
 

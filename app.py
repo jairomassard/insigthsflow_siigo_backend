@@ -30,6 +30,7 @@ from analisis_ia import (
     generar_analisis_balance,
     generar_analisis_indicadores,
     generar_analisis_transversal,
+    generar_analisis_flujo_efectivo,
     generar_word_analisis,
     consultar_uso_mensual,
     listar_historial_analisis,
@@ -21169,6 +21170,118 @@ def create_app():
                 "error": "No fue posible consultar las fechas disponibles",
                 "detalle": str(e)
             }), 500
+
+
+    @app.route("/reportes/flujo_efectivo_v1/analisis-ia", methods=["POST"])
+    @jwt_required()
+    def post_flujo_efectivo_analisis_ia():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        fecha_inicio = data.get("fecha_inicio")
+        fecha_fin = data.get("fecha_fin")
+        forzar = bool(data.get("forzar"))
+
+        if not fecha_inicio or not fecha_fin:
+            return jsonify({"error": "Debes enviar fecha_inicio y fecha_fin"}), 400
+
+        try:
+            flujo_data = construir_flujo_efectivo(idcliente, fecha_inicio, fecha_fin)
+            if not flujo_data.get("ok"):
+                return jsonify({
+                    "error": flujo_data.get("error", "No fue posible construir el flujo de efectivo")
+                }), 404
+
+            resultado = generar_analisis_flujo_efectivo(
+                idcliente, fecha_inicio, fecha_fin, flujo_data, forzar=forzar
+            )
+            return jsonify(resultado), 200
+        except TopeAlcanzadoError as e:
+            return jsonify({
+                "error": "Ya usaste tus análisis con IA de este mes.",
+                "motivo": "tope_mensual_alcanzado",
+                "uso_actual": e.uso_actual,
+                "tope_mensual": e.tope,
+            }), 429
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el análisis con IA",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/flujo_efectivo_v1/analisis-ia/verificar", methods=["POST"])
+    @jwt_required()
+    def post_flujo_efectivo_analisis_ia_verificar():
+        idcliente = get_jwt().get("idcliente")
+        data = request.get_json(silent=True) or {}
+        fecha_inicio = data.get("fecha_inicio")
+        fecha_fin = data.get("fecha_fin")
+
+        if not fecha_inicio or not fecha_fin:
+            return jsonify({"error": "Debes enviar fecha_inicio y fecha_fin"}), 400
+
+        try:
+            flujo_data = construir_flujo_efectivo(idcliente, fecha_inicio, fecha_fin)
+            if not flujo_data.get("ok"):
+                return jsonify({
+                    "error": flujo_data.get("error", "No fue posible construir el flujo de efectivo")
+                }), 404
+
+            resultado = generar_analisis_flujo_efectivo(
+                idcliente, fecha_inicio, fecha_fin, flujo_data, solo_verificar=True
+            )
+            return jsonify(resultado), 200
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible verificar el estado del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/flujo_efectivo_v1/analisis-ia/word", methods=["POST"])
+    @jwt_required()
+    def post_flujo_efectivo_analisis_ia_word():
+        data = request.get_json(silent=True) or {}
+        analisis_markdown = data.get("analisis_markdown")
+        nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
+        periodo = data.get("periodo") or ""
+
+        if not analisis_markdown:
+            return jsonify({"error": "Debes enviar analisis_markdown"}), 400
+
+        try:
+            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            nombre_archivo = f"analisis_ia_FlujoEfectivo_{nombre_cliente.replace(' ', '_')}.docx"
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=nombre_archivo,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": "No fue posible generar el Word del análisis",
+                "detalle": str(e)
+            }), 500
+
+
+    @app.route("/reportes/flujo_efectivo_v1/analisis-ia/estado", methods=["GET"])
+    @jwt_required()
+    def get_flujo_efectivo_analisis_ia_estado():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "uso_mensual": consultar_uso_mensual(idcliente),
+            "tope_mensual": TOPE_MENSUAL,
+        }), 200
+
+
+    @app.route("/reportes/flujo_efectivo_v1/analisis-ia/historial", methods=["GET"])
+    @jwt_required()
+    def get_flujo_efectivo_analisis_ia_historial():
+        idcliente = get_jwt().get("idcliente")
+        return jsonify({
+            "historial": listar_historial_analisis(idcliente, tipo_reporte="flujo_efectivo")
+        }), 200
 
 
     @app.route("/reportes/balance_general_v1/analisis-ia", methods=["POST"])
