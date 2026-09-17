@@ -1916,33 +1916,64 @@ _CUENTA_PADRE_FLUJO_FINANCIACION_EXTRA = {"2355"}  # Socios/accionistas
 _GRUPO_PATRIMONIO_FINANCIACION = {"31", "33"}  # Capital, Reserva Legal (aportes reales)
 
 
-def _armar_narrativa_flujo_efectivo(flujo_operacion, flujo_inversion, flujo_financiacion, cuadra, diferencia_pct):
-    narrativa = []
+def _formato_pesos(v):
+    v = safe_float(v)
+    signo = "-" if v < 0 else ""
+    return f"{signo}${abs(v):,.0f}".replace(",", ".")
+
+
+def _armar_narrativa_flujo_efectivo(
+    caja_inicial, caja_final, flujo_operacion, flujo_inversion, flujo_financiacion,
+    diferencia, cuadra, diferencia_pct
+):
+    """Narrativa con los numeros reales de ESTE calculo insertados en cada
+    frase (no frases genericas) - pedido explicito de Jairo 2026-09-17:
+    "arrancó en tanto, entró tanto dinero, la caja final es de tanto"."""
+    narrativa = [
+        f"Tu caja pasó de {_formato_pesos(caja_inicial)} al inicio del periodo a "
+        f"{_formato_pesos(caja_final)} al final."
+    ]
+
     if flujo_operacion >= 0:
-        narrativa.append("La operación del negocio generó caja en este periodo.")
+        narrativa.append(
+            f"La operación de tu negocio generó {_formato_pesos(flujo_operacion)} en caja en este "
+            "periodo (cobros a clientes, pagos a proveedores y empleados)."
+        )
     else:
-        narrativa.append("La operación del negocio consumió más caja de la que generó en este periodo.")
+        narrativa.append(
+            f"La operación de tu negocio consumió {_formato_pesos(abs(flujo_operacion))} más caja de "
+            "la que generó en este periodo."
+        )
 
     if abs(flujo_inversion) >= 1:
         narrativa.append(
-            "Hubo compra o venta de activos fijos en el periodo."
+            f"Invertiste {_formato_pesos(abs(flujo_inversion))} en activos fijos en este periodo."
             if flujo_inversion < 0 else
-            "Se liberó caja por venta de activos fijos en el periodo."
+            f"Recuperaste {_formato_pesos(flujo_inversion)} vendiendo activos fijos en este periodo."
         )
+    else:
+        narrativa.append("No hubo compra ni venta de activos fijos en este periodo.")
+
     if abs(flujo_financiacion) >= 1:
         narrativa.append(
-            "Entró caja por deuda o aportes de capital en el periodo."
+            f"Entraron {_formato_pesos(flujo_financiacion)} por préstamos o aportes de capital en "
+            "este periodo."
             if flujo_financiacion > 0 else
-            "Se pagó deuda o se hicieron retiros/dividendos en el periodo."
+            f"Salieron {_formato_pesos(abs(flujo_financiacion))} por pago de deuda o retiros en "
+            "este periodo."
         )
 
     if cuadra:
-        narrativa.append("El cálculo cuadra dentro de un margen razonable contra el movimiento real de caja.")
+        narrativa.append(
+            f"El cálculo cuadra: solo hay {_formato_pesos(abs(diferencia))} de diferencia frente al "
+            "movimiento real de tu cuenta bancaria — un margen normal, puedes confiar en este número."
+        )
     else:
         pct_txt = f"{diferencia_pct:.1f}%" if diferencia_pct is not None else "no calculable"
         narrativa.append(
-            f"El cálculo NO cuadra contra el movimiento real de caja (diferencia {pct_txt}) - "
-            "hay cuentas que probablemente necesitan revisión contable antes de confiar en este reporte."
+            f"El cálculo NO cuadra contra el movimiento real de caja (diferencia de "
+            f"{_formato_pesos(abs(diferencia))}, {pct_txt}) — hay cuentas que probablemente necesitan "
+            "revisión contable antes de confiar en este reporte."
         )
     return narrativa
 
@@ -2100,7 +2131,8 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
     cuadra = (abs(diferencia_pct) <= UMBRAL_CUADRATURA_PCT) if diferencia_pct is not None else (abs(diferencia) < 1)
 
     narrativa = _armar_narrativa_flujo_efectivo(
-        flujo_operacion, flujo_inversion, flujo_financiacion, cuadra, diferencia_pct
+        caja_inicial_total, caja_final_total, flujo_operacion, flujo_inversion, flujo_financiacion,
+        diferencia, cuadra, diferencia_pct
     )
 
     return {
