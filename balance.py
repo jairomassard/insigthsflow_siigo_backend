@@ -191,13 +191,26 @@ def _cobertura_balance_sin_codigo(idcliente: int, fecha_corte: str):
     chequeo de plausibilidad antes de sumar esto al snapshot (ver uso en
     regenerar_snapshot_saldos_corte) - esta función solo agrega y neta,
     no decide si es seguro incluirlo."""
+    # LEFT JOIN por nombre contra el catálogo real de Alegra para traer
+    # category_rule_key - alegra_cobertura_contable no lo guarda (se
+    # capturó antes de que este campo hiciera falta para nada), pero el
+    # nombre de cuenta es estable dentro del mismo cliente, así que el
+    # join por nombre es confiable. Se usa en construir_flujo_efectivo
+    # para clasificar mejor que "es activo/pasivo/patrimonio" a secas
+    # (ej. distinguir Capital real de Utilidades acumuladas dentro de
+    # "equity", o una Obligación Financiera de una cuenta por pagar
+    # operativa dentro de "liability") - Balance General ignora este
+    # campo, no le afecta en nada.
     filas = db.session.execute(text("""
-        SELECT cuenta_nombre, tipo_cuenta,
-               SUM(debito) AS debito, SUM(credito) AS credito
-        FROM alegra_cobertura_contable
-        WHERE idcliente = :idc AND fecha <= :fc
-          AND tipo_cuenta IN ('asset', 'liability', 'equity')
-        GROUP BY cuenta_nombre, tipo_cuenta
+        SELECT cc.cuenta_nombre, cc.tipo_cuenta,
+               SUM(cc.debito) AS debito, SUM(cc.credito) AS credito,
+               MAX(acc.category_rule_key) AS category_rule_key
+        FROM alegra_cobertura_contable cc
+        LEFT JOIN alegra_cuentas_contables acc
+            ON acc.idcliente = cc.idcliente AND acc.name = cc.cuenta_nombre
+        WHERE cc.idcliente = :idc AND cc.fecha <= :fc
+          AND cc.tipo_cuenta IN ('asset', 'liability', 'equity')
+        GROUP BY cc.cuenta_nombre, cc.tipo_cuenta
     """), {"idc": idcliente, "fc": fecha_corte}).mappings().all()
 
     neto_por_tipo = {"asset": 0.0, "liability": 0.0, "equity": 0.0}
@@ -211,6 +224,7 @@ def _cobertura_balance_sin_codigo(idcliente: int, fecha_corte: str):
             detalle.append({
                 "cuenta_nombre": f["cuenta_nombre"],
                 "tipo_cuenta": f["tipo_cuenta"],
+                "category_rule_key": f["category_rule_key"],
                 "neto": redondear(neto, 2)
             })
 
@@ -340,6 +354,176 @@ def calcular_cobertura_balance_alegra(idcliente: int, fecha_corte: str):
         "detalle_incluido": detalle_incluido,
         "detalle_excluido": detalle_excluido,
     }
+
+
+# =========================================================
+# Cobertura Alegra sin código PUC, para Flujo de Efectivo
+# =========================================================
+#
+# A diferencia de Balance General (que solo necesita un neto por tipo -
+# activo/pasivo/patrimonio - para inyectar un código sintético en el
+# snapshot), Flujo de Efectivo necesita saber a cuál de sus 4 categorías
+# (operación/inversión/financiación/excluido) pertenece cada cuenta sin
+# código, porque mezclarlas mal significa contar como "operación" una
+# entrada de capital real, o algo peor, como se investigó con datos reales
+# de Maslux LED (idcliente=16, 2026-09). Por eso se usa category_rule_key
+# de Alegra (alegra_cuentas_contables) - su propia taxonomía semántica de
+# cuentas, disponible incluso sin código PUC - más un respaldo por nombre
+# en español para lo que Alegra no categoriza.
+#
+# Encuesta real (2026-09) de los únicos valores de category_rule_key que
+# existen hoy en producción para tipo liability/equity, sobre los clientes
+# Alegra reales (15=NGC, 16=Maslux) + demo (17):
+#   equity:    EQUITY, INITIAL_ADJUSTMENTS_BANKS, INITIAL_ADJUSTMENTS_INVENTORY,
+#              LOSS_OF_PERIOD, UTILITIES, UTILITIES_PERIOD, (vacío)
+#   liability: ADVANCE_IN, DEBTS_TO_PAY_CREDIT_CARDS, DEBTS_TO_PAY_PROVIDERS,
+#              DEBTS_TO_PAY_RETURNS, FUENTE_RETENTION_TO_PAY_COL, ICO_TO_PAY_COL,
+#              INDUSTRY_RETENTION_TO_PAY_COL, IVA_REFUNDED_ON_SALES_COL,
+#              IVA_RETENTION_TO_PAY_COL, IVA_TO_PAY_COL, LIABILITIES,
+#              OTHER_RETENTION_TYPE_TO_PAY, OTHER_TAX_TYPE_TO_PAY,
+#              RETENTIONS_TO_PAY, TAXES_TO_PAY, (vacío)
+# Notablemente Alegra NO tiene una categoría propia para "Obligaciones
+# Financieras" ni "Socios" como pasivo - de ahí que el respaldo por nombre
+# sea imprescindible para pasivo, no solo un extra.
+
+_LIABILITY_CRK_FINANCIACION = {"DEBTS_TO_PAY_CREDIT_CARDS"}
+_LIABILITY_CRK_OPERACION = {
+    "ADVANCE_IN", "DEBTS_TO_PAY_PROVIDERS", "DEBTS_TO_PAY_RETURNS",
+    "FUENTE_RETENTION_TO_PAY_COL", "ICO_TO_PAY_COL", "INDUSTRY_RETENTION_TO_PAY_COL",
+    "IVA_REFUNDED_ON_SALES_COL", "IVA_RETENTION_TO_PAY_COL", "IVA_TO_PAY_COL",
+    "OTHER_RETENTION_TYPE_TO_PAY", "OTHER_TAX_TYPE_TO_PAY", "RETENTIONS_TO_PAY",
+    "TAXES_TO_PAY",
+}
+_PALABRAS_FINANCIACION_PASIVO = (
+    "obligación financ", "obligacion financ", "préstamo", "prestamo",
+    "socio", "accionista", "leasing", "pagaré", "pagare",
+    "crédito bancario", "credito bancario", "tarjeta de crédito", "tarjeta de credito",
+)
+
+_EQUITY_CRK_EXCLUIDO = {"UTILITIES", "UTILITIES_PERIOD", "LOSS_OF_PERIOD"}
+_PALABRAS_EXCLUIDO_PATRIMONIO = (
+    "utilidad", "resultado", "pérdida", "perdida", "excedente", "ganancias acumulad", "ganancia acumulad",
+)
+_PALABRAS_FINANCIACION_PATRIMONIO = ("capital", "aporte", "reserva")
+
+_PALABRAS_ACTIVO_NO_CORRIENTE = (
+    "propiedad, planta", "propiedad planta", "activo fijo", "activos fijos",
+    "intangible", "inversion a largo plazo", "inversión a largo plazo",
+)
+
+
+def _clasificar_categoria_flujo_efectivo_alegra(tipo_cuenta: str, category_rule_key, cuenta_nombre: str):
+    """Devuelve 'operacion' | 'inversion' | 'financiacion' | 'excluido' para
+    una cuenta Alegra sin código PUC, usando category_rule_key + nombre.
+    Ver docstring de la sección arriba para el contexto completo."""
+    crk = str(category_rule_key or "").strip().upper()
+    nombre_l = str(cuenta_nombre or "").strip().lower()
+
+    if tipo_cuenta == "equity":
+        if crk.startswith("INITIAL_ADJUSTMENTS") or crk in _EQUITY_CRK_EXCLUIDO:
+            return "excluido"  # ajuste de carga de saldo inicial o resultado del ejercicio, no es flujo real
+        if crk == "EQUITY":
+            return "financiacion"
+        if any(p in nombre_l for p in _PALABRAS_EXCLUIDO_PATRIMONIO):
+            return "excluido"
+        if any(p in nombre_l for p in _PALABRAS_FINANCIACION_PATRIMONIO):
+            return "financiacion"
+        return "excluido"  # patrimonio sin certeza: por defecto no se cuenta como entrada de caja real
+
+    if tipo_cuenta == "liability":
+        if crk in _LIABILITY_CRK_FINANCIACION:
+            return "financiacion"
+        if crk in _LIABILITY_CRK_OPERACION:
+            return "operacion"
+        if any(p in nombre_l for p in _PALABRAS_FINANCIACION_PASIVO):
+            return "financiacion"
+        return "operacion"  # igual que el comportamiento actual (pasivo corriente operativo)
+
+    if tipo_cuenta == "asset":
+        if crk == "BANK_ACCOUNTS" or "banco" in nombre_l or nombre_l.strip() == "caja":
+            return "excluido"  # cuenta de caja/bancos sin código: ya queda fuera de caja_inicial/caja_final, no duplicar
+        if es_cuenta_contra_activo("", cuenta_nombre):
+            return "excluido"  # ya revertido vía dep_amort en operación
+        if crk == "FIXED_ASSET" or any(p in nombre_l for p in _PALABRAS_ACTIVO_NO_CORRIENTE):
+            return "inversion"
+        return "operacion"  # activo corriente: capital de trabajo
+
+    return "excluido"
+
+
+def cobertura_flujo_efectivo_sin_codigo_alegra(
+    idcliente: int, fecha_inicio: str, fecha_fin: str, deltas_clasificados: dict
+):
+    """Para Flujo de Efectivo (Alegra): calcula el DELTA del período (fin
+    menos inicio) de cada cuenta sin código PUC, la clasifica en
+    operación/inversión/financiación/excluido, y aplica un chequeo de
+    plausibilidad por bucket (no por tipo activo/pasivo/patrimonio como
+    hace Balance General) comparando contra `deltas_clasificados` - los
+    totales YA calculados por el caller a partir de las cuentas CON código
+    para ese mismo período, que sirven de escala de referencia de este
+    cliente en este período.
+
+    Devuelve (delta_por_bucket, detalle_por_bucket, excluidos_por_revisar).
+    delta_por_bucket trae solo 'operacion'/'inversion'/'financiacion' (ya
+    con el efecto en caja aplicado, mismo signo que usa el loop principal
+    de construir_flujo_efectivo). detalle_por_bucket también incluye
+    'excluido'. excluidos_por_revisar son montos que se descartaron por
+    implausibles (mismo espíritu que calcular_cobertura_balance_alegra)."""
+    _neto_ini, detalle_ini = _cobertura_balance_sin_codigo(idcliente, fecha_inicio)
+    _neto_fin, detalle_fin = _cobertura_balance_sin_codigo(idcliente, fecha_fin)
+
+    por_cuenta_ini = {(d["cuenta_nombre"], d["tipo_cuenta"]): d["neto"] for d in detalle_ini}
+    por_cuenta_fin = {(d["cuenta_nombre"], d["tipo_cuenta"]): d["neto"] for d in detalle_fin}
+    categoria_por_cuenta = {
+        (d["cuenta_nombre"], d["tipo_cuenta"]): d["category_rule_key"] for d in detalle_ini
+    }
+    categoria_por_cuenta.update({
+        (d["cuenta_nombre"], d["tipo_cuenta"]): d["category_rule_key"] for d in detalle_fin
+    })
+
+    escala_cliente = max(
+        abs(deltas_clasificados.get("operacion", 0.0)),
+        abs(deltas_clasificados.get("inversion", 0.0)),
+        abs(deltas_clasificados.get("financiacion", 0.0)),
+        1.0,
+    )
+
+    delta_por_bucket = {"operacion": 0.0, "inversion": 0.0, "financiacion": 0.0}
+    detalle_por_bucket = {"operacion": [], "inversion": [], "financiacion": [], "excluido": []}
+    excluidos_por_revisar = []
+
+    for clave in (set(por_cuenta_ini) | set(por_cuenta_fin)):
+        nombre, tipo = clave
+        delta = por_cuenta_fin.get(clave, 0.0) - por_cuenta_ini.get(clave, 0.0)
+        if abs(delta) < 1:
+            continue
+
+        crk = categoria_por_cuenta.get(clave)
+        bucket = _clasificar_categoria_flujo_efectivo_alegra(tipo, crk, nombre)
+        efecto_caja = -delta if tipo == "asset" else delta
+        item = {
+            "cuenta": nombre,
+            "nombre": nombre,
+            "tipo_cuenta": tipo,
+            "category_rule_key": crk,
+            "delta": redondear(delta, 2),
+        }
+
+        if bucket == "excluido":
+            detalle_por_bucket["excluido"].append(item)
+            continue
+
+        referencia = max(abs(deltas_clasificados.get(bucket, 0.0)), escala_cliente)
+        if abs(efecto_caja) > UMBRAL_MULTIPLICADOR_COBERTURA_BALANCE * referencia:
+            item["motivo_exclusion"] = "monto_sin_codigo_implausible"
+            excluidos_por_revisar.append(item)
+            continue
+
+        item["efecto_caja"] = redondear(efecto_caja, 2)
+        delta_por_bucket[bucket] += efecto_caja
+        detalle_por_bucket[bucket].append(item)
+
+    return delta_por_bucket, detalle_por_bucket, excluidos_por_revisar
 
 
 # =========================================================
@@ -769,7 +953,7 @@ def _label_categoria_alerta(categoria: str):
         "pasivo_impuesto_retencion_negativo": "Pasivos tributarios/retenciones con saldo negativo",
         "pasivo_negativo_otro": "Pasivos con saldo negativo a revisar",
         "patrimonio_sin_clase_3": "Patrimonio explícito no identificado",
-        "ajuste_cuadratura": "Ajuste automático de cuadratura",
+        "ajuste_cuadratura_residual": "Diferencia sin explicar en el balance",
         "snapshot_comparativo_faltante": "Snapshot comparativo faltante",
     }
     return labels.get(categoria, categoria)
@@ -811,7 +995,7 @@ def _agrupar_alertas(alertas_dict):
         "pasivo_impuesto_retencion_negativo",
         "pasivo_negativo_otro",
         "patrimonio_sin_clase_3",
-        "ajuste_cuadratura",
+        "ajuste_cuadratura_residual",
         "snapshot_comparativo_faltante",
     ]
 
@@ -821,7 +1005,7 @@ def _agrupar_alertas(alertas_dict):
         items = grupos[categoria]
         titulo = _label_categoria_alerta(categoria)
 
-        if categoria in ("patrimonio_sin_clase_3", "ajuste_cuadratura", "snapshot_comparativo_faltante"):
+        if categoria in ("patrimonio_sin_clase_3", "ajuste_cuadratura_residual", "snapshot_comparativo_faltante"):
             principal = items[0].get("mensaje", titulo)
             alertas_resumen.append(principal)
             alertas_grupo.append({
@@ -861,7 +1045,7 @@ def _armar_alertas(
     patrimonio_calculado,
     cuadratura_original,
     patrimonio_explicito_total,
-    ajuste_patrimonio_aplicado_actual
+    ajuste_cuadratura_residual_actual
 ):
     alertas = []
 
@@ -882,11 +1066,26 @@ def _armar_alertas(
             "mensaje": "No se identificaron cuentas explícitas de patrimonio clase 3 en el snapshot; el sistema completó el patrimonio con resultado calculado."
         })
 
-    if abs(ajuste_patrimonio_aplicado_actual) >= 1 and abs(cuadratura_original) >= 1:
+    # OJO: ajuste_patrimonio_aplicado_actual combina el resultado del
+    # ejercicio (utilidad/pérdida, normal y esperado en CUALQUIER cliente
+    # con actividad) con el ajuste_cuadratura_residual_actual (lo que sobra
+    # DESPUÉS de sumar ese resultado - una diferencia real, sin explicar,
+    # entre lo que dicen las cuentas y lo que dice la caja). Antes esta
+    # alerta usaba el combinado, así que disparaba SIEMPRE que hubiera
+    # utilidad/pérdida - es decir, casi siempre - y por eso nunca fue una
+    # señal útil. Debe evaluar el residual solo (caso real Maslux LED,
+    # 2026-09: $52.7M sin explicar, escondidos en silencio en esa línea).
+    if abs(ajuste_cuadratura_residual_actual) >= 1:
         alertas.append({
-            "nivel": "warning",
-            "categoria": "ajuste_cuadratura",
-            "mensaje": "El balance no cuadraba de forma natural con las cuentas clasificadas, por eso se generó un ajuste de patrimonio calculado."
+            "nivel": "danger",
+            "categoria": "ajuste_cuadratura_residual",
+            "mensaje": (
+                f"El balance tiene una diferencia de {redondear(ajuste_cuadratura_residual_actual, 2):,.0f} "
+                "que no se explica ni con las cuentas cargadas ni con el resultado del ejercicio - el sistema "
+                "la muestra como un ajuste de patrimonio para que la ecuación contable cierre, pero es una señal "
+                "de un posible error en los datos de origen. Pídele a tu contador que lo revise directamente en Alegra."
+            ),
+            "monto": redondear(ajuste_cuadratura_residual_actual, 2),
         })
 
     return alertas
@@ -906,14 +1105,20 @@ def _armar_narrativa(
     autonomia_financiera_pct,
     cuadratura_original,
     ajuste_patrimonio_aplicado,
+    ajuste_cuadratura_residual,
     modo_comparativo
 ):
     narrativa = []
 
-    if abs(ajuste_patrimonio_aplicado) < 1:
+    if abs(ajuste_cuadratura_residual) >= 1:
+        narrativa.append(
+            f"El balance tiene una diferencia de {redondear(ajuste_cuadratura_residual, 2):,.0f} sin explicar "
+            "por las cuentas cargadas ni el resultado del ejercicio - revisa la alerta correspondiente."
+        )
+    elif abs(ajuste_patrimonio_aplicado) < 1:
         narrativa.append("El balance cuadra correctamente al combinar activos, pasivos, patrimonio reportado y resultado acumulado calculado.")
     else:
-        narrativa.append("El balance requirió un ajuste residual de patrimonio calculado para cerrar la ecuación contable.")
+        narrativa.append("El balance cuadra al sumar el resultado (utilidad o pérdida) del ejercicio al patrimonio.")
     
     if patrimonio_total > 0:
         narrativa.append("La empresa presenta una posición patrimonial positiva.")
@@ -1092,7 +1297,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
     if abs(cuadratura_post_resultado) >= 1:
         item_ajuste = _crear_item_sintetico(
             cuenta="39AJUSTE",
-            nombre="Ajuste residual de patrimonio para cuadratura",
+            nombre="Diferencia sin explicar (revisar con tu contador)",
             seccion="PATRIMONIO",
             grupo_balance="PATRIMONIO",
             saldo_actual=cuadratura_post_resultado,
@@ -1163,6 +1368,7 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         autonomia_financiera_pct=autonomia_financiera_pct,
         cuadratura_original=cuadratura_original,
         ajuste_patrimonio_aplicado=ajuste_patrimonio_aplicado_actual,
+        ajuste_cuadratura_residual=ajuste_cuadratura_residual_actual,
         modo_comparativo=modo_comparativo and snapshot_comparativo_existe
     )
 
@@ -1219,7 +1425,9 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             "utilidad_calculada_actual": redondear(utilidad_actual, 2),
             "utilidad_calculada_anterior": redondear(utilidad_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None,
             "ajuste_patrimonio_aplicado_actual": redondear(ajuste_patrimonio_aplicado_actual, 2),
-            "ajuste_patrimonio_aplicado_anterior": redondear(ajuste_patrimonio_aplicado_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None
+            "ajuste_patrimonio_aplicado_anterior": redondear(ajuste_patrimonio_aplicado_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None,
+            "ajuste_cuadratura_residual_actual": redondear(ajuste_cuadratura_residual_actual, 2),
+            "ajuste_cuadratura_residual_anterior": redondear(ajuste_cuadratura_residual_anterior, 2) if modo_comparativo and snapshot_comparativo_existe else None
         },
         "resumen": {
             "narrativa": narrativa,

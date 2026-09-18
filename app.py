@@ -96,6 +96,7 @@ from balance import (
     ultimo_dia_del_mes,
     safe_float,
     redondear,
+    cobertura_flujo_efectivo_sin_codigo_alegra,
 )
 
 from siigo.siigo_sync_documentos_soporte_staging import sync_documentos_soporte_staging_desde_siigo
@@ -1980,18 +1981,30 @@ def _armar_narrativa_flujo_efectivo(
 
 
 def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
-    """Estado de Flujo de Efectivo, método indirecto. SOLO SIIGO por ahora -
-    Alegra queda para una fase futura (tiene sus propios problemas de
-    completitud de datos, ver calcular_cobertura_alegra /
-    calcular_cobertura_balance_alegra en balance.py).
+    """Estado de Flujo de Efectivo, método indirecto. Soporta Siigo y Alegra
+    (Fase 4, 2026-09), cada uno con su propio ancla de saldo inicial:
 
-    Exige snapshot origen='BALANCE_PRUEBA' en AMBAS fechas de corte: el
-    camino general de Siigo (regenerar_snapshot_saldos_corte sin Balance de
-    Prueba) no tiene ancla de saldo inicial - construir el flujo sobre eso
-    daría un número que se ve razonable pero puede estar mal sin que se
+    Siigo: exige snapshot origen='BALANCE_PRUEBA' en AMBAS fechas de corte -
+    el camino general de Siigo (regenerar_snapshot_saldos_corte sin Balance
+    de Prueba) no tiene ancla de saldo inicial - construir el flujo sobre
+    eso daría un número que se ve razonable pero puede estar mal sin que se
     note (piloto real con Binaria Media Group, 2026-09: validado a 0.063%
     de diferencia, pero SOLO cuando ambas fechas usan Balance de Prueba
     real y reconciliado - ver memoria project_insightflow_flujo_efectivo).
+
+    Alegra: exige AlegraSaldoInicial.fecha_corte_inicial <= fecha para AMBAS
+    fechas de corte (el origen persistido en AuxiliarSaldosCorte siempre es
+    'AUXILIAR' para Alegra, así que no se puede distinguir confiable/no vía
+    origen como con Siigo) - y fuerza regenerar_snapshot_saldos_corte para
+    ambas fechas en cada consulta (no confía en un snapshot ya persistido,
+    que puede estar desactualizado). Además, las cuentas Alegra sin código
+    PUC se clasifican aparte vía cobertura_flujo_efectivo_sin_codigo_alegra
+    (balance.py), usando category_rule_key de Alegra + nombre de cuenta -
+    investigación real con Maslux LED (idcliente=16, 2026-09) confirmó que
+    agrupar todo lo sin código en un solo cajón por tipo (como hace Balance
+    General) mete plata de Propiedad Planta y Equipo en operación en vez de
+    inversión, y no distingue ajustes de carga de saldo inicial (que no son
+    flujo real) de un aporte de capital real.
 
     Reglas de clasificación aprendidas del piloto real (no de teoría):
     - Cuentas contra-activo (depreciación/amortización acumulada,
@@ -2012,29 +2025,68 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
     fecha_inicio = ultimo_dia_del_mes(fecha_inicio)
     fecha_fin = ultimo_dia_del_mes(fecha_fin)
 
-    if _proveedor_datos_cliente(idcliente) != "siigo":
+    proveedor = _proveedor_datos_cliente(idcliente)
+
+    if proveedor == "siigo":
+        snap_inicio = AuxiliarSaldosCorte.query.filter_by(
+            idcliente=idcliente, fecha_corte=fecha_inicio, origen="BALANCE_PRUEBA"
+        ).all()
+        snap_fin = AuxiliarSaldosCorte.query.filter_by(
+            idcliente=idcliente, fecha_corte=fecha_fin, origen="BALANCE_PRUEBA"
+        ).all()
+
+        if not snap_inicio or not snap_fin:
+            faltantes = [f for f, snap in ((fecha_inicio, snap_inicio), (fecha_fin, snap_fin)) if not snap]
+            return {
+                "ok": False,
+                "error": (
+                    "Este reporte necesita el Balance de Prueba real de Siigo cargado y "
+                    "aplicado (no el auxiliar acumulado) para ambas fechas de corte, porque "
+                    "solo así el saldo inicial es confiable. Falta para: " + ", ".join(faltantes)
+                ),
+                "fechas_faltantes": faltantes,
+            }
+    elif proveedor == "alegra":
+        # Para Alegra el ancla de saldo inicial confiable es AlegraSaldoInicial
+        # (no existe equivalente a "Balance de Prueba" de Siigo) - el origen
+        # persistido siempre es 'AUXILIAR' así que no se puede distinguir
+        # confiable/no-confiable por origen como con Siigo; hay que revisar
+        # el ancla directamente. Además hay que forzar la regeneración del
+        # snapshot (no confiar en uno ya persistido, que puede estar
+        # desactualizado) - ver regenerar_snapshot_saldos_corte en balance.py.
+        from models_alegra import AlegraSaldoInicial
+
+        fechas_sin_ancla = [
+            f for f in (fecha_inicio, fecha_fin)
+            if not db.session.query(AlegraSaldoInicial.id).filter(
+                AlegraSaldoInicial.idcliente == idcliente,
+                AlegraSaldoInicial.fecha_corte_inicial <= f,
+            ).first()
+        ]
+        if fechas_sin_ancla:
+            return {
+                "ok": False,
+                "error": (
+                    "Este reporte necesita el saldo inicial de Alegra cargado para una "
+                    "fecha anterior o igual a ambas fechas de corte, porque solo así el "
+                    "saldo inicial es confiable. Falta ancla para: " + ", ".join(fechas_sin_ancla)
+                ),
+                "fechas_faltantes": fechas_sin_ancla,
+            }
+
+        regenerar_snapshot_saldos_corte(idcliente, fecha_inicio)
+        regenerar_snapshot_saldos_corte(idcliente, fecha_fin)
+
+        snap_inicio = AuxiliarSaldosCorte.query.filter_by(
+            idcliente=idcliente, fecha_corte=fecha_inicio, origen="AUXILIAR"
+        ).all()
+        snap_fin = AuxiliarSaldosCorte.query.filter_by(
+            idcliente=idcliente, fecha_corte=fecha_fin, origen="AUXILIAR"
+        ).all()
+    else:
         return {
             "ok": False,
-            "error": "El Estado de Flujo de Efectivo todavía solo está disponible para clientes Siigo."
-        }
-
-    snap_inicio = AuxiliarSaldosCorte.query.filter_by(
-        idcliente=idcliente, fecha_corte=fecha_inicio, origen="BALANCE_PRUEBA"
-    ).all()
-    snap_fin = AuxiliarSaldosCorte.query.filter_by(
-        idcliente=idcliente, fecha_corte=fecha_fin, origen="BALANCE_PRUEBA"
-    ).all()
-
-    if not snap_inicio or not snap_fin:
-        faltantes = [f for f, snap in ((fecha_inicio, snap_inicio), (fecha_fin, snap_fin)) if not snap]
-        return {
-            "ok": False,
-            "error": (
-                "Este reporte necesita el Balance de Prueba real de Siigo cargado y "
-                "aplicado (no el auxiliar acumulado) para ambas fechas de corte, porque "
-                "solo así el saldo inicial es confiable. Falta para: " + ", ".join(faltantes)
-            ),
-            "fechas_faltantes": faltantes,
+            "error": "El Estado de Flujo de Efectivo todavía no está disponible para este proveedor de datos."
         }
 
     fecha_pyg_desde = (datetime.strptime(fecha_inicio, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -2120,6 +2172,28 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
                 detalle_operacion.append(item)
             continue
 
+    sin_codigo_excluidos_por_revisar = []
+    if proveedor == "alegra":
+        # Cuentas Alegra sin código PUC (ver cobertura_flujo_efectivo_sin_codigo_alegra
+        # en balance.py) - se clasifican aparte porque no tienen cuenta_codigo
+        # para pasar por el loop de arriba, usando category_rule_key + nombre
+        # en vez de grupo/cuenta_padre.
+        deltas_clasificados = {
+            "operacion": operacion_delta,
+            "inversion": inversion_delta,
+            "financiacion": financiacion_delta,
+        }
+        delta_sin_codigo, detalle_sin_codigo, sin_codigo_excluidos_por_revisar = (
+            cobertura_flujo_efectivo_sin_codigo_alegra(idcliente, fecha_inicio, fecha_fin, deltas_clasificados)
+        )
+        operacion_delta += delta_sin_codigo["operacion"]
+        inversion_delta += delta_sin_codigo["inversion"]
+        financiacion_delta += delta_sin_codigo["financiacion"]
+        detalle_operacion.extend(detalle_sin_codigo["operacion"])
+        detalle_inversion.extend(detalle_sin_codigo["inversion"])
+        detalle_financiacion.extend(detalle_sin_codigo["financiacion"])
+        detalle_excluido.extend(detalle_sin_codigo["excluido"])
+
     flujo_operacion = redondear(utilidad_neta + dep_amort + operacion_delta, 2)
     flujo_inversion = redondear(inversion_delta, 2)
     flujo_financiacion = redondear(financiacion_delta, 2)
@@ -2159,6 +2233,9 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
             "inversion": sorted(detalle_inversion, key=lambda x: -abs(x["delta"])),
             "financiacion": sorted(detalle_financiacion, key=lambda x: -abs(x["delta"])),
             "excluido_patrimonio": sorted(detalle_excluido, key=lambda x: -abs(x["delta"])),
+            "sin_codigo_excluido_por_revisar": sorted(
+                sin_codigo_excluidos_por_revisar, key=lambda x: -abs(x["delta"])
+            ),
         },
         "resumen": {
             "narrativa": narrativa,
@@ -20691,19 +20768,181 @@ def create_app():
                     return 0.0
                 return float(val)
 
+            # El export "Estado de situación financiera" trae, mezcladas, tanto
+            # cuentas reales (use='movement' en el catálogo de Alegra, postable
+            # y con saldo propio) como cuentas "accumulative" (subtotales de
+            # grupo que Alegra calcula sumando sus hijas, ej. "11 Bancos" =
+            # suma de "1105 Caja" + cuentas bancarias individuales) - ambas
+            # traen "Código" así que el filtro de "sin código" no las separa.
+            # Si se suman ambas, cada cuenta accumulative duplica el saldo de
+            # sus hijas (confirmado con datos reales de NGC/Maslux, 2026-09:
+            # esto rompía la cuadratura del Balance General y del Flujo de
+            # Efectivo). "use" es la fuente principal para distinguir una cosa
+            # de la otra, pero NO es 100% confiable: en Maslux "24 Impuestos
+            # por pagar" y "2505 Obligaciones laborales" están marcadas
+            # 'movement' igual que sus hijas "240805"/"237021", pero nunca
+            # reciben un solo movimiento propio en el Libro Diario real y
+            # duplican EXACTO el valor de esa hija - por eso se agrega un
+            # segundo chequeo por comportamiento real (auxiliar_contable) más
+            # abajo, no solo por metadata de Alegra.
+            from models import AuxiliarContable
+            from models_alegra import AlegraCuentaContable
+            uso_por_codigo = {
+                c.code: c.use for c in AlegraCuentaContable.query.filter_by(idcliente=idcliente).all()
+                if c.code
+            }
+            codigos_con_movimiento_real = {
+                r[0] for r in db.session.query(AuxiliarContable.cuenta_codigo)
+                .filter_by(idcliente=idcliente).distinct().all()
+            }
+
+            # Reusa exactamente las mismas listas de palabras que
+            # cobertura_flujo_efectivo_sin_codigo_alegra (balance.py) usa para
+            # cuentas sin código del Libro Diario, para que una cuenta sin
+            # código en el saldo inicial (ej. Maslux: "Capital social",
+            # "Ganancias acumuladas", "Inventarios" - nunca tuvieron código
+            # PUC en Alegra) se clasifique con el mismo criterio en vez de
+            # uno inventado aparte.
+            from balance import (
+                _PALABRAS_FINANCIACION_PATRIMONIO,
+                _PALABRAS_EXCLUIDO_PATRIMONIO,
+                _PALABRAS_ACTIVO_NO_CORRIENTE,
+                _PALABRAS_FINANCIACION_PASIVO,
+            )
+
+            filas_ordenadas = df.reset_index(drop=True)
+            n_filas = len(filas_ordenadas)
+
+            def _indent(nombre_raw):
+                return len(nombre_raw) - len(nombre_raw.lstrip(" "))
+
+            candidatos_codificados = []  # [(codigo, nombre, valor, indent, posicion)]
+            candidatos_sin_codigo = []  # [(seccion, nombre, valor)]
+            seccion_actual = None
+
+            for i in range(n_filas):
+                nombre_raw = filas_ordenadas.at[i, "Cuenta contable"]
+                if nombre_raw is None or pd.isna(nombre_raw):
+                    continue
+                nombre_raw = str(nombre_raw)
+                nombre = nombre_raw.strip()
+                indent = _indent(nombre_raw)
+                codigo = clean_codigo(filas_ordenadas.at[i, "Código"])
+                valor = clean_num(filas_ordenadas.at[i, columna_saldo])
+
+                if indent == 0 and nombre.upper() in ("ACTIVOS", "PASIVOS", "PATRIMONIO"):
+                    seccion_actual = nombre.upper()
+                    continue
+
+                if codigo:
+                    candidatos_codificados.append((codigo, nombre, valor, indent, i))
+                    continue
+
+                if seccion_actual not in ("ACTIVOS", "PASIVOS", "PATRIMONIO") or nombre.lower().startswith("total"):
+                    continue
+
+                es_hoja = (i + 1 >= n_filas)
+                if not es_hoja:
+                    siguiente_raw = filas_ordenadas.at[i + 1, "Cuenta contable"]
+                    if siguiente_raw is not None and not pd.isna(siguiente_raw):
+                        es_hoja = _indent(str(siguiente_raw)) <= indent
+                    else:
+                        es_hoja = True
+                if es_hoja and abs(valor) >= 1:
+                    candidatos_sin_codigo.append((seccion_actual, nombre, valor))
+
+            # Segundo chequeo de duplicado: una fila codificada que NUNCA
+            # recibió un movimiento propio en el Libro Diario real es, casi
+            # siempre, un subtotal de grupo que Alegra decidió (por la razón
+            # que sea) no marcar 'accumulative' en su catálogo - "use" no es
+            # 100% confiable (ver comentario de más arriba). Se resuelve de
+            # abajo hacia arriba por indentación del export: si la SUMA de lo
+            # que ya se va a incluir en su subárbol (sus filas más indentadas
+            # inmediatas, código o no) coincide exacto con su propio valor,
+            # es un duplicado puro y se descarta - sus hijas ya representan
+            # esa misma plata. Caso real Maslux: "1355" (sin movimiento
+            # propio) = "135580" (sin movimiento propio) + "135520" (con
+            # movimiento) - ninguna comparación 1 a 1 lo detecta, pero la
+            # suma del subárbol sí. Si NO coincide la suma (ej. "2408"/
+            # "240801" de NGC, que sí tienen movimiento propio y por eso ni
+            # siquiera se evalúan aquí), se conserva tal cual - más vale un
+            # residual sin explicar que perder plata real.
+            candidatos_por_posicion = {pos: (codigo, nombre, valor, indent) for codigo, nombre, valor, indent, pos in candidatos_codificados}
+            descartados_por_subarbol = set()
+
+            for codigo, nombre, valor, indent, posicion in sorted(candidatos_codificados, key=lambda x: -x[4]):
+                if codigo in codigos_con_movimiento_real:
+                    continue
+                if uso_por_codigo.get(codigo) == "accumulative":
+                    continue
+                j = posicion + 1
+                suma_subarbol = 0.0
+                tiene_hijos = False
+                while j < n_filas:
+                    nombre_j = filas_ordenadas.at[j, "Cuenta contable"]
+                    if nombre_j is None or pd.isna(nombre_j):
+                        j += 1
+                        continue
+                    if _indent(str(nombre_j)) <= indent:
+                        break
+                    if j in candidatos_por_posicion and j not in descartados_por_subarbol:
+                        codigo_hijo = candidatos_por_posicion[j][0]
+                        if uso_por_codigo.get(codigo_hijo) != "accumulative":
+                            suma_subarbol += candidatos_por_posicion[j][2]
+                            tiene_hijos = True
+                    j += 1
+                if tiene_hijos and abs(suma_subarbol - valor) < 1:
+                    descartados_por_subarbol.add(posicion)
+
+            omitidas_sin_movimiento_real = 0
             lista_mapeada = []
-            for _, row in df.iterrows():
-                codigo = clean_codigo(row.get("Código"))
-                if not codigo:
+            for codigo, nombre, valor, indent, posicion in candidatos_codificados:
+                if uso_por_codigo.get(codigo) == "accumulative" or posicion in descartados_por_subarbol:
+                    if posicion in descartados_por_subarbol:
+                        omitidas_sin_movimiento_real += 1
                     continue
                 lista_mapeada.append({
                     "idcliente": idcliente,
                     "fecha_corte_inicial": fecha_corte_inicial,
                     "cuenta_codigo": codigo,
-                    "cuenta_nombre": str(row.get("Cuenta contable") or "").strip(),
-                    "saldo": clean_num(row.get(columna_saldo)),
+                    "cuenta_nombre": nombre,
+                    "saldo": valor,
                     "archivo_origen": file.filename,
                 })
+
+            # Código sintético "<grupo>SC####" (mismo espíritu que
+            # _MAPA_SINTETICO_COBERTURA de balance.py, con prefijo "SC" propio
+            # para no colisionar con esos códigos - son mecanismos distintos,
+            # uno para saldo inicial y otro para cobertura del Libro Diario)
+            # para que clasificar_cuenta() lo resuelva en el grupo_balance
+            # correcto. Dentro de ACTIVOS y PASIVOS el grupo por defecto es
+            # corriente (14/23) salvo que el nombre sugiera lo contrario.
+            filas_sin_codigo_capturadas = 0
+            for idx, (seccion, nombre, valor) in enumerate(candidatos_sin_codigo, start=1):
+                nombre_l = nombre.lower()
+                if seccion == "PATRIMONIO":
+                    if any(p in nombre_l for p in _PALABRAS_EXCLUIDO_PATRIMONIO):
+                        prefijo_sintetico = "39"  # excluido (ej. resultados/ganancias acumuladas)
+                    elif any(p in nombre_l for p in _PALABRAS_FINANCIACION_PATRIMONIO):
+                        prefijo_sintetico = "31"  # financiación real (ej. capital/aportes/reserva)
+                    else:
+                        prefijo_sintetico = "39"  # sin certeza: mismo criterio conservador que balance.py
+                elif seccion == "PASIVOS":
+                    if any(p in nombre_l for p in _PALABRAS_FINANCIACION_PASIVO):
+                        prefijo_sintetico = "21"  # obligación financiera / préstamo / socios
+                    else:
+                        prefijo_sintetico = "23"  # pasivo corriente operativo (default)
+                else:  # ACTIVOS
+                    prefijo_sintetico = "19" if any(p in nombre_l for p in _PALABRAS_ACTIVO_NO_CORRIENTE) else "14"
+                lista_mapeada.append({
+                    "idcliente": idcliente,
+                    "fecha_corte_inicial": fecha_corte_inicial,
+                    "cuenta_codigo": f"{prefijo_sintetico}SC{idx:04d}",
+                    "cuenta_nombre": nombre,
+                    "saldo": valor,
+                    "archivo_origen": file.filename,
+                })
+                filas_sin_codigo_capturadas += 1
 
             AlegraSaldoInicial.query.filter_by(
                 idcliente=idcliente, fecha_corte_inicial=fecha_corte_inicial
@@ -20717,6 +20956,11 @@ def create_app():
                 "fecha_corte_inicial": fecha_corte_inicial.isoformat(),
                 "columna_usada": columna_saldo,
                 "cuentas_cargadas": len(lista_mapeada),
+                "cuentas_omitidas_accumulative": sum(
+                    1 for c, _n, _v, _i, _p in candidatos_codificados if uso_por_codigo.get(c) == "accumulative"
+                ),
+                "cuentas_omitidas_sin_movimiento_real": omitidas_sin_movimiento_real,
+                "filas_sin_codigo_capturadas": filas_sin_codigo_capturadas,
             }), 200
         except Exception as e:
             db.session.rollback()
@@ -21152,14 +21396,41 @@ def create_app():
     @app.route("/reportes/flujo_efectivo_v1/fechas_disponibles", methods=["GET"])
     @jwt_required()
     def get_flujo_efectivo_fechas_disponibles():
-        """Fechas de corte que sí tienen Balance de Prueba real (origen
-        BALANCE_PRUEBA) cargado - las únicas con las que el Flujo de
-        Efectivo puede calcularse de forma confiable (ver
-        construir_flujo_efectivo). El frontend usa esto para que el
-        usuario solo pueda elegir combinaciones que van a funcionar, en
-        vez de "elige y falla" con un date picker libre."""
+        """Fechas de corte con las que el Flujo de Efectivo puede calcularse
+        de forma confiable (ver construir_flujo_efectivo) - el frontend usa
+        esto para que el usuario solo pueda elegir combinaciones que van a
+        funcionar, en vez de "elige y falla" con un date picker libre.
+
+        Siigo: solo fechas con Balance de Prueba real (origen
+        BALANCE_PRUEBA) cargado - es la única fuente con ancla de saldo
+        inicial confiable para Siigo.
+
+        Alegra: fin de mes de cada período con movimiento en
+        auxiliar_contable, a partir del mes del saldo inicial cargado más
+        antiguo (AlegraSaldoInicial) - antes de esa fecha no hay ancla
+        confiable (ver regenerar_snapshot_saldos_corte)."""
         idcliente = get_jwt().get("idcliente")
         try:
+            if _proveedor_datos_cliente(idcliente) == "alegra":
+                from models import AuxiliarContable
+                from models_alegra import AlegraSaldoInicial
+                ancla_min = db.session.query(
+                    func.min(AlegraSaldoInicial.fecha_corte_inicial)
+                ).filter(AlegraSaldoInicial.idcliente == idcliente).scalar()
+                if not ancla_min:
+                    return jsonify({"fechas": []}), 200
+
+                periodos = db.session.query(
+                    AuxiliarContable.periodo_anio, AuxiliarContable.periodo_mes
+                ).filter_by(idcliente=idcliente).distinct().all()
+
+                fechas = sorted({
+                    ultimo_dia_del_mes(f"{anio:04d}-{mes:02d}-01")
+                    for anio, mes in periodos if anio and mes
+                })
+                fechas = [f for f in fechas if f >= ancla_min.isoformat()]
+                return jsonify({"fechas": fechas}), 200
+
             filas = db.session.query(AuxiliarSaldosCorte.fecha_corte).filter_by(
                 idcliente=idcliente, origen="BALANCE_PRUEBA"
             ).distinct().order_by(AuxiliarSaldosCorte.fecha_corte).all()
