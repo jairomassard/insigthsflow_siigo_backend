@@ -55,7 +55,7 @@ COLOR_EBITDA = "#4f46e5"
 from models import db, AnalisisIAUso, AnalisisIACache
 
 
-MODELO_ANALISIS = "claude-opus-5"
+MODELO_ANALISIS = "claude-opus-5-5"
 TOPE_MENSUAL = 15
 
 # Referencial, solo para guardar un estimado de costo en COP junto al
@@ -64,7 +64,7 @@ TOPE_MENSUAL = 15
 TRM_COP_POR_USD = 3063
 
 PRECIO_POR_MILLON_USD = {
-    "claude-opus-5": {"input": 5.00, "output": 25.00},
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00},
 }
 
 PROMPT_SISTEMA = (
@@ -72,7 +72,16 @@ PROMPT_SISTEMA = (
     "PyME colombiana a entender su Estado de Resultados (PyG). Vas a "
     "recibir datos ya calculados: KPIs del periodo, evolución mes a mes, "
     "y composición por cuenta contable - no inventes cifras que no estén "
-    "ahí. Responde siempre en español, en formato markdown, con esta "
+    "ahí. Además de leer cada cuenta por separado, buscá activamente "
+    "cruces indirectos entre cuentas de la misma composición: si una "
+    "cuenta permite inferir un monto implícito (por ejemplo, aplicando "
+    "una tasa o proporción conocida, como un impuesto que implica un "
+    "consumo total mucho mayor al que aparece registrado en la cuenta de "
+    "gasto relacionada), y ese monto no cuadra con lo que efectivamente "
+    "está registrado en otra cuenta, señalalo como hallazgo explícito - "
+    "ahí suele esconderse gasto mal clasificado o no reportado, y es de "
+    "los cruces con más impacto para el dueño. Responde siempre en "
+    "español, en formato markdown, con esta "
     "estructura fija y sin exceder ~2500-3000 palabras en total (podés "
     "usar tablas markdown donde ayuden a mostrar un desglose, ej. la "
     "cascada del PyG o una comparación mes a mes - las tablas no cuentan "
@@ -105,7 +114,13 @@ PROMPT_SISTEMA_BALANCE = (
     "activo no corriente, pasivo corriente, pasivo no corriente y "
     "patrimonio) con su saldo actual y, si el usuario pidió comparación, "
     "el saldo del corte anterior y su variación. No inventes cifras que no "
-    "estén ahí. Responde siempre en español, en formato markdown, con esta "
+    "estén ahí. Además de leer cada cuenta por separado, buscá activamente "
+    "cruces indirectos entre cuentas: si una cuenta permite inferir un "
+    "monto implícito que no cuadra con lo registrado en otra cuenta "
+    "relacionada, o si la relación entre dos grupos no tiene sentido "
+    "económico, señalalo como hallazgo explícito - ahí suele esconderse "
+    "algo mal clasificado o no reportado. Responde siempre en español, en "
+    "formato markdown, con esta "
     "estructura fija y sin exceder ~2500-3000 palabras en total (podés "
     "usar tablas markdown donde ayuden a mostrar un desglose):\n\n"
     "## Resumen ejecutivo\n"
@@ -165,7 +180,12 @@ PROMPT_SISTEMA_INDICADORES = (
     "que combinan ambos (ROE, ROA, prueba ácida, días de cobro/pago "
     "reales usando cartera y cuentas por pagar reales, cobertura de "
     "intereses). Vas a recibir todo eso ya calculado en JSON - no "
-    "inventes cifras que no estén ahí.\n\n"
+    "inventes cifras que no estén ahí. Además de leer cada indicador por "
+    "separado, buscá activamente cruces indirectos: si un indicador o una "
+    "cuenta permite inferir un monto implícito que no cuadra con lo "
+    "registrado en otra parte de los datos, señalalo como hallazgo "
+    "explícito - ahí suele esconderse algo mal clasificado o no "
+    "reportado.\n\n"
     "MUY IMPORTANTE sobre los parámetros de la empresa: revisá el campo "
     "parametros_configurados.\n"
     "- Si es false (modo informativo): la empresa NO ha definido metas "
@@ -237,7 +257,12 @@ PROMPT_SISTEMA_FLUJO_EFECTIVO = (
     "el detalle de cuentas dentro de cada flujo, y las cuentas de "
     "patrimonio que el sistema excluyó de financiación por ser "
     "probablemente apropiación de utilidad ya contada (no un aporte o "
-    "retiro real). No inventes cifras que no estén ahí.\n\n"
+    "retiro real). No inventes cifras que no estén ahí. Además de leer "
+    "cada cuenta por separado, buscá activamente cruces indirectos entre "
+    "cuentas: si una cuenta permite inferir un monto implícito que no "
+    "cuadra con lo registrado en otra cuenta relacionada, señalalo como "
+    "hallazgo explícito - ahí suele esconderse algo mal clasificado o no "
+    "reportado.\n\n"
     "El objetivo central de este reporte es responder la pregunta que más "
     "confunde a un dueño de negocio: '¿por qué mi utilidad no se parece a "
     "la plata que tengo en el banco?' - tu análisis tiene que resolver "
@@ -946,6 +971,12 @@ PROMPT_SISTEMA_DIAGNOSTICO_INTEGRAL = (
     "financiera del Balance/Indicadores si aplica.\n"
     "- Si Indicadores muestra ROE alto, revisá si el Balance explica que "
     "es apalancamiento y no eficiencia real (ROA bajo o activo mínimo).\n"
+    "- Esto también aplica DENTRO de una misma fuente, no solo entre "
+    "reportes: si una cuenta del PyG o del Balance permite inferir un "
+    "monto implícito (por ejemplo, un impuesto que implica un consumo "
+    "total mucho mayor al que aparece en la cuenta de gasto relacionada) "
+    "y ese monto no cuadra con lo registrado en otra cuenta, señalalo "
+    "igual - ahí suele esconderse gasto mal clasificado.\n"
     "- Si la autonomía de caja (runway) del panel operativo es corta, "
     "cruzala con el ciclo de cobro/pago (DSO/DPO de Indicadores) y con la "
     "cartera o cuentas por pagar más antiguas para explicar POR QUÉ es "
