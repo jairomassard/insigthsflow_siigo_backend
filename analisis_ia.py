@@ -1456,8 +1456,92 @@ def generar_grafico_evolucion(evolucion: list) -> BytesIO | None:
     return buffer
 
 
+def generar_grafico_cascada_flujo(kpis: dict) -> BytesIO | None:
+    """Cascada "de la caja inicial a la caja final" para el Word del
+    análisis de Flujo de Efectivo - mismo gráfico y mismos pasos que
+    pasosCascadaAnalisis() en frontend/.../flujo-efectivo/page.tsx (abre el
+    flujo de operación en utilidad + depreciación + capital de trabajo,
+    que es donde se ve por qué la utilidad no se parece a la caja). Se
+    dibuja con los KPIs de construir_flujo_efectivo(), no le cuesta nada a
+    la IA."""
+    if not kpis:
+        return None
+
+    def num(clave):
+        return float(kpis.get(clave) or 0)
+
+    caja_inicial = num("caja_inicial")
+    caja_final = num("caja_final")
+    sin_explicar = num("delta_caja_real") - num("total_flujos_calculado")
+
+    pasos = [("Utilidad neta", num("utilidad_neta"))]
+    if abs(num("dep_amort")) >= 1:
+        pasos.append(("Depreciación", num("dep_amort")))
+    pasos += [
+        ("Capital de trabajo", num("variacion_capital_trabajo")),
+        ("Inversión", num("flujo_inversion")),
+        ("Financiación", num("flujo_financiacion")),
+    ]
+    if abs(sin_explicar) >= 1:
+        pasos.append(("Sin explicar", sin_explicar))
+
+    color_total, color_entra, color_sale = "#475569", COLOR_INGRESOS, COLOR_COSTOS_GASTOS
+
+    # (etiqueta, base, alto, color, valor mostrado, es_total)
+    barras = [("Caja inicial", min(caja_inicial, 0), abs(caja_inicial), color_total, caja_inicial, True)]
+    acumulado = caja_inicial
+    for etiqueta, delta in pasos:
+        antes, despues = acumulado, acumulado + delta
+        acumulado = despues
+        barras.append((etiqueta, min(antes, despues), abs(delta), color_entra if delta >= 0 else color_sale, delta, False))
+    barras.append(("Caja final", min(caja_final, 0), abs(caja_final), color_total, caja_final, True))
+
+    tope = max(b[1] + b[2] for b in barras)
+    piso = min(min(b[1] for b in barras), 0)
+    rango = (tope - piso) or 1
+
+    fig, ax = plt.subplots(figsize=(9.6, 3.4), dpi=160)
+    caja_etiqueta = dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.88)
+
+    for i, (_etiqueta, base, alto, color, valor, es_total) in enumerate(barras):
+        ax.bar(i, alto, bottom=base, width=0.58, color=color)
+        signo = "+" if (valor > 0 and not es_total) else ""
+        ax.text(
+            i, base + alto + rango * 0.03, f"{signo}{_abreviar_valor_chart(valor)}",
+            ha="center", va="bottom", fontsize=7.5, fontweight="bold", color="#334155", bbox=caja_etiqueta,
+        )
+
+    ax.axhline(0, color="#cbd5e1", linewidth=0.8)
+    ax.set_ylim(bottom=piso - rango * 0.04, top=tope + rango * 0.2)
+    ax.set_xlim(-0.6, len(barras) - 0.4)
+    ax.set_xticks(range(len(barras)))
+    ax.set_xticklabels([b[0] for b in barras], fontsize=8, fontweight="bold")
+    ax.get_yaxis().set_visible(False)
+    for spine in ("top", "right", "left", "bottom"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(axis="x", length=0)
+
+    from matplotlib.patches import Patch
+    ax.legend(
+        handles=[
+            Patch(color=color_total, label="Saldo de caja"),
+            Patch(color=color_entra, label="Entra caja"),
+            Patch(color=color_sale, label="Sale caja"),
+        ],
+        loc="upper center", bbox_to_anchor=(0.5, 1.2), ncol=3, frameon=False, fontsize=8,
+    )
+
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
 def generar_word_analisis(
-    markdown: str, nombre_cliente: str, periodo: str, evolucion: list | None = None
+    markdown: str, nombre_cliente: str, periodo: str, evolucion: list | None = None,
+    grafico_inicial: BytesIO | None = None,
 ) -> BytesIO:
     doc = DocxDocument()
 
@@ -1486,7 +1570,9 @@ def generar_word_analisis(
     footer_run.font.size = Pt(8)
     footer_run.font.color.rgb = RGBColor(0x9C, 0xA3, 0xAF)
 
-    grafico = generar_grafico_evolucion(evolucion) if evolucion else None
+    # grafico_inicial: PNG ya generado por quien llama (ej. la cascada del
+    # Flujo de Efectivo) - tiene prioridad sobre el de tendencia del PyG.
+    grafico = grafico_inicial or (generar_grafico_evolucion(evolucion) if evolucion else None)
     if grafico:
         doc.add_picture(grafico, width=Inches(6.2))
         doc.add_paragraph("")

@@ -32,6 +32,7 @@ from analisis_ia import (
     generar_analisis_transversal,
     generar_analisis_flujo_efectivo,
     generar_word_analisis,
+    generar_grafico_cascada_flujo,
     consultar_uso_mensual,
     listar_historial_analisis,
     TOPE_MENSUAL,
@@ -21523,16 +21524,34 @@ def create_app():
     @app.route("/reportes/flujo_efectivo_v1/analisis-ia/word", methods=["POST"])
     @jwt_required()
     def post_flujo_efectivo_analisis_ia_word():
+        idcliente = get_jwt().get("idcliente")
         data = request.get_json(silent=True) or {}
         analisis_markdown = data.get("analisis_markdown")
         nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
         periodo = data.get("periodo") or ""
+        fecha_inicio = data.get("fecha_inicio")
+        fecha_fin = data.get("fecha_fin")
 
         if not analisis_markdown:
             return jsonify({"error": "Debes enviar analisis_markdown"}), 400
 
         try:
-            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            # Misma cascada "caja inicial -> caja final" que se ve en la
+            # ventana del análisis - se recalcula con construir_flujo_efectivo
+            # (consulta a la BD, sin costo de IA). Si no vienen fechas o
+            # falla el cálculo, el Word sale igual pero sin gráfico.
+            grafico = None
+            if fecha_inicio and fecha_fin:
+                try:
+                    flujo_data = construir_flujo_efectivo(idcliente, fecha_inicio, fecha_fin)
+                    if flujo_data.get("ok"):
+                        grafico = generar_grafico_cascada_flujo(flujo_data.get("kpis"))
+                except Exception:
+                    grafico = None
+
+            buffer = generar_word_analisis(
+                analisis_markdown, nombre_cliente, periodo, evolucion=None, grafico_inicial=grafico
+            )
             nombre_archivo = f"analisis_ia_FlujoEfectivo_{nombre_cliente.replace(' ', '_')}.docx"
             return send_file(
                 buffer,
