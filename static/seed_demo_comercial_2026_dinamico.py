@@ -14,12 +14,27 @@ COMPORTAMIENTO AUTOMÁTICO:
       usando el promedio de los meses anteriores con una variación aleatoria controlada.
     - Borra toda la data previa del cliente demo antes de regenerar.
     - No requiere modificación manual de ningún parámetro.
+
+GENERACIÓN INCREMENTAL (importante para los análisis con IA):
+    - Cada mes se genera con su propia semilla fija (cliente + año + mes),
+      nunca con el día de ejecución. Un mes ya cerrado sale IDÉNTICO en cada
+      corrida, así la huella de datos de un período cerrado no cambia y los
+      análisis con IA ya generados para ese período siguen saliendo del caché
+      (sin costo) aunque se refresque la demo.
+    - El mes en curso se genera completo y solo se insertan los documentos con
+      fecha <= hoy: crece día a día sin alterar lo que ya existía.
+    - Candado: si al regenerar cambia algún mes que ya estaba cerrado, el
+      script hace rollback y avisa. Para aceptar el cambio a propósito:
+          python seed_demo_comercial_2026_dinamico.py --forzar
+    - DEMO_HOY=YYYY-MM-DD (variable de entorno) simula otra fecha de
+      ejecución; solo para pruebas.
 """
 from dotenv import load_dotenv
 load_dotenv()
 
 
 import os
+import sys
 import uuid
 import random
 import calendar
@@ -40,8 +55,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("No existe DATABASE_URL en las variables de entorno.")
 
+FORZAR = "--forzar" in sys.argv
+
 # Fecha de ejecución — todo se calcula a partir de aquí
-HOY = date.today()
+_hoy_simulado = os.getenv("DEMO_HOY")
+HOY = date.fromisoformat(_hoy_simulado) if _hoy_simulado else date.today()
 ANO_ACTUAL = HOY.year
 MES_ACTUAL = HOY.month
 DIA_ACTUAL = HOY.day
@@ -131,21 +149,19 @@ def fin_mes(year, month):
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
-def dia_maximo_del_mes(mes: int) -> int:
-    """
-    Para el mes actual, el máximo día disponible es HOY.
-    Para meses anteriores, es el último día del mes.
-    """
-    if mes == MES_ACTUAL:
-        return DIA_ACTUAL
-    return calendar.monthrange(ANO_ACTUAL, mes)[1]
+def sembrar_mes(mes: int, bloque: int) -> None:
+    """Semilla fija por cliente + año + mes + bloque (1=operación, 2=nómina).
+    NUNCA depende del día de ejecución: es lo que garantiza que un mes ya
+    cerrado salga idéntico en cada corrida."""
+    random.seed(IDCLIENTE * 10_000_000 + ANO_ACTUAL * 1000 + mes * 10 + bloque)
 
 
 def fecha_aleatoria_en_mes(mes: int, dia_desde: int = 2) -> date:
-    """Genera una fecha aleatoria dentro del mes, sin exceder el día de hoy si es el mes actual."""
-    dia_hasta = dia_maximo_del_mes(mes)
-    if dia_hasta < dia_desde:
-        dia_hasta = dia_desde
+    """Genera una fecha aleatoria dentro del mes COMPLETO (también para el mes
+    en curso). Los documentos con fecha > HOY se descartan después de generar
+    todos sus valores aleatorios, para que el mes en curso crezca día a día
+    sin cambiar lo ya generado."""
+    dia_hasta = calendar.monthrange(ANO_ACTUAL, mes)[1]
     dia = random.randint(dia_desde, dia_hasta)
     return date(ANO_ACTUAL, mes, dia)
 
@@ -448,9 +464,6 @@ def insertar_catalogos(cur):
 def insertar_operacion_siigo(cur, customer_ids, producto_ids):
     print(f"Insertando operación Siigo demo {ANO_ACTUAL} (enero → mes {MES_ACTUAL})...")
 
-    # Seed estable por fecha: misma ejecución el mismo día = mismos datos
-    random.seed(ANO_ACTUAL * 10000 + MES_ACTUAL * 100 + DIA_ACTUAL)
-
     factura_seq = 1001
     compra_seq = 1001
     pago_recibido_seq = 1001
@@ -462,18 +475,19 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
 
     for mes in range(1, MES_ACTUAL + 1):
 
-        es_mes_actual = (mes == MES_ACTUAL)
+        # Semilla propia del mes: lo generado para este mes no depende del
+        # día de ejecución ni de los demás meses.
+        sembrar_mes(mes, 1)
 
-        # Para el mes actual, reducir proporcionalemente el volumen
-        # según los días transcurridos del mes vs días totales del mes
-        dias_mes = calendar.monthrange(ANO_ACTUAL, mes)[1]
-        fraccion_mes = DIA_ACTUAL / dias_mes if es_mes_actual else 1.0
-
+        # IMPORTANTE (generación incremental): dentro de este loop TODOS los
+        # valores aleatorios de cada documento se sacan siempre, en el mismo
+        # orden y sin depender de HOY, ANTES de decidir si el documento se
+        # inserta (fecha <= HOY). Si se agrega un random nuevo, ponerlo antes
+        # del `continue` y sin condicionarlo a HOY - de lo contrario los meses
+        # ya cerrados cambian y se invalida el caché de análisis con IA.
         ventas_mes = ventas_base_mes[mes]
-        # Cantidad de facturas proporcional a los días transcurridos si es el mes actual
-        cantidad_facturas_base = random.randint(9, 13)
-        cantidad_facturas = max(1, round(cantidad_facturas_base * fraccion_mes)) if es_mes_actual else cantidad_facturas_base
-        promedio_factura = Decimal(ventas_mes) / Decimal(cantidad_facturas_base)  # mantener montos, ajustar cantidad
+        cantidad_facturas = random.randint(9, 13)
+        promedio_factura = Decimal(ventas_mes) / Decimal(cantidad_facturas)
 
         for i in range(cantidad_facturas):
             cliente_nit, cliente_nombre, cliente_email = random.choice(clientes_demo)
@@ -516,37 +530,46 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
             if reteiva > 0:
                 retenciones_factura.append({"type": "ReteIVA", "percentage": 15.0, "value": float(reteiva)})
 
-            # Para el mes actual, más facturas quedan pendientes (lógico: aún no han vencido)
-            if es_mes_actual:
-                estado_random = random.random()
-                if estado_random <= 0.40:
-                    estado_pago = "pagada"
-                    pagos_total = total
-                    saldo = money(0)
-                elif estado_random <= 0.65:
-                    estado_pago = "parcial"
-                    pagos_total = money(total * Decimal(random.choice(["0.40", "0.55", "0.70"])))
-                    saldo = money(total - pagos_total)
-                else:
-                    estado_pago = "pendiente"
-                    pagos_total = money(0)
-                    saldo = total
+            # El estado de pago es un atributo fijo de la factura (mismos
+            # umbrales para el mes en curso y los cerrados): si dependiera de
+            # si el mes está abierto, la factura cambiaría al cerrar el mes.
+            estado_random = random.random()
+            fraccion_parcial = Decimal(random.choice(["0.40", "0.55", "0.70"]))
+            if estado_random <= 0.66:
+                estado_pago = "pagada"
+                pagos_total = total
+                saldo = money(0)
+            elif estado_random <= 0.84:
+                estado_pago = "parcial"
+                pagos_total = money(total * fraccion_parcial)
+                saldo = money(total - pagos_total)
             else:
-                estado_random = random.random()
-                if estado_random <= 0.66:
-                    estado_pago = "pagada"
-                    pagos_total = total
-                    saldo = money(0)
-                elif estado_random <= 0.84:
-                    estado_pago = "parcial"
-                    pagos_total = money(total * Decimal(random.choice(["0.40", "0.55", "0.70"])))
-                    saldo = money(total - pagos_total)
-                else:
-                    estado_pago = "pendiente"
-                    pagos_total = money(0)
-                    saldo = total
+                estado_pago = "pendiente"
+                pagos_total = money(0)
+                saldo = total
 
+            medio_pago_factura = random.choice(["TRANSF", "PSE", "CONSIG"])
+            dias_pago = random.choice([5, 12, 20, 32])
+            metodo_pago_recaudo = random.choice(["TRANSF", "PSE", "CONSIG"])
+            genera_nc = random.random() <= 0.10
+            porcentaje_nc = Decimal(random.choice(["0.04", "0.06", "0.08"]))
+            dias_nc = random.choice([4, 8, 12])
+
+            # Los consecutivos avanzan aunque el documento todavía no se
+            # inserte, para que cada documento conserve siempre su número.
             idfactura = f"FV-9-{factura_seq}"
+            factura_seq += 1
+            idpago_recibido = None
+            if pagos_total > 0:
+                idpago_recibido = f"RC-9-{pago_recibido_seq}"
+                pago_recibido_seq += 1
+            nota_id = None
+            if genera_nc:
+                nota_id = f"NC-9-{nota_seq}"
+                nota_seq += 1
+
+            if fecha > HOY:
+                continue
 
             cur.execute(
                 """
@@ -582,7 +605,7 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                     subtotal, iva,
                     pagos_total, saldo,
                     estado_pago,
-                    random.choice(["TRANSF", "PSE", "CONSIG"]),
+                    medio_pago_factura,
                     "Factura demo generada para demos comerciales de InsightsFlow.",
                     f"https://demo.insightsflow.com/facturas/{idfactura}",
                     centro_id, Json(retenciones_factura),
@@ -612,7 +635,7 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
             )
 
             if pagos_total > 0:
-                fecha_pago = clampear_fecha(add_days(fecha, random.choice([5, 12, 20, 32])))
+                fecha_pago = clampear_fecha(add_days(fecha, dias_pago))
                 cur.execute(
                     """
                     INSERT INTO siigo_pagos_recibidos (
@@ -621,12 +644,11 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, now())
                     """,
                     (
-                        IDCLIENTE, f"RC-9-{pago_recibido_seq}", fecha_pago,
-                        cliente_nombre, random.choice(["TRANSF", "PSE", "CONSIG"]),
+                        IDCLIENTE, idpago_recibido, fecha_pago,
+                        cliente_nombre, metodo_pago_recaudo,
                         pagos_total, idfactura,
                     ),
                 )
-                pago_recibido_seq += 1
 
             if saldo > 0:
                 cur.execute(
@@ -644,8 +666,8 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                     ),
                 )
 
-            if random.random() <= 0.10:
-                valor_nc = money(total * Decimal(random.choice(["0.04", "0.06", "0.08"])))
+            if genera_nc:
+                valor_nc = money(total * porcentaje_nc)
                 cur.execute(
                     """
                     INSERT INTO siigo_notas_credito (
@@ -656,8 +678,8 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                     ) VALUES (%s, %s, %s, %s, %s, 'Aplicada', %s, now(), %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        IDCLIENTE, f"NC-9-{nota_seq}",
-                        clampear_fecha(add_days(fecha, random.choice([4, 8, 12]))),
+                        IDCLIENTE, nota_id,
+                        clampear_fecha(add_days(fecha, dias_nc)),
                         cliente_nombre, vendedor_nombre, valor_nc,
                         str(uuid.uuid4()), "Ajuste comercial demo",
                         "Nota crédito demo por ajuste comercial controlado.",
@@ -667,7 +689,6 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                         str(uuid.uuid4()),
                     ),
                 )
-                nota_seq += 1
 
             facturas_creadas.append({
                 "mes": mes,
@@ -683,14 +704,12 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                 "reteica": reteica,
                 "reteiva": reteiva,
             })
-            factura_seq += 1
 
         # ── COMPRAS DEL MES ──────────────────────────────────────────────
 
         gastos_mes = gastos_base_mes[mes]
-        cantidad_compras_base = random.randint(12, 17)
-        cantidad_compras = max(1, round(cantidad_compras_base * fraccion_mes)) if es_mes_actual else cantidad_compras_base
-        promedio_compra = Decimal(gastos_mes) / Decimal(cantidad_compras_base)
+        cantidad_compras = random.randint(12, 17)
+        promedio_compra = Decimal(gastos_mes) / Decimal(cantidad_compras)
 
         conceptos_gasto = [
             ("613595", "Costos directos de prestación de servicios tecnológicos"),
@@ -738,34 +757,25 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
             if reteica_compra > 0:
                 retenciones_compra.append({"type": "ReteICA", "percentage": 0.966, "value": float(reteica_compra)})
 
-            if es_mes_actual:
-                estado_random = random.random()
-                if estado_random <= 0.40:
-                    estado = "pagada"
-                    pago_valor = total
-                    saldo = money(0)
-                elif estado_random <= 0.65:
-                    estado = "parcial"
-                    pago_valor = money(total * Decimal(random.choice(["0.40", "0.55", "0.70"])))
-                    saldo = money(total - pago_valor)
-                else:
-                    estado = "pendiente"
-                    pago_valor = money(0)
-                    saldo = total
+            # Estado fijo por compra, mismos umbrales para todo mes (ver nota
+            # equivalente en facturas).
+            estado_random = random.random()
+            fraccion_parcial = Decimal(random.choice(["0.40", "0.55", "0.70"]))
+            if estado_random <= 0.62:
+                estado = "pagada"
+                pago_valor = total
+                saldo = money(0)
+            elif estado_random <= 0.82:
+                estado = "parcial"
+                pago_valor = money(total * fraccion_parcial)
+                saldo = money(total - pago_valor)
             else:
-                estado_random = random.random()
-                if estado_random <= 0.62:
-                    estado = "pagada"
-                    pago_valor = total
-                    saldo = money(0)
-                elif estado_random <= 0.82:
-                    estado = "parcial"
-                    pago_valor = money(total * Decimal(random.choice(["0.40", "0.55", "0.70"])))
-                    saldo = money(total - pago_valor)
-                else:
-                    estado = "pendiente"
-                    pago_valor = money(0)
-                    saldo = total
+                estado = "pendiente"
+                pago_valor = money(0)
+                saldo = total
+
+            dias_pago = random.choice([5, 10, 18, 32])
+            metodo_pago_proveedor = random.choice(["TRANSF", "ACH", "CONSIG"])
 
             if proveedor_tipo == "NIT":
                 idcompra = f"FC-9-{compra_seq}"
@@ -773,6 +783,14 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
             else:
                 idcompra = f"DS-9-{compra_seq}"
                 factura_proveedor = f"DS-{compra_seq}"
+            compra_seq += 1
+            idpago_proveedor = None
+            if pago_valor > 0:
+                idpago_proveedor = f"PP-9-{pago_proveedor_seq}"
+                pago_proveedor_seq += 1
+
+            if fecha > HOY:
+                continue
 
             cur.execute(
                 """
@@ -815,7 +833,7 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
             )
 
             if pago_valor > 0:
-                fecha_pago = clampear_fecha(add_days(fecha, random.choice([5, 10, 18, 32])))
+                fecha_pago = clampear_fecha(add_days(fecha, dias_pago))
                 cur.execute(
                     """
                     INSERT INTO siigo_pagos_proveedores (
@@ -826,12 +844,11 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, now(), %s, %s)
                     """,
                     (
-                        IDCLIENTE, f"PP-9-{pago_proveedor_seq}", fecha_pago,
-                        proveedor_nombre, random.choice(["TRANSF", "ACH", "CONSIG"]),
+                        IDCLIENTE, idpago_proveedor, fecha_pago,
+                        proveedor_nombre, metodo_pago_proveedor,
                         pago_valor, idcompra, factura_proveedor, proveedor_nit,
                     ),
                 )
-                pago_proveedor_seq += 1
 
             compras_creadas.append({
                 "mes": mes,
@@ -847,7 +864,6 @@ def insertar_operacion_siigo(cur, customer_ids, producto_ids):
                 "retefuente_compra": retefuente_compra,
                 "reteica_compra": reteica_compra,
             })
-            compra_seq += 1
 
     return facturas_creadas, compras_creadas
 
@@ -862,6 +878,7 @@ def insertar_nomina(cur):
     resumen_nomina = {}
 
     for mes in range(1, MES_ACTUAL + 1):
+        sembrar_mes(mes, 2)
         total_ingresos_mes = money(0)
         neto_mes = money(0)
 
@@ -959,6 +976,10 @@ def insertar_auxiliar(cur, fecha_contable, tipo, numero, cuenta_codigo, tercero_
 
 
 def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos):
+    """origen='BALANCE_PRUEBA': construir_flujo_efectivo (app.py) exige
+    exactamente ese origen en auxiliar_saldos_corte para ambas fechas de
+    corte - sin esto el Flujo de Efectivo del cliente demo siempre
+    respondería "faltan fechas" aunque haya data."""
     for codigo, saldo in saldos.items():
         if saldo == 0:
             continue
@@ -1010,7 +1031,7 @@ def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos):
                 %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                now(), 'SEED_DEMO'
+                now(), 'BALANCE_PRUEBA'
             )
             """,
             (
@@ -1153,7 +1174,18 @@ def insertar_contabilidad(cur, facturas, compras, resumen_nomina):
         insertar_auxiliar(cur, fecha_mes, "CP", f"CP-DEMO-MES-{mes:02d}", "236540", None, "Proveedores demo", "Retención en la fuente por pagar", credito=retencion_pagar, base=compras_subtotal_total)
         insertar_auxiliar(cur, fecha_mes, "CP", f"CP-DEMO-MES-{mes:02d}", "236805", None, "Proveedores demo", "ReteICA por pagar", credito=reteica_pagar, base=compras_subtotal_total)
 
-        saldos["24081501"] += compras_iva
+        # 24081501 es clase "2" -> el resto de este script (y el clasificador
+        # real de producción, clasificar_cuenta() en balance.py) la trata
+        # bajo convención CREDITO_MENOS_DEBITO como cualquier otra cuenta
+        # clase 2, sin excepción por nombre/naturaleza. Como aquí solo se
+        # DEBITA esta cuenta (nunca se acredita), hay que restar para que
+        # el saldo guardado (y su delta mes a mes) coincida con lo que
+        # cualquier recálculo real desde auxiliar_contable daría - un `+=`
+        # aquí invierte el signo del delta y descuadra Flujo de Efectivo
+        # exactamente en 2x el monto de IVA descontable del período (bug
+        # real encontrado 2026-09-22 al validar el reporte contra este
+        # cliente demo: Siigo daba 236% de diferencia en vez de <5%).
+        saldos["24081501"] -= compras_iva
         saldos["220505"] += proveedor_neto
         saldos["236540"] += retencion_pagar
         saldos["236805"] += reteica_pagar
@@ -1189,7 +1221,11 @@ def insertar_contabilidad(cur, facturas, compras, resumen_nomina):
         utilidad = money(ingresos - costos - gastos)
         saldos["360505"] = utilidad
 
-        insertar_saldos_corte_y_balance(cur, fecha_corte_mes(mes), saldos)
+        # Fin de mes SIEMPRE (no fecha_corte_mes, que da "hoy" para el mes en
+        # curso) - construir_flujo_efectivo normaliza toda fecha consultada
+        # con ultimo_dia_del_mes() antes de buscar el snapshot, así que un
+        # corte fechado "hoy" para el mes en curso nunca haría match.
+        insertar_saldos_corte_y_balance(cur, fin_mes(ANO_ACTUAL, mes), saldos)
 
 
 # ─────────────────────────────────────────────
@@ -1253,6 +1289,85 @@ def validar(cur):
 
 
 # ─────────────────────────────────────────────
+# CANDADO DE MESES CERRADOS
+# ─────────────────────────────────────────────
+
+def _totales_meses_cerrados(cur, mes_limite):
+    """Totales por mes (solo meses < mes_limite del año en curso) de lo que
+    alimenta la huella de los análisis con IA: contabilidad por cuenta, y
+    facturas/compras (cartera, CxP, top clientes/proveedores)."""
+    totales = {}
+
+    cur.execute(
+        """
+        SELECT periodo_mes, cuenta_codigo, SUM(debito), SUM(credito)
+        FROM auxiliar_contable
+        WHERE idcliente = %s AND periodo_anio = %s AND periodo_mes < %s
+        GROUP BY 1, 2
+        """,
+        (IDCLIENTE, ANO_ACTUAL, mes_limite),
+    )
+    for mes, cuenta, debito, credito in cur.fetchall():
+        totales[("auxiliar", int(mes), cuenta)] = (debito, credito)
+
+    for etiqueta, tabla in (("facturas", "siigo_facturas"), ("compras", "siigo_compras")):
+        cur.execute(
+            f"""
+            SELECT EXTRACT(MONTH FROM fecha)::int, COUNT(*), SUM(total), SUM(saldo)
+            FROM {tabla}
+            WHERE idcliente = %s
+              AND EXTRACT(YEAR FROM fecha) = %s
+              AND EXTRACT(MONTH FROM fecha) < %s
+            GROUP BY 1
+            """,
+            (IDCLIENTE, ANO_ACTUAL, mes_limite),
+        )
+        for mes, cantidad, total, saldo in cur.fetchall():
+            totales[(etiqueta, int(mes), "")] = (cantidad, total, saldo)
+
+    return totales
+
+
+def foto_meses_cerrados(cur):
+    """Foto de los meses que YA estaban cerrados en la corrida anterior. El
+    último mes con datos se asume que era el mes en curso de esa corrida
+    (estaba parcial), así que no entra a la comparación."""
+    cur.execute(
+        "SELECT MAX(periodo_mes) FROM auxiliar_contable WHERE idcliente = %s AND periodo_anio = %s",
+        (IDCLIENTE, ANO_ACTUAL),
+    )
+    ultimo_mes_previo = cur.fetchone()[0]
+    if not ultimo_mes_previo:
+        return {}, 0
+
+    mes_limite = min(int(ultimo_mes_previo), MES_ACTUAL)
+    return _totales_meses_cerrados(cur, mes_limite), mes_limite
+
+
+def verificar_meses_cerrados(cur, foto_antes, mes_limite):
+    if not mes_limite:
+        return
+
+    foto_despues = _totales_meses_cerrados(cur, mes_limite)
+    if foto_despues == foto_antes:
+        print(f"\n✓ Meses cerrados (1 a {mes_limite - 1}) idénticos a la corrida anterior — los análisis con IA ya generados siguen vigentes.")
+        return
+
+    claves = set(foto_antes) | set(foto_despues)
+    meses_cambiados = sorted({k[1] for k in claves if foto_antes.get(k) != foto_despues.get(k)})
+
+    if FORZAR:
+        print(f"\n⚠ Cambiaron meses ya cerrados: {meses_cambiados}. Se acepta por --forzar; los análisis con IA de períodos que incluyan esos meses se van a regenerar (con costo).")
+        return
+
+    raise RuntimeError(
+        f"Cambiaron meses ya cerrados: {meses_cambiados}. Esto invalidaría los análisis con IA "
+        "ya generados para esos períodos. No se guardó nada. Si el cambio es intencional, "
+        "volver a correr con --forzar."
+    )
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -1261,6 +1376,7 @@ def main():
     try:
         with conn:
             with conn.cursor() as cur:
+                foto_antes, mes_limite = foto_meses_cerrados(cur)
                 limpiar_data_demo(cur)
                 asegurar_configuraciones(cur)
                 customer_ids, producto_ids = insertar_catalogos(cur)
@@ -1268,6 +1384,7 @@ def main():
                 resumen_nomina = insertar_nomina(cur)
                 insertar_contabilidad(cur, facturas, compras, resumen_nomina)
                 validar(cur)
+                verificar_meses_cerrados(cur, foto_antes, mes_limite)
 
         print(f"\n✓ Carga demo dinámica finalizada — data actualizada al {HOY.strftime('%d/%m/%Y')}.")
 

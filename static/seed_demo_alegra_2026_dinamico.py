@@ -29,6 +29,20 @@ Importadora NGC):
 CÓMO USARLO:
     python seed_demo_alegra_2026_dinamico.py
 
+GENERACIÓN INCREMENTAL (importante para los análisis con IA):
+    - Cada mes se genera con su propia semilla fija (cliente + año + mes),
+      nunca con el día de ejecución. Un mes ya cerrado sale IDÉNTICO en cada
+      corrida, así la huella de datos de un período cerrado no cambia y los
+      análisis con IA ya generados para ese período siguen saliendo del caché
+      (sin costo) aunque se refresque la demo.
+    - El mes en curso se genera completo y solo se insertan los documentos con
+      fecha <= hoy: crece día a día sin alterar lo que ya existía.
+    - Candado: si al regenerar cambia algún mes que ya estaba cerrado, el
+      script hace rollback y avisa. Para aceptar el cambio a propósito:
+          python seed_demo_alegra_2026_dinamico.py --forzar
+    - DEMO_HOY=YYYY-MM-DD (variable de entorno) simula otra fecha de
+      ejecución; solo para pruebas.
+
 PRE-REQUISITO (ya resuelto para idcliente=17, verificado 2026-07-21):
     - Registro en `clientes` (idcliente=17).
     - Registro en `fuente_datos_cliente` con proveedor='alegra'.
@@ -42,6 +56,7 @@ load_dotenv()
 
 
 import os
+import sys
 import uuid
 import random
 import calendar
@@ -62,7 +77,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("No existe DATABASE_URL en las variables de entorno.")
 
-HOY = date.today()
+FORZAR = "--forzar" in sys.argv
+
+_hoy_simulado = os.getenv("DEMO_HOY")
+HOY = date.fromisoformat(_hoy_simulado) if _hoy_simulado else date.today()
 ANO_ACTUAL = HOY.year
 MES_ACTUAL = HOY.month
 DIA_ACTUAL = HOY.day
@@ -138,16 +156,19 @@ def fin_mes(year, month):
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
-def dia_maximo_del_mes(mes: int) -> int:
-    if mes == MES_ACTUAL:
-        return DIA_ACTUAL
-    return calendar.monthrange(ANO_ACTUAL, mes)[1]
+def sembrar_mes(mes: int) -> None:
+    """Semilla fija por cliente + año + mes. NUNCA depende del día de
+    ejecución: es lo que garantiza que un mes ya cerrado salga idéntico en
+    cada corrida."""
+    random.seed(IDCLIENTE * 10_000_000 + ANO_ACTUAL * 1000 + mes * 10 + 1)
 
 
 def fecha_aleatoria_en_mes(mes: int, dia_desde: int = 2) -> date:
-    dia_hasta = dia_maximo_del_mes(mes)
-    if dia_hasta < dia_desde:
-        dia_hasta = dia_desde
+    """Fecha aleatoria dentro del mes COMPLETO (también para el mes en
+    curso). Los documentos con fecha > HOY se descartan después de generar
+    todos sus valores aleatorios, para que el mes en curso crezca día a día
+    sin cambiar lo ya generado."""
+    dia_hasta = calendar.monthrange(ANO_ACTUAL, mes)[1]
     dia = random.randint(dia_desde, dia_hasta)
     return date(ANO_ACTUAL, mes, dia)
 
@@ -293,6 +314,7 @@ def limpiar_data_demo(cur):
         "alegra_centros_costo",
         "alegra_cuentas_contables",
         "alegra_retenciones_catalogo",
+        "alegra_saldos_iniciales",
         "auxiliar_contable",
         "auxiliar_saldos_corte",
     ]
@@ -475,8 +497,6 @@ def insertar_catalogos(cur):
 def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, producto_ids):
     print(f"Insertando operación Alegra demo {ANO_ACTUAL} (enero → mes {MES_ACTUAL})...")
 
-    random.seed(ANO_ACTUAL * 10000 + MES_ACTUAL * 100 + DIA_ACTUAL + 5)
-
     factura_seq = 2001
     compra_seq = 2001
     nota_seq = 2001
@@ -485,15 +505,21 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
     compras_creadas = []
 
     for mes in range(1, MES_ACTUAL + 1):
-        es_mes_actual = (mes == MES_ACTUAL)
-        dias_mes = calendar.monthrange(ANO_ACTUAL, mes)[1]
-        fraccion_mes = DIA_ACTUAL / dias_mes if es_mes_actual else 1.0
+        # Semilla propia del mes: lo generado para este mes no depende del
+        # día de ejecución ni de los demás meses.
+        sembrar_mes(mes)
+
+        # IMPORTANTE (generación incremental): dentro de este loop TODOS los
+        # valores aleatorios de cada documento se sacan siempre, en el mismo
+        # orden y sin depender de HOY, ANTES de decidir si el documento se
+        # inserta (fecha <= HOY). Si se agrega un random nuevo, ponerlo antes
+        # del `continue` y sin condicionarlo a HOY - de lo contrario los meses
+        # ya cerrados cambian y se invalida el caché de análisis con IA.
 
         # ── FACTURAS DEL MES ────────────────────────────────────────────
         ventas_mes = ventas_base_mes[mes]
-        cantidad_facturas_base = random.randint(9, 13)
-        cantidad_facturas = max(1, round(cantidad_facturas_base * fraccion_mes)) if es_mes_actual else cantidad_facturas_base
-        promedio_factura = Decimal(ventas_mes) / Decimal(cantidad_facturas_base)
+        cantidad_facturas = random.randint(9, 13)
+        promedio_factura = Decimal(ventas_mes) / Decimal(cantidad_facturas)
 
         for i in range(cantidad_facturas):
             cliente_nit, cliente_nombre, _regimen_cli = random.choice(clientes_demo)
@@ -539,8 +565,10 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             # Siigo).
             monto_nc_aplicado = money(0)
             genera_nc = random.random() <= 0.10
+            porcentaje_nc = Decimal(random.choice(["0.05", "0.08", "0.12"]))
+            dias_nc = random.choice([4, 8, 12])
             if genera_nc:
-                monto_nc_aplicado = money(total * Decimal(random.choice(["0.05", "0.08", "0.12"])))
+                monto_nc_aplicado = money(total * porcentaje_nc)
 
             # Monto real por cobrar: total menos lo que ya cubrió la nota
             # crédito y menos lo que el cliente retuvo — pagado/saldo se
@@ -548,15 +576,17 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             # exacta la identidad total = total_paid + nc_aplicada + retencion + saldo.
             monto_por_cubrir = money(total - monto_nc_aplicado - retencion_factura_total)
 
-            # Distribución de pago — igual criterio que el demo Siigo: el mes
-            # en curso queda con mas facturas pendientes (aun no vencen).
-            umbral_pagada, umbral_parcial = (0.40, 0.65) if es_mes_actual else (0.66, 0.84)
+            # Distribución de pago — igual criterio que el demo Siigo. El
+            # estado es un atributo fijo de la factura (mismos umbrales para
+            # el mes en curso y los cerrados): si dependiera de si el mes
+            # está abierto, la factura cambiaría al cerrar el mes.
             estado_random = random.random()
-            if estado_random <= umbral_pagada:
+            fraccion_parcial = Decimal(random.choice(["0.40", "0.55", "0.70"]))
+            if estado_random <= 0.66:
                 total_paid = monto_por_cubrir
                 saldo_final = money(0)
-            elif estado_random <= umbral_parcial:
-                total_paid = money(monto_por_cubrir * Decimal(random.choice(["0.40", "0.55", "0.70"])))
+            elif estado_random <= 0.84:
+                total_paid = money(monto_por_cubrir * fraccion_parcial)
                 saldo_final = money(monto_por_cubrir - total_paid)
             else:
                 total_paid = money(0)
@@ -565,7 +595,17 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             balance = saldo_final
             estado = "closed" if balance <= 0 else "open"
 
+            # Los consecutivos avanzan aunque el documento todavía no se
+            # inserte, para que cada documento conserve siempre su número.
             alegra_id_factura = str(factura_seq)
+            factura_seq += 1
+            nota_alegra_id = None
+            if genera_nc:
+                nota_alegra_id = str(nota_seq)
+                nota_seq += 1
+
+            if fecha > HOY:
+                continue
 
             cur.execute(
                 """
@@ -607,7 +647,6 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             )
 
             if genera_nc:
-                nota_alegra_id = str(nota_seq)
                 nota_total = monto_nc_aplicado  # nota simple, 1 factura afectada, monto = total de la nota
                 nota_subtotal = money(nota_total / Decimal("1.19"))
                 nota_iva = money(nota_total - nota_subtotal)
@@ -626,7 +665,7 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
                     """,
                     (
                         IDCLIENTE, nota_alegra_id,
-                        clampear_fecha(add_days(fecha, random.choice([4, 8, 12]))),
+                        clampear_fecha(add_days(fecha, dias_nc)),
                         nota_subtotal, nota_iva, nota_total, nota_total,
                         tercero_id,
                     ),
@@ -641,7 +680,6 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
                     """,
                     (IDCLIENTE, nota_db_id, alegra_id_factura, monto_nc_aplicado),
                 )
-                nota_seq += 1
 
             facturas_creadas.append({
                 "mes": mes,
@@ -657,13 +695,11 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
                 "reteica": reteica,
                 "reteiva": reteiva,
             })
-            factura_seq += 1
 
         # ── COMPRAS DEL MES ──────────────────────────────────────────────
         gastos_mes = gastos_base_mes[mes]
-        cantidad_compras_base = random.randint(12, 17)
-        cantidad_compras = max(1, round(cantidad_compras_base * fraccion_mes)) if es_mes_actual else cantidad_compras_base
-        promedio_compra = Decimal(gastos_mes) / Decimal(cantidad_compras_base)
+        cantidad_compras = random.randint(12, 17)
+        promedio_compra = Decimal(gastos_mes) / Decimal(cantidad_compras)
 
         for i in range(cantidad_compras):
             proveedor_nit, proveedor_nombre, proveedor_tipo_id, _regimen_prov = random.choice(proveedores_demo)
@@ -692,13 +728,15 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             else:
                 retefuente_compra = reteica_compra = money(0)
 
-            umbral_pagada, umbral_parcial = (0.40, 0.65) if es_mes_actual else (0.62, 0.82)
+            # Estado fijo por compra, mismos umbrales para todo mes (ver nota
+            # equivalente en facturas).
             estado_random = random.random()
-            if estado_random <= umbral_pagada:
+            fraccion_parcial = Decimal(random.choice(["0.40", "0.55", "0.70"]))
+            if estado_random <= 0.62:
                 total_paid = total
                 balance = money(0)
-            elif estado_random <= umbral_parcial:
-                total_paid = money(total * Decimal(random.choice(["0.40", "0.55", "0.70"])))
+            elif estado_random <= 0.82:
+                total_paid = money(total * fraccion_parcial)
                 balance = money(total - total_paid)
             else:
                 total_paid = money(0)
@@ -710,6 +748,10 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
             # con datos reales de Maslux) - a diferencia de Siigo (FC-.../DS-...).
             factura_proveedor = f"FE{compra_seq}" if proveedor_tipo_id == "NIT" else f"CT{compra_seq}"
             alegra_id_compra = str(compra_seq)
+            compra_seq += 1
+
+            if fecha > HOY:
+                continue
 
             cur.execute(
                 """
@@ -781,7 +823,6 @@ def insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, prod
                 "retefuente_compra": retefuente_compra,
                 "reteica_compra": reteica_compra,
             })
-            compra_seq += 1
 
     return facturas_creadas, compras_creadas
 
@@ -883,6 +924,29 @@ def insertar_saldos_corte(cur, fecha_corte, saldos):
                 grupo_balance_calc, naturaleza_calc, saldo_final,
             ),
         )
+
+
+def insertar_ancla_saldo_inicial(cur):
+    """Ancla mínima en alegra_saldos_iniciales (AlegraSaldoInicial), fechada
+    31-dic del año anterior con saldo $0. No cambia la contabilidad — este
+    demo sigue "arrancando en cero" el 1-enero via auxiliar_contable, igual
+    que siempre — pero construir_flujo_efectivo (app.py) exige que exista
+    AL MENOS un registro con fecha_corte_inicial <= ambas fechas de corte
+    consultadas, o responde "falta ancla" sin importar cuánta data haya en
+    auxiliar_contable. regenerar_snapshot_saldos_corte (balance.py) trata
+    un ancla en $0 exactamente igual que "sin ancla" (FULL OUTER JOIN con
+    saldo base 0), así que esto solo destraba el chequeo, no altera ningún
+    número."""
+    fecha_ancla = date(ANO_ACTUAL - 1, 12, 31)
+    cur.execute(
+        """
+        INSERT INTO alegra_saldos_iniciales (
+            idcliente, fecha_corte_inicial, cuenta_codigo, cuenta_nombre,
+            saldo, archivo_origen, fecha_carga
+        ) VALUES (%s, %s, %s, %s, 0, %s, now())
+        """,
+        (IDCLIENTE, fecha_ancla, "310505", "Capital social", "seed_demo_alegra_2026_dinamico.py"),
+    )
 
 
 def insertar_contabilidad(cur, facturas, compras):
@@ -995,7 +1059,15 @@ def insertar_contabilidad(cur, facturas, compras):
         insertar_auxiliar(cur, fecha_mes, "CP", f"CP-DEMO-ALEGRA-MES-{mes:02d}", "236540", None, "Proveedores demo", "Retención en la fuente por pagar", credito=retencion_pagar, base=compras_subtotal_total)
         insertar_auxiliar(cur, fecha_mes, "CP", f"CP-DEMO-ALEGRA-MES-{mes:02d}", "236805", None, "Proveedores demo", "ReteICA por pagar", credito=reteica_pagar, base=compras_subtotal_total)
 
-        saldos["24081501"] += compras_iva
+        # Convención CREDITO_MENOS_DEBITO (misma que el resto de clase "2"
+        # aquí y en clasificar_cuenta() de producción) - como esta cuenta
+        # solo se DEBITA, hay que restar. Mismo bug real encontrado y
+        # corregido en el script hermano de Siigo el 2026-09-22 (ver ese
+        # archivo) - se corrige aquí también aunque hoy no se note (Alegra
+        # regenera el snapshot desde auxiliar_contable en cada consulta y
+        # nunca confía en este valor persistido), para no dejar la misma
+        # trampa si algo empieza a confiar en él más adelante.
+        saldos["24081501"] -= compras_iva
         saldos["220505"] += proveedor_neto
         saldos["236540"] += retencion_pagar
         saldos["236805"] += reteica_pagar
@@ -1106,6 +1178,85 @@ def validar(cur):
 
 
 # ─────────────────────────────────────────────
+# CANDADO DE MESES CERRADOS
+# ─────────────────────────────────────────────
+
+def _totales_meses_cerrados(cur, mes_limite):
+    """Totales por mes (solo meses < mes_limite del año en curso) de lo que
+    alimenta la huella de los análisis con IA: contabilidad por cuenta, y
+    facturas/compras (cartera, CxP, top clientes/proveedores)."""
+    totales = {}
+
+    cur.execute(
+        """
+        SELECT periodo_mes, cuenta_codigo, SUM(debito), SUM(credito)
+        FROM auxiliar_contable
+        WHERE idcliente = %s AND periodo_anio = %s AND periodo_mes < %s
+        GROUP BY 1, 2
+        """,
+        (IDCLIENTE, ANO_ACTUAL, mes_limite),
+    )
+    for mes, cuenta, debito, credito in cur.fetchall():
+        totales[("auxiliar", int(mes), cuenta)] = (debito, credito)
+
+    for etiqueta, tabla in (("facturas", "alegra_facturas"), ("compras", "alegra_compras")):
+        cur.execute(
+            f"""
+            SELECT EXTRACT(MONTH FROM fecha)::int, COUNT(*), SUM(total), SUM(balance)
+            FROM {tabla}
+            WHERE idcliente = %s
+              AND EXTRACT(YEAR FROM fecha) = %s
+              AND EXTRACT(MONTH FROM fecha) < %s
+            GROUP BY 1
+            """,
+            (IDCLIENTE, ANO_ACTUAL, mes_limite),
+        )
+        for mes, cantidad, total, saldo in cur.fetchall():
+            totales[(etiqueta, int(mes), "")] = (cantidad, total, saldo)
+
+    return totales
+
+
+def foto_meses_cerrados(cur):
+    """Foto de los meses que YA estaban cerrados en la corrida anterior. El
+    último mes con datos se asume que era el mes en curso de esa corrida
+    (estaba parcial), así que no entra a la comparación."""
+    cur.execute(
+        "SELECT MAX(periodo_mes) FROM auxiliar_contable WHERE idcliente = %s AND periodo_anio = %s",
+        (IDCLIENTE, ANO_ACTUAL),
+    )
+    ultimo_mes_previo = cur.fetchone()[0]
+    if not ultimo_mes_previo:
+        return {}, 0
+
+    mes_limite = min(int(ultimo_mes_previo), MES_ACTUAL)
+    return _totales_meses_cerrados(cur, mes_limite), mes_limite
+
+
+def verificar_meses_cerrados(cur, foto_antes, mes_limite):
+    if not mes_limite:
+        return
+
+    foto_despues = _totales_meses_cerrados(cur, mes_limite)
+    if foto_despues == foto_antes:
+        print(f"\n✓ Meses cerrados (1 a {mes_limite - 1}) idénticos a la corrida anterior — los análisis con IA ya generados siguen vigentes.")
+        return
+
+    claves = set(foto_antes) | set(foto_despues)
+    meses_cambiados = sorted({k[1] for k in claves if foto_antes.get(k) != foto_despues.get(k)})
+
+    if FORZAR:
+        print(f"\n⚠ Cambiaron meses ya cerrados: {meses_cambiados}. Se acepta por --forzar; los análisis con IA de períodos que incluyan esos meses se van a regenerar (con costo).")
+        return
+
+    raise RuntimeError(
+        f"Cambiaron meses ya cerrados: {meses_cambiados}. Esto invalidaría los análisis con IA "
+        "ya generados para esos períodos. No se guardó nada. Si el cambio es intencional, "
+        "volver a correr con --forzar."
+    )
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -1114,12 +1265,15 @@ def main():
     try:
         with conn:
             with conn.cursor() as cur:
+                foto_antes, mes_limite = foto_meses_cerrados(cur)
                 limpiar_data_demo(cur)
                 asegurar_configuraciones(cur)
                 terceros_clientes, terceros_proveedores, producto_ids = insertar_catalogos(cur)
                 facturas, compras = insertar_operacion_alegra(cur, terceros_clientes, terceros_proveedores, producto_ids)
                 insertar_contabilidad(cur, facturas, compras)
+                insertar_ancla_saldo_inicial(cur)
                 validar(cur)
+                verificar_meses_cerrados(cur, foto_antes, mes_limite)
 
         print(f"\n✓ Carga demo Alegra dinámica finalizada — data actualizada al {HOY.strftime('%d/%m/%Y')}.")
 

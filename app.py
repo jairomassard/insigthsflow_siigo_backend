@@ -2258,22 +2258,32 @@ def construir_flujo_efectivo(idcliente: int, fecha_inicio: str, fecha_fin: str):
 # el balance general de Alegra siga con ese problema pendiente.
 # =========================================================
 
-def _cartera_total_actual(idcliente):
-    """Saldo total pendiente de recaudo a clientes, a la fecha actual.
-    Misma logica de cuentas_por_cobrar() (solo_saldo_pendiente)."""
+def _cartera_total_al_corte(idcliente, fecha_corte):
+    """Saldo pendiente de recaudo de las facturas emitidas hasta fecha_corte.
+    Misma logica de cuentas_por_cobrar() (solo_saldo_pendiente), pero
+    acotada al corte del periodo analizado: antes sumaba TODA la cartera
+    que existiera hoy, asi que el DSO de un periodo ya cerrado cambiaba con
+    cada factura nueva posterior al corte - numero sin sentido para ese
+    periodo, y ademas le cambiaba la huella al analisis con IA de
+    Indicadores/Panel Ejecutivo (regeneracion con costo sin que el periodo
+    hubiera cambiado). OJO: el saldo sigue siendo el saldo de HOY de esos
+    documentos (no hay saldo historico por fecha) - si una factura vieja
+    se paga despues, este numero si cambia, y eso es correcto."""
     from sqlalchemy import text
 
     sql = text("""
         SELECT COALESCE(SUM(saldo), 0) AS total
         FROM facturas_enriquecidas
         WHERE idcliente = :idc AND COALESCE(saldo, 0) > 0
+          AND fecha <= :corte
     """)
-    row = db.session.execute(sql, {"idc": idcliente}).first()
+    row = db.session.execute(sql, {"idc": idcliente, "corte": fecha_corte}).first()
     return float(row.total if row else 0) or 0.0
 
 
-def _cuentas_por_pagar_total_actual(idcliente):
-    """Saldo total pendiente de pago a proveedores, a la fecha actual.
+def _cuentas_por_pagar_total_al_corte(idcliente, fecha_corte):
+    """Saldo pendiente de pago de las compras/gastos registrados hasta
+    fecha_corte (ver _cartera_total_al_corte para el por que del corte).
     Misma formula de total_saldo ya validada en /reportes/financiero/compras-gastos."""
     from sqlalchemy import text
 
@@ -2286,8 +2296,9 @@ def _cuentas_por_pagar_total_actual(idcliente):
         ), 0) AS total
         FROM compras_enriquecidas
         WHERE idcliente = :idc
+          AND fecha <= :corte
     """)
-    row = db.session.execute(sql, {"idc": idcliente}).first()
+    row = db.session.execute(sql, {"idc": idcliente, "corte": fecha_corte}).first()
     return float(row.total if row else 0) or 0.0
 
 
@@ -22046,8 +22057,8 @@ def create_app():
             # =========================
             dias_periodo = (fecha_hasta - fecha_desde).days + 1
 
-            cartera_total = _cartera_total_actual(idcliente)
-            cuentas_por_pagar_total = _cuentas_por_pagar_total_actual(idcliente)
+            cartera_total = _cartera_total_al_corte(idcliente, fecha_hasta)
+            cuentas_por_pagar_total = _cuentas_por_pagar_total_al_corte(idcliente, fecha_hasta)
             compras_periodo = _compras_total_periodo(idcliente, fecha_desde, fecha_hasta)
             gastos_financieros = _gastos_financieros_periodo(idcliente, fecha_desde, fecha_hasta)
             inventarios = _inventarios_actual(idcliente, fecha_hasta)
@@ -22156,8 +22167,8 @@ def create_app():
                 "pasivo_corto": "Obligaciones exigibles en el corto plazo.",
                 "pasivo_largo": "Obligaciones exigibles a largo plazo.",
                 "inventarios": "Saldo de inventarios de mercancías al corte final.",
-                "cartera_total": "Saldo total pendiente de recaudo a clientes, a la fecha actual.",
-                "cuentas_por_pagar_total": "Saldo total pendiente de pago a proveedores, a la fecha actual.",
+                "cartera_total": "Saldo pendiente de recaudo de las facturas emitidas hasta el corte final del período.",
+                "cuentas_por_pagar_total": "Saldo pendiente de pago de las compras y gastos registrados hasta el corte final del período.",
                 "gastos_financieros": "Intereses, comisiones y gastos bancarios del período seleccionado.",
             }
 
@@ -22257,12 +22268,12 @@ def create_app():
                 {
                     "clase": "Cartera (CxC)",
                     "valor": round(cartera_total, 2),
-                    "interpretacion": "Saldo total pendiente de recaudo a clientes, a la fecha actual."
+                    "interpretacion": "Saldo pendiente de recaudo de las facturas emitidas hasta el corte final del período."
                 },
                 {
                     "clase": "Cuentas por pagar (CxP)",
                     "valor": round(cuentas_por_pagar_total, 2),
-                    "interpretacion": "Saldo total pendiente de pago a proveedores, a la fecha actual."
+                    "interpretacion": "Saldo pendiente de pago de las compras y gastos registrados hasta el corte final del período."
                 },
                 {
                     "clase": "Gastos financieros",
