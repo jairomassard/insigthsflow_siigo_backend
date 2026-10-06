@@ -1083,7 +1083,7 @@ def _armar_alertas(
                 f"El balance tiene una diferencia de {redondear(ajuste_cuadratura_residual_actual, 2):,.0f} "
                 "que no se explica ni con las cuentas cargadas ni con el resultado del ejercicio - el sistema "
                 "la muestra como un ajuste de patrimonio para que la ecuación contable cierre, pero es una señal "
-                "de un posible error en los datos de origen. Pídele a tu contador que lo revise directamente en Alegra."
+                "de un posible error en los datos de origen. Pídele a tu contador que lo revise directamente en tu sistema contable."
             ),
             "monto": redondear(ajuste_cuadratura_residual_actual, 2),
         })

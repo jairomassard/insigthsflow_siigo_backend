@@ -352,7 +352,7 @@ def asegurar_configuraciones(cur):
             ) VALUES (
                 %s, true,
                 1.20, 3.00,
-                0.65, 0.12, 2.00,
+                0.65, 0.12, 0.40,
                 1.40, 1.20,
                 20000000, 0.75,
                 0.45, 0.35,
@@ -1211,15 +1211,13 @@ def insertar_contabilidad(cur, facturas, compras, resumen_nomina):
         saldos["250505"] -= nomina_neto
         saldos["111005"] -= nomina_neto
 
-        ingresos = saldos["413595"]
-        costos = saldos["613595"]
-        gastos = (
-            saldos["510506"] + saldos["511095"] + saldos["512010"]
-            + saldos["513525"] + saldos["514525"] + saldos["519595"]
-            + saldos["530505"]
-        )
-        utilidad = money(ingresos - costos - gastos)
-        saldos["360505"] = utilidad
+        # OJO: NO se guarda la utilidad del ejercicio en 360505. El corte ya
+        # lleva las cuentas de resultado (clases 4, 5 y 6), igual que un
+        # Balance de Prueba real a mitad de año, y construir_balance_general
+        # (balance.py) calcula la utilidad desde ahí. Guardarla además en
+        # 360505 la duplicaba: el Balance del demo mostraba una alerta roja
+        # de "diferencia sin explicar" por el valor exacto de la utilidad
+        # (bug real encontrado 2026-10-06 al preparar los análisis con IA).
 
         # Fin de mes SIEMPRE (no fecha_corte_mes, que da "hoy" para el mes en
         # curso) - construir_flujo_efectivo normaliza toda fecha consultada
