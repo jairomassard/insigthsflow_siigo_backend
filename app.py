@@ -33,6 +33,8 @@ from analisis_ia import (
     generar_analisis_flujo_efectivo,
     generar_word_analisis,
     generar_grafico_cascada_flujo,
+    construir_graficos_diagnostico_integral,
+    generar_graficos_word_diagnostico_integral,
     consultar_uso_mensual,
     listar_historial_analisis,
     TOPE_MENSUAL,
@@ -23332,6 +23334,12 @@ def create_app():
                 pnl_data, balance_data, indicadores_data, dashboard_data,
                 forzar=forzar,
             )
+            # Tablero visual que abre el diagnóstico (cifras clave + un
+            # gráfico por fuente) - sale de los mismos datos ya calculados
+            # arriba, no del texto de la IA, y no entra a la huella.
+            resultado["graficos"] = construir_graficos_diagnostico_integral(
+                pnl_data, balance_data, indicadores_data, dashboard_data
+            )
             return jsonify(resultado), 200
         except TopeAlcanzadoError as e:
             return jsonify({
@@ -23399,16 +23407,52 @@ def create_app():
     @app.route("/dashboard/resumen-ejecutivo/analisis-ia/word", methods=["POST"])
     @jwt_required()
     def post_dashboard_resumen_ejecutivo_analisis_ia_word():
+        idcliente = get_jwt().get("idcliente")
         data = request.get_json(silent=True) or {}
         analisis_markdown = data.get("analisis_markdown")
         nombre_cliente = data.get("nombre_cliente") or "Cliente InsightsFlow"
         periodo = data.get("periodo") or ""
+        desde = data.get("desde")
+        hasta = data.get("hasta")
+        centro_costos = data.get("centro_costos") if data.get("centro_costos") not in (None, "") else None
+        modo_periodo = data.get("modo_periodo")
 
         if not analisis_markdown:
             return jsonify({"error": "Debes enviar analisis_markdown"}), 400
 
         try:
-            buffer = generar_word_analisis(analisis_markdown, nombre_cliente, periodo, evolucion=None)
+            # Mismo tablero (cifras clave + gráficos) que se ve en la
+            # ventana del diagnóstico - se recalcula con las mismas fuentes
+            # y el mismo período resuelto que el endpoint del análisis
+            # (consultas a la BD, sin costo de IA). Si no vienen fechas o
+            # algo falla, el Word sale igual pero sin tablero.
+            graficos = None
+            if desde and hasta:
+                try:
+                    dashboard_data = construir_resumen_ejecutivo(idcliente, desde, hasta, centro_costos, modo_periodo)
+                    if dashboard_data.get("ok"):
+                        per = dashboard_data.get("periodo", {})
+                        d_res, h_res = per.get("desde"), per.get("hasta")
+                        pnl_data = construir_pnl(idcliente, d_res, h_res)
+                        balance_data = construir_balance_general(idcliente, h_res, per.get("anterior_hasta"))
+                        if int(d_res[:4]) == int(h_res[:4]) and int(d_res[5:7]) <= int(h_res[5:7]):
+                            indicadores_data = construir_indicadores_financieros(
+                                idcliente, int(h_res[:4]), int(d_res[5:7]), int(h_res[5:7])
+                            )
+                        else:
+                            indicadores_data = {"ok": False}
+                        graficos = construir_graficos_diagnostico_integral(
+                            pnl_data, balance_data, indicadores_data, dashboard_data
+                        )
+                except Exception:
+                    db.session.rollback()
+                    graficos = None
+
+            buffer = generar_word_analisis(
+                analisis_markdown, nombre_cliente, periodo, evolucion=None,
+                graficos_iniciales=generar_graficos_word_diagnostico_integral(graficos) if graficos else None,
+                cifras=(graficos or {}).get("cifras"),
+            )
             nombre_archivo = f"diagnostico_integral_IA_{nombre_cliente.replace(' ', '_')}.docx"
             return send_file(
                 buffer,

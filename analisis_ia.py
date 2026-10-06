@@ -1539,9 +1539,260 @@ def generar_grafico_cascada_flujo(kpis: dict) -> BytesIO | None:
     return buffer
 
 
+def construir_graficos_diagnostico_integral(
+    pnl_data: dict, balance_data: dict, indicadores_data: dict, dashboard_data: dict
+) -> dict:
+    """Datos para el tablero visual que abre el Diagnóstico Integral (en
+    pantalla y en el Word): una franja de cifras clave y un gráfico por
+    cada fuente que el diagnóstico cruza. Sale 100% de lo que ya calculan
+    los reportes (los mismos dicts que alimentan la huella), nunca del
+    texto de la IA - así el tablero no puede contradecir al análisis ni
+    cuesta nada. Cada bloque viene en None/[] si su fuente no está
+    disponible para el período; el frontend y el Word simplemente lo
+    omiten. NO entra a la huella: cambiar esto no invalida ningún caché."""
+
+    def num(valor):
+        try:
+            return float(valor or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    pk = (pnl_data or {}).get("kpis", {}) or {}
+    dk = (dashboard_data or {}).get("kpis", {}) or {}
+    balance_ok = bool((balance_data or {}).get("ok"))
+    bk = (balance_data or {}).get("kpis", {}) or {} if balance_ok else {}
+    indicadores_ok = bool((indicadores_data or {}).get("ok"))
+    ik = (indicadores_data or {}).get("indicadores", {}) or {} if indicadores_ok else {}
+    flujo = (dashboard_data or {}).get("flujo_efectivo") or {}
+
+    caja = dk.get("caja_disponible") or {}
+    runway = dk.get("cash_runway") or {}
+
+    cifras = [
+        {"label": "Ventas del período", "valor": num(pk.get("ingresos_totales")), "formato": "moneda", "fuente": "Estado de Resultados"},
+        {
+            "label": "Utilidad neta", "valor": num(pk.get("utilidad_neta")), "formato": "moneda",
+            "detalle": f"Margen neto {num(pk.get('margen_neto')):.1f}%", "fuente": "Estado de Resultados",
+        },
+    ]
+    if caja.get("visible") and caja.get("actual") is not None:
+        cifras.append({"label": "Caja disponible", "valor": num(caja.get("actual")), "formato": "moneda", "fuente": "Panel operativo"})
+    if runway.get("visible") and runway.get("actual") is not None:
+        cifras.append({"label": "Autonomía de caja", "valor": num(runway.get("actual")), "formato": "meses", "fuente": "Panel operativo"})
+    if balance_ok:
+        cifras.append({"label": "Razón corriente", "valor": num(bk.get("razon_corriente")), "formato": "veces", "fuente": "Balance General"})
+        cifras.append({"label": "Endeudamiento", "valor": num(bk.get("nivel_endeudamiento_pct")), "formato": "pct", "fuente": "Balance General"})
+
+    tendencia = [
+        {
+            "label": e.get("label", ""),
+            "ventas": num(e.get("ingresos_totales")),
+            "egresos": num(e.get("costos_gastos")),
+            "ebitda": num(e.get("ebitda")),
+        }
+        for e in ((pnl_data or {}).get("evolucion") or [])
+    ]
+
+    estructura = None
+    if balance_ok and abs(num(bk.get("activos_totales"))) >= 1:
+        estructura = {
+            "activo_corriente": num(bk.get("activo_corriente")),
+            "activo_no_corriente": num(bk.get("activo_no_corriente")),
+            "pasivo_corriente": num(bk.get("pasivo_corriente")),
+            "pasivo_no_corriente": num(bk.get("pasivo_no_corriente")),
+            "patrimonio": num(bk.get("patrimonio_total")),
+        }
+
+    ciclo_caja = None
+    if ik.get("dso_dias_cobro") is not None and ik.get("dpo_dias_pago") is not None:
+        ciclo_caja = {"dias_cobro": num(ik.get("dso_dias_cobro")), "dias_pago": num(ik.get("dpo_dias_pago"))}
+
+    return {
+        "cifras": cifras,
+        "tendencia": tendencia,
+        "estructura": estructura,
+        "ciclo_caja": ciclo_caja,
+        "cascada_flujo": flujo.get("kpis") if flujo.get("ok") else None,
+        "top_clientes": [
+            {"nombre": c.get("nombre"), "valor": num(c.get("total"))}
+            for c in ((dashboard_data or {}).get("top_clientes") or [])
+        ],
+        "top_gastos": [
+            {"nombre": g.get("nombre"), "valor": num(g.get("valor"))}
+            for g in ((dashboard_data or {}).get("top_gastos") or [])
+        ],
+    }
+
+
+def _formatear_cifra_tablero(cifra: dict) -> str:
+    valor = float(cifra.get("valor") or 0)
+    formato = cifra.get("formato")
+    if formato == "moneda":
+        return f"${_abreviar_valor_chart(valor)}"
+    if formato == "pct":
+        return f"{valor:.1f}%".replace(".", ",")
+    if formato == "meses":
+        return f"{valor:.1f} meses".replace(".", ",")
+    if formato == "veces":
+        return f"{valor:.2f}".replace(".", ",")
+    return str(valor)
+
+
+def _guardar_figura(fig) -> BytesIO:
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
+def _limpiar_ejes(ax) -> None:
+    for spine in ("top", "right", "left", "bottom"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(axis="both", length=0)
+
+
+def generar_grafico_estructura_y_ciclo(estructura: dict | None, ciclo_caja: dict | None) -> BytesIO | None:
+    """Dos paneles lado a lado para el Word del Diagnóstico Integral:
+    estructura financiera (qué tiene la empresa vs cómo lo financia) y
+    ciclo de caja (días de cobro vs días de pago). Mismo contenido que el
+    tablero en pantalla; se omite el panel cuya fuente no esté."""
+    if not estructura and not ciclo_caja:
+        return None
+
+    paneles = [p for p in ("estructura", "ciclo") if (estructura if p == "estructura" else ciclo_caja)]
+    fig, ejes = plt.subplots(1, len(paneles), figsize=(9.6, 3.3), dpi=160)
+    if len(paneles) == 1:
+        ejes = [ejes]
+
+    for ax, panel in zip(ejes, paneles):
+        _limpiar_ejes(ax)
+        if panel == "estructura":
+            segmentos = [
+                (0, "Activo corriente", estructura["activo_corriente"], "#10b981"),
+                (0, "Activo no corriente", estructura["activo_no_corriente"], "#0f766e"),
+                (1, "Pasivo corto plazo", estructura["pasivo_corriente"], "#f43f5e"),
+                (1, "Pasivo largo plazo", estructura["pasivo_no_corriente"], "#f59e0b"),
+                (1, "Patrimonio", estructura["patrimonio"], "#4f46e5"),
+            ]
+            bases = {0: 0.0, 1: 0.0}
+            total = max(sum(v for c, _, v, _ in segmentos if c == col and v > 0) for col in (0, 1)) or 1
+            for col, nombre, valor, color in segmentos:
+                if valor <= 0:
+                    continue
+                ax.bar(col, valor, bottom=bases[col], width=0.55, color=color, label=nombre)
+                if valor / total >= 0.06:
+                    ax.text(col, bases[col] + valor / 2, f"${_abreviar_valor_chart(valor)}", ha="center", va="center",
+                            fontsize=7.5, fontweight="bold", color="white")
+                bases[col] += valor
+            ax.set_xticks([0, 1])
+            ax.set_xticklabels(["Lo que tiene", "Cómo lo financia"], fontsize=8, fontweight="bold")
+            ax.set_xlim(-0.6, 1.6)
+            ax.get_yaxis().set_visible(False)
+            ax.set_title("Estructura financiera", fontsize=9, fontweight="bold", color="#334155", loc="left")
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False, fontsize=6.5)
+        else:
+            dias_cobro, dias_pago = ciclo_caja["dias_cobro"], ciclo_caja["dias_pago"]
+            ax.barh([1, 0], [dias_cobro, dias_pago], height=0.5, color=["#f43f5e", "#10b981"])
+            tope = max(dias_cobro, dias_pago, 1)
+            ax.text(dias_cobro + tope * 0.02, 1, f"{dias_cobro:.0f} días", va="center", fontsize=8.5, fontweight="bold", color="#334155")
+            ax.text(dias_pago + tope * 0.02, 0, f"{dias_pago:.0f} días", va="center", fontsize=8.5, fontweight="bold", color="#334155")
+            ax.set_yticks([1, 0])
+            ax.set_yticklabels(["Tarda en cobrar", "Tarda en pagar"], fontsize=8, fontweight="bold")
+            ax.set_xlim(0, tope * 1.25)
+            ax.set_ylim(-0.7, 1.7)
+            ax.get_xaxis().set_visible(False)
+            brecha = dias_cobro - dias_pago
+            lectura = (
+                f"Cobra {abs(brecha):.0f} días después de pagar" if brecha > 0
+                else f"Cobra {abs(brecha):.0f} días antes de pagar"
+            )
+            ax.set_title(f"Ciclo de caja - {lectura}", fontsize=9, fontweight="bold", color="#334155", loc="left")
+
+    return _guardar_figura(fig)
+
+
+def generar_grafico_concentracion(top_clientes: list, top_gastos: list) -> BytesIO | None:
+    """Principales clientes y principales gastos del período, lado a lado
+    (barras horizontales), para el Word del Diagnóstico Integral."""
+    paneles = [
+        (titulo, datos, color)
+        for titulo, datos, color in (
+            ("Principales clientes", top_clientes, "#4f46e5"),
+            ("Principales gastos", top_gastos, "#f43f5e"),
+        )
+        if datos
+    ]
+    if not paneles:
+        return None
+
+    fig, ejes = plt.subplots(1, len(paneles), figsize=(9.6, 2.9), dpi=160)
+    if len(paneles) == 1:
+        ejes = [ejes]
+
+    for ax, (titulo, datos, color) in zip(ejes, paneles):
+        _limpiar_ejes(ax)
+        datos = datos[:5]
+        nombres = [str(d.get("nombre") or "")[:30] for d in datos]
+        valores = [float(d.get("valor") or 0) for d in datos]
+        posiciones = list(range(len(datos)))[::-1]
+        ax.barh(posiciones, valores, height=0.6, color=color)
+        tope = max(valores + [1])
+        for pos, valor in zip(posiciones, valores):
+            ax.text(valor + tope * 0.02, pos, f"${_abreviar_valor_chart(valor)}", va="center", fontsize=7.5,
+                    fontweight="bold", color="#334155")
+        ax.set_yticks(posiciones)
+        ax.set_yticklabels(nombres, fontsize=7)
+        ax.set_xlim(0, tope * 1.22)
+        ax.get_xaxis().set_visible(False)
+        ax.set_title(titulo, fontsize=9, fontweight="bold", color="#334155", loc="left")
+
+    return _guardar_figura(fig)
+
+
+def generar_graficos_word_diagnostico_integral(graficos: dict) -> list:
+    """Lista ordenada de PNGs para el Word del Diagnóstico Integral, a
+    partir de construir_graficos_diagnostico_integral()."""
+    if not graficos:
+        return []
+    evolucion = [
+        {"label": t["label"], "ingresos_totales": t["ventas"], "costos_gastos": t["egresos"], "ebitda": t["ebitda"]}
+        for t in (graficos.get("tendencia") or [])
+    ]
+    imagenes = [
+        generar_grafico_evolucion(evolucion) if evolucion else None,
+        generar_grafico_estructura_y_ciclo(graficos.get("estructura"), graficos.get("ciclo_caja")),
+        generar_grafico_cascada_flujo(graficos.get("cascada_flujo")) if graficos.get("cascada_flujo") else None,
+        generar_grafico_concentracion(graficos.get("top_clientes") or [], graficos.get("top_gastos") or []),
+    ]
+    return [img for img in imagenes if img]
+
+
+def _agregar_tabla_cifras(doc, cifras: list) -> None:
+    """Franja de cifras clave como tabla de 2 filas (nombre / valor)."""
+    if not cifras:
+        return
+    tabla = doc.add_table(rows=2, cols=len(cifras))
+    tabla.style = "Light Grid Accent 1"
+    for i, cifra in enumerate(cifras):
+        celda_nombre, celda_valor = tabla.rows[0].cells[i], tabla.rows[1].cells[i]
+        run_nombre = celda_nombre.paragraphs[0].add_run(str(cifra.get("label", "")))
+        run_nombre.font.size = Pt(7.5)
+        run_nombre.bold = True
+        celda_nombre.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_valor = celda_valor.paragraphs[0].add_run(_formatear_cifra_tablero(cifra))
+        run_valor.font.size = Pt(11)
+        run_valor.bold = True
+        celda_valor.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph("")
+
+
 def generar_word_analisis(
     markdown: str, nombre_cliente: str, periodo: str, evolucion: list | None = None,
     grafico_inicial: BytesIO | None = None,
+    graficos_iniciales: list | None = None,
+    cifras: list | None = None,
 ) -> BytesIO:
     doc = DocxDocument()
 
@@ -1572,9 +1823,13 @@ def generar_word_analisis(
 
     # grafico_inicial: PNG ya generado por quien llama (ej. la cascada del
     # Flujo de Efectivo) - tiene prioridad sobre el de tendencia del PyG.
+    # cifras + graficos_iniciales: tablero del Diagnóstico Integral (franja
+    # de cifras clave y varios PNG en orden).
+    _agregar_tabla_cifras(doc, cifras or [])
+
     grafico = grafico_inicial or (generar_grafico_evolucion(evolucion) if evolucion else None)
-    if grafico:
-        doc.add_picture(grafico, width=Inches(6.2))
+    for imagen in ([grafico] if grafico else []) + list(graficos_iniciales or []):
+        doc.add_picture(imagen, width=Inches(6.2))
         doc.add_paragraph("")
 
     _markdown_a_docx(doc, markdown)
