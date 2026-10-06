@@ -4339,10 +4339,16 @@ def _anchor_balance_prueba_siigo(idcliente, hasta):
     else:
         hasta_date = datetime.strptime(str(hasta)[:10], "%Y-%m-%d").date()
 
-    for anio, mes_inicio, _mes_fin in filas:
+    # Se devuelve tambien mes_fin: un mismo anio puede tener VARIOS periodos
+    # de Balance de Prueba cargados con el mismo mes de inicio (ej. ene-jun y
+    # ene-jul) y cada uno repite el saldo_inicial de la cuenta. Si quien
+    # consulta filtra solo por anio + mes_inicio, suma ese saldo_inicial una
+    # vez por cada periodo cargado y la Caja Disponible queda inflada
+    # (encontrado 2026-10-06: Binaria tenia 2 periodos 2026 cargados).
+    for anio, mes_inicio, mes_fin in filas:
         fecha_anchor = date(anio, mes_inicio, 1)
         if fecha_anchor <= hasta_date:
-            return anio, mes_inicio, fecha_anchor
+            return anio, mes_inicio, mes_fin, fecha_anchor
 
     return None
 
@@ -4435,9 +4441,10 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     AS caja_actual
             """)
         elif anchor_bp:
-            anio_bp, mes_inicio_bp, fecha_anchor_bp = anchor_bp
+            anio_bp, mes_inicio_bp, mes_fin_bp, fecha_anchor_bp = anchor_bp
             params["anio_bp"] = anio_bp
             params["mes_inicio_bp"] = mes_inicio_bp
+            params["mes_fin_bp"] = mes_fin_bp
             params["fecha_anchor_bp"] = fecha_anchor_bp
             sql = text(f"""
                 WITH base AS (
@@ -4446,6 +4453,7 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     WHERE idcliente = :idc
                       AND periodo_anio = :anio_bp
                       AND periodo_mes_inicio = :mes_inicio_bp
+                      AND periodo_mes_fin = :mes_fin_bp
                       AND es_transaccional = true
                       AND ({where_cuentas_bp})
                 ),
@@ -4527,9 +4535,10 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     AS caja_actual
             """)
         elif anchor_bp:
-            anio_bp, mes_inicio_bp, fecha_anchor_bp = anchor_bp
+            anio_bp, mes_inicio_bp, mes_fin_bp, fecha_anchor_bp = anchor_bp
             params["anio_bp"] = anio_bp
             params["mes_inicio_bp"] = mes_inicio_bp
+            params["mes_fin_bp"] = mes_fin_bp
             params["fecha_anchor_bp"] = fecha_anchor_bp
             sql = text(f"""
                 WITH base AS (
@@ -4538,6 +4547,7 @@ def _calcular_caja_disponible_parametrizada(idcliente, hasta, config):
                     WHERE idcliente = :idc
                       AND periodo_anio = :anio_bp
                       AND periodo_mes_inicio = :mes_inicio_bp
+                      AND periodo_mes_fin = :mes_fin_bp
                       AND es_transaccional = true
                       AND codigo_cuenta LIKE '11%'
                       {filtro_exclusion_bp}

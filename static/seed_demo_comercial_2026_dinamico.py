@@ -975,7 +975,7 @@ def insertar_auxiliar(cur, fecha_contable, tipo, numero, cuenta_codigo, tercero_
     )
 
 
-def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos):
+def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos, saldos_apertura=None):
     """origen='BALANCE_PRUEBA': construir_flujo_efectivo (app.py) exige
     exactamente ese origen en auxiliar_saldos_corte para ambas fechas de
     corte - sin esto el Flujo de Efectivo del cliente demo siempre
@@ -1042,8 +1042,15 @@ def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos):
             ),
         )
 
-        movimiento_debito = money(abs(saldo_final)) if naturaleza_calc == "DEBITO_MENOS_CREDITO" else money(0)
-        movimiento_credito = money(abs(saldo_final)) if naturaleza_calc == "CREDITO_MENOS_DEBITO" else money(0)
+        # saldo_inicial = saldo con que la cuenta abrió el año (el del corte
+        # de apertura del 31-dic anterior). _anchor_balance_prueba_siigo
+        # (app.py) calcula la Caja Disponible como saldo_inicial del período
+        # + movimiento del auxiliar DESDE el 1-ene, así que si esto queda en
+        # 0 la caja pierde el aporte inicial (que está fechado 31-dic).
+        saldo_inicial = money((saldos_apertura or {}).get(codigo, 0))
+        movimiento = money(abs(saldo_final - saldo_inicial))
+        movimiento_debito = movimiento if naturaleza_calc == "DEBITO_MENOS_CREDITO" else money(0)
+        movimiento_credito = movimiento if naturaleza_calc == "CREDITO_MENOS_DEBITO" else money(0)
 
         cur.execute(
             """
@@ -1056,14 +1063,14 @@ def insertar_saldos_corte_y_balance(cur, fecha_corte, saldos):
             ) VALUES (
                 %s, %s, %s,
                 'auxiliar', true,
-                0, %s, %s,
+                %s, %s, %s,
                 %s, %s, 1,
                 %s, now()
             )
             """,
             (
                 IDCLIENTE, codigo, cuenta["nombre"],
-                movimiento_debito, movimiento_credito,
+                saldo_inicial, movimiento_debito, movimiento_credito,
                 saldo_final, fecha_corte.year, fecha_corte.month,
             ),
         )
@@ -1074,14 +1081,24 @@ def insertar_contabilidad(cur, facturas, compras, resumen_nomina):
 
     saldos = {codigo: money(0) for codigo in cuentas.keys()}
 
-    # Capital inicial
-    fecha_inicial = date(ANO_ACTUAL, 1, 1)
-    insertar_auxiliar(cur, fecha_inicial, "AP", f"AP-DEMO-{ANO_ACTUAL}", "111005", None, None, "Aporte inicial en bancos", debito=180_000_000)
-    insertar_auxiliar(cur, fecha_inicial, "AP", f"AP-DEMO-{ANO_ACTUAL}", "152405", None, None, "Equipos de oficina iniciales", debito=35_000_000)
-    insertar_auxiliar(cur, fecha_inicial, "AP", f"AP-DEMO-{ANO_ACTUAL}", "310505", None, None, "Capital social inicial", credito=215_000_000)
+    # Capital inicial, fechado el 31-dic del año ANTERIOR (la empresa se
+    # constituye a fin de año y empieza a operar en enero), con su propio
+    # corte de apertura. Antes el aporte iba el 1-ene y no existía ningún
+    # corte anterior a enero, así que (a) el Flujo de Efectivo de "enero a
+    # hoy" no se podía calcular (construir_flujo_efectivo exige Balance de
+    # Prueba en la fecha de inicio = 31-dic) y el Diagnóstico Integral con IA
+    # tenía que decir "Flujo de Efectivo no disponible", y (b) el Balance no
+    # tenía contra qué comparar el cierre del año anterior.
+    fecha_apertura = date(ANO_ACTUAL - 1, 12, 31)
+    insertar_auxiliar(cur, fecha_apertura, "AP", f"AP-DEMO-{ANO_ACTUAL}", "111005", None, None, "Aporte inicial en bancos", debito=180_000_000)
+    insertar_auxiliar(cur, fecha_apertura, "AP", f"AP-DEMO-{ANO_ACTUAL}", "152405", None, None, "Equipos de oficina iniciales", debito=35_000_000)
+    insertar_auxiliar(cur, fecha_apertura, "AP", f"AP-DEMO-{ANO_ACTUAL}", "310505", None, None, "Capital social inicial", credito=215_000_000)
     saldos["111005"] += money(180_000_000)
     saldos["152405"] += money(35_000_000)
     saldos["310505"] += money(215_000_000)
+
+    saldos_apertura = {codigo: saldo for codigo, saldo in saldos.items() if saldo != 0}
+    insertar_saldos_corte_y_balance(cur, fecha_apertura, saldos)
 
     for mes in range(1, MES_ACTUAL + 1):
         fecha_mes = fecha_corte_mes(mes)
@@ -1223,7 +1240,7 @@ def insertar_contabilidad(cur, facturas, compras, resumen_nomina):
         # curso) - construir_flujo_efectivo normaliza toda fecha consultada
         # con ultimo_dia_del_mes() antes de buscar el snapshot, así que un
         # corte fechado "hoy" para el mes en curso nunca haría match.
-        insertar_saldos_corte_y_balance(cur, fin_mes(ANO_ACTUAL, mes), saldos)
+        insertar_saldos_corte_y_balance(cur, fin_mes(ANO_ACTUAL, mes), saldos, saldos_apertura)
 
 
 # ─────────────────────────────────────────────
