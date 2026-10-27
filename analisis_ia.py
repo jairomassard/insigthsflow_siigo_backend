@@ -330,8 +330,24 @@ class TopeAlcanzadoError(Exception):
         super().__init__(f"Tope mensual de análisis con IA alcanzado ({uso_actual}/{tope}).")
 
 
+# Claves del payload que la IA SI recibe pero que NO cuentan para la huella
+# del cache: son fotos de "hoy" (ej. CxP neta segun Siigo) que cambian con
+# cada sync diaria aunque el periodo analizado ya este cerrado. Sin esto,
+# todo analisis guardado se veria "desactualizado" a diario (mismo problema
+# que se corrigio con la cartera "al corte", ver _cartera_total_al_corte).
+CLAVES_FUERA_DE_HUELLA = {"cuentas_por_pagar_siigo_hoy"}
+
+
+def _sin_claves_fuera_de_huella(valor):
+    if isinstance(valor, dict):
+        return {k: _sin_claves_fuera_de_huella(v) for k, v in valor.items() if k not in CLAVES_FUERA_DE_HUELLA}
+    if isinstance(valor, list):
+        return [_sin_claves_fuera_de_huella(v) for v in valor]
+    return valor
+
+
 def _huella_datos(payload: dict) -> str:
-    canon = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    canon = json.dumps(_sin_claves_fuera_de_huella(payload), sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
@@ -801,7 +817,7 @@ def _resumen_indicadores_para_ia(data: dict) -> dict:
     formulas_no_obvias = ("dso_dias_cobro", "dpo_dias_pago", "prueba_acida", "cobertura_intereses", "roe", "roa")
     explicaciones = data.get("explicaciones") or {}
 
-    return {
+    payload = {
         "meta": data.get("meta", {}),
         "parametros_configurados": bool(data.get("parametros_configurados")),
         "config_financiera": data.get("config_financiera") if data.get("parametros_configurados") else None,
@@ -813,6 +829,14 @@ def _resumen_indicadores_para_ia(data: dict) -> dict:
         "resumen_balance": data.get("resumen_balance", {}),
         "meta_balance": data.get("meta_balance", {}),
     }
+
+    # Solo clientes Siigo: CxP neta segun Siigo (foto de hoy, fuera de la
+    # huella del cache - ver CLAVES_FUERA_DE_HUELLA). Se omite la clave para
+    # Alegra para no alterar su payload.
+    if data.get("cuentas_por_pagar_siigo_hoy"):
+        payload["cuentas_por_pagar_siigo_hoy"] = data["cuentas_por_pagar_siigo_hoy"]
+
+    return payload
 
 
 def generar_analisis_indicadores(
