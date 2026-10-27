@@ -11287,6 +11287,47 @@ def create_app():
 
 
     # ============================================================
+    # Años con ventas registradas (Siigo + Alegra)
+    # Alimenta el selector "Comparar con otro año" de Ingresos por
+    # Ventas. El comparativo en si reutiliza /reportes/facturas_enriquecidas
+    # dos veces (rango actual y mismo rango corrido de año), asi ambas
+    # cifras salen de la misma logica que la vista normal.
+    # ============================================================
+
+    @app.route("/reportes/ventas_anios_disponibles", methods=["GET"])
+    @jwt_required()
+    def ventas_anios_disponibles():
+        from sqlalchemy.sql import text
+
+        claims = get_jwt()
+        perfilid = claims.get("perfilid")
+        idcliente = claims.get("idcliente")
+
+        q_idcliente = request.args.get("idcliente", type=int)
+        if perfilid == 0 and q_idcliente:
+            idcliente = q_idcliente
+
+        if not idcliente:
+            return jsonify({"error": "No autorizado"}), 403
+
+        try:
+            sql = text("""
+                SELECT DISTINCT EXTRACT(YEAR FROM m.fecha)::int AS anio
+                FROM ventas_movimientos_enriquecidos m
+                WHERE m.idcliente = :idcliente
+                  AND m.fecha IS NOT NULL
+                ORDER BY anio DESC
+            """)
+
+            anios = [int(r["anio"]) for r in db.session.execute(sql, {"idcliente": idcliente}).mappings().all()]
+
+            return jsonify({"anios": anios})
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
+    # ============================================================
     # Endpoint detalle de movimientos comerciales
     # Para modales de barras, clientes y conciliación contra Siigo
     # Fuente: ventas_movimientos_enriquecidos
