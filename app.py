@@ -18355,55 +18355,39 @@ def create_app():
 
         try:
             from sqlalchemy import func, or_
+            from siigo.siigo_cruce_cxp import emparejar_cxp_con_compras
 
             cuentas = SiigoCuentasPorCobrar.query.filter_by(idcliente=idcliente).all()
+            compras_cliente = SiigoCompra.query.filter_by(idcliente=idcliente).all()
 
-            compras = {
-                (c.factura_proveedor, c.proveedor_identificacion): (c.idcompra, c.fecha)
-                for c in SiigoCompra.query.filter_by(idcliente=idcliente).all()
-            }
+            # Emparejamiento 1 fila CxP -> 1 compra aun con llave
+            # (factura_proveedor, NIT) repetida - ver siigo/siigo_cruce_cxp.py.
+            asignacion, _sin_compra = emparejar_cxp_con_compras(cuentas, compras_cliente)
 
-            matched = 0
             total = len(cuentas)
-            cuentas_keys = set()
-
-            for cuenta in cuentas:
-                key = (cuenta.documento, cuenta.proveedor_identificacion)
-                cuentas_keys.add(key)
-
-                if key in compras:
-                    idcompra, fecha = compras[key]
-                    cuenta.idcompra = idcompra
-                    cuenta.fecha = fecha
-
-                    compra = SiigoCompra.query.filter_by(
-                        idcliente=idcliente,
-                        idcompra=idcompra
-                    ).first()
-
-                    if compra:
-                        compra.estado = "pendiente"
-                        compra.saldo = cuenta.saldo
-
-                    matched += 1
-
-            compras_keys = set(compras.keys())
-            pagadas = compras_keys - cuentas_keys
-
+            matched = 0
             marcadas_pagadas = 0
 
-            for key in pagadas:
-                idcompra, _ = compras[key]
+            for compra in compras_cliente:
+                filas = asignacion.get(id(compra))
 
-                compra = SiigoCompra.query.filter_by(
-                    idcliente=idcliente,
-                    idcompra=idcompra
-                ).first()
-
-                if compra:
+                if not filas:
+                    # No aparece en la CxP de Siigo: ya no se le debe nada.
                     compra.estado = "pagado"
                     compra.saldo = 0
                     marcadas_pagadas += 1
+                    continue
+
+                for cuenta in filas:
+                    cuenta.idcompra = compra.idcompra
+                    cuenta.fecha = compra.fecha
+                    matched += 1
+
+                # Suma de sus filas: netea reversos que Siigo reporta como
+                # linea negativa aparte (ej. DS-202110: +2.008M y -2.008M).
+                saldo = max(sum(float(c.saldo or 0) for c in filas), 0)
+                compra.saldo = saldo
+                compra.estado = "pendiente" if saldo > 0 else "pagado"
 
             ds_compras = SiigoCompra.query.filter(
                 SiigoCompra.idcliente == idcliente,
