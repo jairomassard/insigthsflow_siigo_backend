@@ -15948,6 +15948,111 @@ def create_app():
         })
 
 
+    # --- Cuadre del pendiente de compras contra la CxP de Siigo ---
+    # El pendiente del reporte suma documento por documento (FC/DS). Siigo, en
+    # su informe "Cuentas por cobrar/pagar general por cliente/proveedor",
+    # ademas incluye lineas de CxP que no son una compra (anticipos, CC, RP,
+    # ajustes) y resta el saldo a favor: su "Total" es la suma de TODAS las
+    # lineas de siigo_cuentasporcobrar con su signo (validado 2026-10-27 con
+    # Binaria: 167/170 proveedores cuadran al peso contra el Excel de Siigo).
+    # Este endpoint arma ese puente:
+    #   pendiente por documentos
+    #   + diferencia de calculo en esos mismos documentos
+    #   + otras deudas en Siigo sin documento de compra
+    #   - saldo a favor
+    #   = total por pagar segun Siigo
+    # Es una foto al corte de la ultima sync de CxP: no aplica filtros de
+    # fecha ni centro de costo (los anticipos no tienen fecha de compra).
+    @app.route("/reportes/financiero/compras-gastos/cuadre-siigo", methods=["GET"])
+    @jwt_required()
+    def reporte_compras_gastos_cuadre_siigo():
+        from sqlalchemy.sql import text
+
+        claims = get_jwt()
+        idcliente = claims.get("idcliente")
+        if not idcliente:
+            return jsonify({"error": "Token sin cliente"}), 403
+
+        if _proveedor_datos_cliente(idcliente) == "alegra":
+            return jsonify({
+                "disponible": False,
+                "motivo": "El cuadre se hace contra el informe de cuentas por pagar de Siigo; no aplica para clientes Alegra.",
+            })
+
+        sql = text("""
+            WITH docs AS (
+                SELECT
+                    c.proveedor_identificacion AS nit,
+                    MAX(c.proveedor_nombre) AS nombre,
+                    SUM(LEAST(
+                        COALESCE(c.saldo, 0),
+                        GREATEST(COALESCE(c.total_ajustado, c.total, 0) - COALESCE(c.retencion_total, 0), 0)
+                    )) AS pend_docs
+                FROM compras_enriquecidas c
+                WHERE c.idcliente = :idcliente
+                GROUP BY c.proveedor_identificacion
+            ),
+            cxp AS (
+                SELECT
+                    x.proveedor_identificacion AS nit,
+                    MAX(x.proveedor_nombre) AS nombre,
+                    COALESCE(SUM(x.saldo) FILTER (WHERE x.idcompra IS NOT NULL), 0) AS siigo_docs,
+                    -- Lineas sin documento neteadas POR PROVEEDOR: Siigo trae
+                    -- parejas contables (ej. +2.017M / -2.017M en un mismo
+                    -- tercero) que, separadas, inflaban "otras deudas" y
+                    -- "saldo a favor" a miles de millones cada una.
+                    COALESCE(SUM(x.saldo) FILTER (WHERE x.idcompra IS NULL), 0) AS sin_doc_neto,
+                    COALESCE(SUM(x.saldo), 0) AS total_siigo
+                FROM siigo_cuentasporcobrar x
+                WHERE x.idcliente = :idcliente
+                GROUP BY x.proveedor_identificacion
+            )
+            SELECT
+                COALESCE(x.nit, d.nit) AS nit,
+                COALESCE(x.nombre, d.nombre) AS nombre,
+                COALESCE(d.pend_docs, 0) AS pend_docs,
+                COALESCE(x.siigo_docs, 0) - COALESCE(d.pend_docs, 0) AS ajuste_docs,
+                GREATEST(COALESCE(x.sin_doc_neto, 0), 0) AS otras_deudas,
+                GREATEST(-COALESCE(x.sin_doc_neto, 0), 0) AS saldo_favor,
+                COALESCE(x.total_siigo, 0) AS total_siigo
+            FROM cxp x
+            FULL OUTER JOIN docs d ON d.nit = x.nit
+        """)
+
+        rows = [dict(r) for r in db.session.execute(sql, {"idcliente": idcliente}).mappings().all()]
+
+        corte = db.session.execute(
+            text("SELECT MAX(created_at) FROM siigo_cuentasporcobrar WHERE idcliente = :idcliente"),
+            {"idcliente": idcliente},
+        ).scalar()
+
+        campos = ["pend_docs", "ajuste_docs", "otras_deudas", "saldo_favor", "total_siigo"]
+        totales = {k: round(sum(float(r[k] or 0) for r in rows), 2) for k in campos}
+
+        # Solo proveedores donde el total de Siigo difiere del pendiente por
+        # documentos - los demas cuadran 1 a 1 y no aportan al puente.
+        proveedores = []
+        for r in rows:
+            item = {k: round(float(r[k] or 0), 2) for k in campos}
+            if abs(item["total_siigo"] - item["pend_docs"]) <= 1:
+                continue
+            item["nit"] = r["nit"]
+            item["nombre"] = r["nombre"]
+            proveedores.append(item)
+
+        proveedores.sort(key=lambda p: -abs(p["total_siigo"] - p["pend_docs"]))
+
+        return jsonify({
+            "disponible": True,
+            # created_at se guarda en UTC sin zona; se marca "Z" para que el
+            # frontend lo muestre en hora Colombia.
+            "corte": (corte.isoformat() + "Z") if corte else None,
+            "totales": totales,
+            "proveedores": proveedores,
+            "proveedores_cuadran": len(rows) - len(proveedores),
+        })
+
+
     # --- ENDPOINT 2: Top 15 Proveedores por valor de compras ---
     @app.route("/reportes/financiero/compras-gastos/top-proveedores", methods=["GET"])
     @jwt_required()
