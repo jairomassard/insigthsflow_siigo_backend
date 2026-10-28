@@ -21,6 +21,13 @@ def redondear(v, dec=2):
     return round(safe_float(v), dec)
 
 
+def formatear_pesos(v):
+    """Monto en formato colombiano para textos al usuario: -8274929.4 -> "-$ 8.274.929"."""
+    n = round(safe_float(v))
+    signo = "-" if n < 0 else ""
+    return f"{signo}$ {abs(n):,.0f}".replace(",", ".")
+
+
 def ultimo_dia_del_mes(fecha_str):
     dt = datetime.strptime(fecha_str, "%Y-%m-%d").date()
     if dt.month == 12:
@@ -955,6 +962,7 @@ def _label_categoria_alerta(categoria: str):
         "patrimonio_sin_clase_3": "Patrimonio explícito no identificado",
         "ajuste_cuadratura_residual": "Diferencia sin explicar en el balance",
         "snapshot_comparativo_faltante": "Snapshot comparativo faltante",
+        "snapshot_metodos_distintos": "Cortes calculados con métodos distintos",
     }
     return labels.get(categoria, categoria)
 
@@ -997,6 +1005,7 @@ def _agrupar_alertas(alertas_dict):
         "patrimonio_sin_clase_3",
         "ajuste_cuadratura_residual",
         "snapshot_comparativo_faltante",
+        "snapshot_metodos_distintos",
     ]
 
     categorias = [c for c in orden if c in grupos] + [c for c in grupos if c not in orden]
@@ -1005,7 +1014,7 @@ def _agrupar_alertas(alertas_dict):
         items = grupos[categoria]
         titulo = _label_categoria_alerta(categoria)
 
-        if categoria in ("patrimonio_sin_clase_3", "ajuste_cuadratura_residual", "snapshot_comparativo_faltante"):
+        if categoria in ("patrimonio_sin_clase_3", "ajuste_cuadratura_residual", "snapshot_comparativo_faltante", "snapshot_metodos_distintos"):
             principal = items[0].get("mensaje", titulo)
             alertas_resumen.append(principal)
             alertas_grupo.append({
@@ -1045,7 +1054,8 @@ def _armar_alertas(
     patrimonio_calculado,
     cuadratura_original,
     patrimonio_explicito_total,
-    ajuste_cuadratura_residual_actual
+    ajuste_cuadratura_residual_actual,
+    cuentas_fuera_balance=None
 ):
     alertas = []
 
@@ -1076,14 +1086,24 @@ def _armar_alertas(
     # señal útil. Debe evaluar el residual solo (caso real Maslux LED,
     # 2026-09: $52.7M sin explicar, escondidos en silencio en esa línea).
     if abs(ajuste_cuadratura_residual_actual) >= 1:
+        causa = ""
+        if cuentas_fuera_balance:
+            detalle = "; ".join(
+                f"{c['cuenta']} {c['nombre']} por {formatear_pesos(c['saldo'])}" for c in cuentas_fuera_balance[:3]
+            )
+            causa = (
+                f" Parte o toda la diferencia está en cuentas que no pertenecen al balance (clases 8/9, "
+                f"cuentas de orden): {detalle}. Revisa los comprobantes que movieron esas cuentas."
+            )
         alertas.append({
             "nivel": "danger",
             "categoria": "ajuste_cuadratura_residual",
             "mensaje": (
-                f"El balance tiene una diferencia de {redondear(ajuste_cuadratura_residual_actual, 2):,.0f} "
+                f"El balance tiene una diferencia de {formatear_pesos(abs(ajuste_cuadratura_residual_actual))} "
                 "que no se explica ni con las cuentas cargadas ni con el resultado del ejercicio - el sistema "
                 "la muestra como un ajuste de patrimonio para que la ecuación contable cierre, pero es una señal "
                 "de un posible error en los datos de origen. Pídele a tu contador que lo revise directamente en tu sistema contable."
+                + causa
             ),
             "monto": redondear(ajuste_cuadratura_residual_actual, 2),
         })
@@ -1112,8 +1132,8 @@ def _armar_narrativa(
 
     if abs(ajuste_cuadratura_residual) >= 1:
         narrativa.append(
-            f"El balance tiene una diferencia de {redondear(ajuste_cuadratura_residual, 2):,.0f} sin explicar "
-            "por las cuentas cargadas ni el resultado del ejercicio - revisa la alerta correspondiente."
+            f"El balance tiene una diferencia de {formatear_pesos(abs(ajuste_cuadratura_residual))} sin explicar "
+            "por las cuentas cargadas ni el resultado del ejercicio - revisa el aviso en rojo."
         )
     elif abs(ajuste_patrimonio_aplicado) < 1:
         narrativa.append("El balance cuadra correctamente al combinar activos, pasivos, patrimonio reportado y resultado acumulado calculado.")
@@ -1132,7 +1152,7 @@ def _armar_narrativa(
 
     if abs(activo_no_corriente_contra_total) >= 1:
         narrativa.append(
-            f"El activo no corriente se está presentando en forma neta: base por {redondear(activo_no_corriente_bruto_total, 2)} y depreciaciones/ajustes acumulados por {redondear(activo_no_corriente_contra_total, 2)}."
+            f"El activo no corriente se está presentando en forma neta: base por {formatear_pesos(activo_no_corriente_bruto_total)} y depreciaciones/ajustes acumulados por {formatear_pesos(activo_no_corriente_contra_total)}."
         )
 
     if razon_corriente >= 1.5:
@@ -1156,8 +1176,16 @@ def _armar_narrativa(
     else:
         narrativa.append("La autonomía financiera es baja frente al tamaño de los activos.")
 
-    if abs(ajuste_patrimonio_aplicado) >= 1:
-        narrativa.append("Conviene revisar si el auxiliar incluye todas las cuentas de patrimonio o si falta reclasificación contable de cierre.")
+    # Antes salía con cualquier utilidad/pérdida (ajuste_patrimonio_aplicado
+    # incluye el resultado del ejercicio, que es normal), o sea casi siempre,
+    # incluso en balances que cuadran exacto. Solo aplica si de verdad no hay
+    # cuentas de patrimonio (clase 3) en el corte.
+    if abs(patrimonio_explicito_total) < 1 and abs(ajuste_patrimonio_aplicado) >= 1:
+        narrativa.append(
+            "No se encontraron cuentas de patrimonio (clase 3) en este corte: el patrimonio mostrado sale solo "
+            "del resultado calculado. Conviene revisar si faltan el capital y los resultados de años anteriores "
+            "o la reclasificación contable de cierre."
+        )
 
     if not modo_comparativo:
         narrativa.append("Este balance se está mostrando en modo simple, sin comparación contra otro corte.")
@@ -1168,6 +1196,21 @@ def _armar_narrativa(
 # =========================================================
 # Construcción del balance general
 # =========================================================
+
+_ETIQUETA_ORIGEN = {
+    "BALANCE_PRUEBA": "Balance de Prueba de Siigo",
+    "AUXILIAR": "acumulado del auxiliar contable",
+}
+
+
+def _origen_snapshot(filas):
+    """Origen predominante de las filas de un corte (AUXILIAR si no viene)."""
+    conteo = {}
+    for f in filas:
+        o = f.origen or "AUXILIAR"
+        conteo[o] = conteo.get(o, 0) + 1
+    return max(conteo, key=conteo.get) if conteo else None
+
 
 def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: str = None):
     fecha_corte = ultimo_dia_del_mes(fecha_corte)
@@ -1244,6 +1287,29 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         elif clase in ("5", "6", "7"):
             utilidad_actual -= safe_float(row.saldo)
             utilidad_anterior -= safe_float(ant.saldo if ant else 0)
+
+    # Cuentas que no entran ni al balance ni al resultado (clases 8/9, cuentas
+    # de orden). Normalmente se compensan entre sí, pero si un comprobante usó
+    # una como contrapartida de una cuenta real (caso real Binaria 2026-08:
+    # CC-1-150 descuadrado, Siigo lo cerró contra 99999999 "Saldos iniciales
+    # por conciliar"), su saldo es justo la causa de la diferencia sin explicar.
+    grupos_balance = ("ACTIVO_CORRIENTE", "ACTIVO_NO_CORRIENTE", "PASIVO_CORRIENTE", "PASIVO_NO_CORRIENTE", "PATRIMONIO")
+    cuentas_fuera_balance = sorted(
+        [
+            # El import del Balance de Prueba guarda los códigos como "99999999.0".
+            {"cuenta": str(row.cuenta_codigo or "").removesuffix(".0"), "nombre": row.cuenta_nombre or "", "saldo": redondear(row.saldo, 2)}
+            for row in actuales
+            if row.grupo_balance not in grupos_balance
+            and str(row.clase or "")[:1] not in ("4", "5", "6", "7")
+            and abs(safe_float(row.saldo)) >= 1
+        ],
+        key=lambda c: -abs(c["saldo"]),
+    )
+
+    # Método con el que se armó cada corte: si difieren (uno desde el Balance de
+    # Prueba de Siigo y otro acumulando el auxiliar), la comparación no es pareja.
+    origen_actual = _origen_snapshot(actuales)
+    origen_comparativo = _origen_snapshot(anteriores) if snapshot_comparativo_existe else None
 
     activo_corriente = _ordenar_items(activo_corriente)
     activo_no_corriente_bruto = _ordenar_items(activo_no_corriente_bruto)
@@ -1344,8 +1410,24 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
         patrimonio_calculado,
         cuadratura_original,
         patrimonio_explicito_actual,
-        ajuste_cuadratura_residual_actual
+        ajuste_cuadratura_residual_actual,
+        cuentas_fuera_balance
     )
+
+    metodos_distintos = bool(
+        snapshot_comparativo_existe and origen_comparativo and origen_actual != origen_comparativo
+    )
+    if metodos_distintos:
+        alertas_dict.append({
+            "nivel": "warning",
+            "categoria": "snapshot_metodos_distintos",
+            "mensaje": (
+                f"Los dos cortes se calcularon con métodos distintos ({fecha_corte}: "
+                f"{_ETIQUETA_ORIGEN.get(origen_actual, origen_actual)}; {comparar_con_norm}: "
+                f"{_ETIQUETA_ORIGEN.get(origen_comparativo, origen_comparativo)}), así que las variaciones "
+                "pueden no ser reales. Genera el balance de ambos cortes con el mismo método antes de comparar."
+            ),
+        })
 
     if modo_comparativo and comparar_con_norm and not snapshot_comparativo_existe:
         alertas_dict.append({
@@ -1387,6 +1469,10 @@ def construir_balance_general(idcliente: int, fecha_corte: str, comparar_con: st
             "modo_comparativo": bool(modo_comparativo and snapshot_comparativo_existe),
             "comparacion_solicitada": bool(comparar_con),
             "snapshot_comparativo_existe": snapshot_comparativo_existe,
+            "origen_actual": origen_actual,
+            "origen_comparativo": origen_comparativo,
+            "metodos_distintos": metodos_distintos,
+            "cuentas_fuera_balance": cuentas_fuera_balance,
             "explicacion_filtros": {
                 "fecha_corte": "Muestra la situación financiera acumulada hasta esa fecha.",
                 "comparar_con": "Permite comparar contra otro corte para analizar variaciones. Se recomienda usar cierres de mes."
